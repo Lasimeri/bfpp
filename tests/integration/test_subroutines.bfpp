@@ -1,0 +1,37 @@
+!include "io.bfpp"
+
+; Define a subroutine that prints a digit
+!#pd{
+    ++++++++++++++++++++++++++++++++++++++++++++++++  ; add 48 ('0')
+    .
+    [-]
+    ^
+}
+
+; Call it with different values
+#1 !#pd     ; prints '1'
+#2 !#pd     ; prints '2'
+#3 !#pd     ; prints '3'
+
+; Test early return
+!#er{
+    #65 .   ; 'A'
+    ^       ; return early
+    #88 .   ; 'X' — should not print
+}
+!#er
+
+; Test nested calls
+!#outer{
+    #66 .   ; 'B'
+    !#inner
+    #67 .   ; 'C'
+    ^
+}
+!#inner{
+    #45 .   ; '-'
+    ^
+}
+!#outer     ; prints "B-C"
+
+#10 .       ; newline

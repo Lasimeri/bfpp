@@ -1,0 +1,26 @@
+; Test: Numeric literals — #N (decimal) and #0xHH (hex)
+; Verifies: decimal values, hex values, zero, and multi-byte cell interaction
+
+; Decimal literals spell "Hello "
+#72 .                    ; 'H' = 72
+#101 .                   ; 'e' = 101
+#108 . #108 .            ; "ll"
+#111 .                   ; 'o' = 111
+#32 .                    ; space = 32
+
+; Hex literals spell "World"
+#0x57 .                  ; 'W' = 0x57
+#0x6F .                  ; 'o' = 0x6F
+#0x72 .                  ; 'r' = 0x72
+#0x6C .                  ; 'l' = 0x6C
+#0x64 .                  ; 'd' = 0x64
+#10 .                    ; newline
+
+; Test zero — sets cell to 0, prints null (invisible but tests the path)
+#0 .
+
+; Test cell width interaction with numeric literal
+; %2 makes current cell 16-bit, #0x4148 stores LE: tape[0]=0x48='H', tape[1]=0x41='A'
+%2 #0x4148
+%1 . > .                 ; switch back to 8-bit, print tape[0]='H', move right, print tape[1]='A'
+#10 .                    ; newline

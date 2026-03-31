@@ -1,0 +1,28 @@
+!include "io.bfpp"
+
+; Test 1: ? inside R block should break to K, not return
+R{
+    #6 e        ; set error = 6
+    ?           ; should break to K block
+    #88 .       ; 'X' — should NOT print (? should have broken)
+}K{
+    E           ; read error code (6)
+    !#.+        ; print "6"
+}
+
+; Test 2: nested R/K
+R{
+    R{
+        #3 e ?      ; set error 3, propagate
+        #88 .       ; should not print
+    }K{
+        E !#.+      ; print "3" (inner catch)
+        [-] #0 e    ; clear error
+    }
+    ; After inner R/K, error is cleared, so this should execute
+    #79 .           ; 'O'
+}K{
+    #88 .           ; should not print — no error from outer R block
+}
+
+#75 . #10 .         ; "K\n"

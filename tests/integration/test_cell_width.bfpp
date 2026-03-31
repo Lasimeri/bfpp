@@ -1,0 +1,18 @@
+; Test: Cell width directives — %1, %2, %4, %8
+; Verifies: direct width setting, multi-byte store/read, width transitions
+
+; Test 1: %8 sets 64-bit cell, store 'A'=65, read back as %1 (8-bit)
+%8 #65                   ; 64-bit cell at ptr=0, store 65
+%1 .                     ; switch to 8-bit, read tape[0] → 65 = 'A'
+
+; Test 2: %2 creates a 16-bit cell, store a two-byte value
+; Move to a fresh cell first
+> %2 #0x4243             ; 16-bit at ptr=1: LE → tape[1]=0x43='C', tape[2]=0x42='B'
+%1 . > .                 ; switch to 8-bit at ptr=1, print 0x43='C'; move to ptr=2, print 0x42='B'
+
+; Test 3: %4 creates a 32-bit cell
+; Move to fresh area
+> > %4 #0x0000004E       ; 32-bit at ptr=4: LE → tape[4]=0x4E='N', rest=0
+%1 .                     ; switch to 8-bit, read tape[4]=0x4E='N'
+
+#10 .                    ; newline

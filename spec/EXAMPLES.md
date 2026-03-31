@@ -277,3 +277,224 @@ R{
 ; # is reserved for subroutine names
 ; and // would conflict with potential future operators
 ```
+
+---
+
+## 16. Numeric Literals (`#N`)
+
+```bfpp
+; Set cell to known value directly — no increment chains needed
+#72 .                   ; print 'H' (ASCII 72)
+#101 .                  ; print 'e'
+#108 . .                ; print 'l' twice
+#111 .                  ; print 'o'
+#10 .                   ; print newline
+
+; Hex format
+#0xFF                   ; cell = 255
+#0x9000                 ; cell = 36864 (heap metadata address)
+
+; Large values (requires wider cell)
+%4 #40960              ; 32-bit cell, value = 0xA000 (framebuffer offset)
+
+; Clear cell to zero
+#0                      ; equivalent to [-] but generates a direct bfpp_set
+```
+
+---
+
+## 17. Direct Cell Width (`%N`)
+
+```bfpp
+; Set cell width without cycling through intermediate widths
+%8                      ; 64-bit cell (for syscall args)
+#41                     ; SYS_socket = 41
+
+; Set up a 16-bit value
+%2 #0x1000              ; 16-bit cell, value = 4096
+
+; Restore to byte width
+%1                      ; back to 8-bit
+
+; Compare with cycling (%):
+; % cycles: 8 -> 16 -> 32 -> 64 -> 8
+; %4 jumps directly to 32-bit
+```
+
+---
+
+## 18. Block Comments
+
+```bfpp
+; Line comments use ;
+/* Block comments use C-style delimiters */
+
++ /* this is a block comment spanning
+     multiple lines */ -
+
+/* Block comments support nesting:
+   /* inner comment */
+   still in outer comment
+*/
+
+; Useful for commenting out code blocks:
+/* [-] +++ . */         ; this code is disabled
+```
+
+---
+
+## 19. Compiler Intrinsics
+
+```bfpp
+; Intrinsics are subroutine calls with __ prefix that emit inline C.
+; They bridge BF++ to system APIs that can't be expressed in pure BF++.
+
+!include "io.bfpp"
+
+; --- Read environment variable ---
+"HOME\0"
+<<<<<                   ; back to start of "HOME"
+!#__getenv              ; overwrites "HOME" with the value (e.g., "/home/user")
+!#.>                    ; print the path
+#10 . [-]               ; newline
+
+; --- Get process ID ---
+[-]
+!#__getpid              ; tape[ptr] = pid
+!#.+                    ; print as decimal
+#10 .                   ; newline
+
+; --- Monotonic timestamp ---
+[-]
+!#__time_ms             ; tape[ptr] = milliseconds since boot
+!#.+
+#10 .
+
+; --- Sleep ---
+[-]
+#50                     ; 50 milliseconds
+!#__sleep               ; pause execution
+
+; --- Exit cleanly ---
+[-]
+#0
+!#__exit                ; exit(0)
+```
+
+---
+
+## 20. TUI Runtime (Double-Buffered Terminal UI)
+
+```bfpp
+; The TUI runtime provides a double-buffered terminal UI.
+; __tui_* intrinsics require the C runtime library (bfpp_rt.h).
+
+; Initialize TUI (raw mode, alternate screen, hide cursor)
+!#__tui_init
+
+; Get terminal size
+!#__tui_size            ; tape[ptr]=cols, tape[ptr+1]=rows
+
+; Main render loop
+#1                      ; loop flag
+[
+    !#__tui_begin       ; start frame
+
+    ; Draw a character: row=5, col=10, char='X', fg=2 (green), bg=-1 (default)
+    #5 > #10 > #88 > #2 > #255 <<<<
+    ;                              ^ -1 as unsigned byte = 255 for default color
+    !#__tui_put
+
+    ; Fill a rectangle: row=0, col=0, w=20, h=3, char=' ', fg=7, bg=4
+    #0 > #0 > #20 > #3 > #32 > #7 > #4 <<<<<<
+    !#__tui_fill
+
+    ; Draw a box: row=10, col=5, w=30, h=10, style=0
+    #10 > #5 > #30 > #10 > #0 <<<<
+    !#__tui_box
+
+    !#__tui_end         ; end frame (diff and render)
+
+    ; Poll for keypress (100ms timeout)
+    #100
+    !#__tui_key         ; tape[ptr] = keycode or -1
+
+    ; Check for 'q' to quit (ASCII 113)
+    ; (simplified — real code would compare the value)
+]
+
+; Cleanup (restore terminal)
+!#__tui_cleanup
+```
+
+---
+
+## 21. Intrinsics Demo (Complete Program)
+
+```bfpp
+; Full intrinsics demo — compile with: bfpp examples/intrinsics_demo.bfpp -o demo
+
+!include "io.bfpp"
+
+; --- __getenv: read environment variable ---
+"HOME\0"
+<<<<<                   ; back to start of "HOME"
+!#__getenv              ; reads HOME, writes value at ptr
+!#.>                    ; print the result path
+#10 . [-]               ; newline
+
+; --- __getpid: get process ID ---
+[-]
+!#__getpid              ; tape[ptr] = pid
+!#.+                    ; print as decimal
+#10 .                   ; newline
+
+; --- __time_ms: monotonic timestamp ---
+[-]
+!#__time_ms             ; tape[ptr] = timestamp in ms
+!#.+                    ; print timestamp
+#10 .
+
+; --- __sleep: pause execution ---
+[-]
+#50                     ; 50 milliseconds
+!#__sleep               ; pause
+
+; --- __time_ms again to show elapsed time ---
+[-]
+!#__time_ms
+!#.+
+#10 .
+
+; --- __exit: clean exit with code 0 ---
+[-]
+#0
+!#__exit
+```
+
+---
+
+## 22. Framebuffer Graphics
+
+```bfpp
+; Draw a red pixel and clear to blue on a 320x200 framebuffer.
+; Compile with: bfpp prog.bfpp --framebuffer 320x200 --tape-size 262144 -o demo
+
+!include "graphics.bfpp"
+
+; Clear screen to blue
+%4                          ; 32-bit cells for FB addresses
+#40960 >                    ; P+0 = fb_offset (0xA000)
+#320 >                      ; P+1 = width
+#200 >                      ; P+2 = height
+#0 >                        ; P+3 = r
+#0 >                        ; P+4 = g
+#255                        ; P+5 = b
+<<<<<                       ; back to P+0
+!#gc                        ; clear_fb
+F                           ; flush to screen
+
+; Draw a red pixel at (160, 100) — center of screen
+; (ptr is now inside FB, so navigate to a clean area first)
+; ... set up params at known clean tape position ...
+```

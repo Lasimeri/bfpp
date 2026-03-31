@@ -63,10 +63,16 @@ Run the compiled binary:
 
 ### Writing BF++ Programs
 
-BF++ source files use `.bfpp` extension. The language is a strict superset of Brainfuck: all valid BF programs run unmodified. Non-instruction characters (except inside strings) are silently ignored, serving as inline comments. Line comments start with `;`.
+BF++ source files use `.bfpp` extension. The language is a strict superset of Brainfuck: all valid BF programs run unmodified. Non-instruction characters (except inside strings) are silently ignored, serving as inline comments. Line comments start with `;`. Block comments use `/* ... */` with nesting support.
 
 ```bfpp
-+++ ; this is a comment
++++ ; this is a line comment
+
+/* This is a block comment.
+   It can span multiple lines.
+   /* Nested block comments are supported. */
+   Still inside the outer comment.
+*/
 ```
 
 ---
@@ -147,7 +153,98 @@ Multi-line strings are allowed -- embedded newlines become `\n` bytes in the out
 
 ---
 
-#### 3. Subroutines
+#### 3. Numeric Literals
+
+`#N` sets the current cell to the immediate value N, respecting the current cell width. Accepts decimal or hexadecimal (`#0xHH`) notation. This replaces the tedious BF pattern of chaining `+` operators to set a cell value.
+
+| Syntax     | Description                                    |
+|------------|------------------------------------------------|
+| `#N`       | Set `tape[ptr]` to decimal value N             |
+| `#0xHH`    | Set `tape[ptr]` to hex value HH                |
+
+**Examples:**
+
+```bfpp
+#72 .                   ; set cell to 72 (ASCII 'H'), print it
+#0x48 .                 ; same thing in hex
+
+#10 .                   ; print newline (ASCII 10)
+#0                      ; set cell to 0 (same as [-])
+#255                    ; set cell to 255 (max 8-bit value)
+
+; Print "Hi" using numeric literals
+#72 . #105 . #10 .      ; prints H, i, newline
+```
+
+**Before and after -- Hello World with numeric literals:**
+
+```bfpp
+; Before (classic BF): 97 characters of +/- chains
+++++++++[>++++[>++>+++>+++>+<<<<-]>+>+>->>+[<]<-]>>.>---.+++++++..+++.>>.<-.<.+++.------.--------.>>+.>++.
+
+; After: clear and readable
+#72 . #101 . #108 . #108 . #111 . #44 . #32 .
+#87 . #111 . #114 . #108 . #100 . #33 . #10 .
+```
+
+Numeric literals respect cell width. With `%4` (32-bit cells), `#40960` sets the cell to 40960. With default 8-bit cells, values above 255 are truncated to the cell width.
+
+```bfpp
+%4 #40960               ; 32-bit cell set to 40960 (0xA000)
+%8 #1000                ; 64-bit cell set to 1000
+```
+
+---
+
+#### 4. Direct Cell Width
+
+`%N` sets the cell width at `ptr` to exactly N bytes, without cycling. This is cleaner than chaining `%` operators when you know the target width.
+
+| Syntax | Width   | Range                    | Equivalent `%` chain |
+|--------|---------|--------------------------|----------------------|
+| `%1`   | 8-bit   | 0-255                    | (default)            |
+| `%2`   | 16-bit  | 0-65535                  | `%`                  |
+| `%4`   | 32-bit  | 0-4294967295             | `%%`                 |
+| `%8`   | 64-bit  | 0-18446744073709551615   | `%%%`                |
+
+**Examples:**
+
+```bfpp
+%4 #40960               ; set cell to 32-bit, then set value to 40960
+%8 #1000                ; 64-bit cell with value 1000
+%1                      ; reset to 8-bit (default width)
+```
+
+Multi-byte cells occupy consecutive tape positions with little-endian byte order. The first byte position holds the width marker; subsequent bytes are marked as continuations.
+
+The cycling operator `%` (without a digit) still works as before: 8 -> 16 -> 32 -> 64 -> 8. `%N` is preferred in new code for clarity.
+
+---
+
+#### 5. Block Comments
+
+`/* ... */` block comments can span multiple lines and nest arbitrarily. Nesting is tracked by depth counter, so inner `/* */` pairs are handled correctly.
+
+```bfpp
+/* Single-line block comment */
+
+/*
+  Multi-line block comment.
+  Useful for documenting subroutine interfaces.
+
+  /* Nested comments work.
+     This is useful for temporarily commenting out
+     code that already contains block comments. */
+*/
+```
+
+Unterminated block comments (missing closing `*/`) are a compile-time error. A standalone `/` not followed by `*` is silently ignored (treated as a non-instruction character).
+
+Line comments (`;`) and block comments (`/* */`) can be used together. Line comments take precedence within a line -- a `/*` inside a `;` comment is not recognized.
+
+---
+
+#### 6. Subroutines
 
 **Definition:** `!#name{ body ^ }`
 
@@ -201,7 +298,7 @@ Rules:
 
 ---
 
-#### 4. Stack Operations
+#### 7. Stack Operations
 
 | Op  | Name | Semantics                                         |
 |-----|------|---------------------------------------------------|
@@ -231,13 +328,14 @@ $                     ; save current cell to stack
 
 ---
 
-#### 5. Extended Memory
+#### 8. Extended Memory
 
 | Op  | Name            | Semantics                                                        |
 |-----|-----------------|------------------------------------------------------------------|
 | `@` | Absolute addr   | `ptr = tape[ptr]` -- jump pointer to address stored in cell      |
 | `*` | Dereference     | Next op targets `tape[tape[ptr]]` instead of `tape[ptr]`         |
 | `%` | Cell width cycle| Cycle cell bit-width: 8 -> 16 -> 32 -> 64 -> 8                  |
+| `%N`| Direct width    | Set cell width to N bytes (see section 4). N = 1, 2, 4, or 8    |
 | `T` | Tape addr       | Push `&tape[ptr]` (raw pointer to current cell) onto the stack   |
 
 **Absolute addressing (`@`):**
@@ -264,19 +362,23 @@ $                     ; save current cell to stack
 
 **Cell width cycling (`%`):**
 
-Cells default to 8-bit. `%` cycles the width at the current position: 8 -> 16 -> 32 -> 64 -> 8. Multi-byte cells use little-endian byte order and occupy consecutive tape positions.
+Cells default to 8-bit. `%` cycles the width at the current position: 8 -> 16 -> 32 -> 64 -> 8. Multi-byte cells use little-endian byte order and occupy consecutive tape positions. Use `%N` (direct width, see section 4) for clarity in new code.
 
 ```bfpp
 %                     ; cell at ptr is now 16-bit (uses 2 bytes)
 %%                    ; cell at ptr is now 64-bit (8->16->32)
 %%%                   ; 64-bit (8->16->32->64)
+
+; Preferred: direct width syntax
+%4                    ; 32-bit (equivalent to %%)
+%8                    ; 64-bit (equivalent to %%%)
 ```
 
 16-bit cells can hold values 0-65535. 64-bit cells are required for syscall arguments (addresses, large values).
 
 ---
 
-#### 6. Error Handling
+#### 9. Error Handling
 
 BF++ has a dedicated error register (`bfpp_err`), a 64-bit value separate from the tape.
 
@@ -358,7 +460,7 @@ Output: `6` followed by a newline.
 
 ---
 
-#### 7. Bitwise Operations
+#### 10. Bitwise Operations
 
 All bitwise ops operate on the current cell in-place, using `tape[ptr+1]` as the second operand where applicable.
 
@@ -398,7 +500,7 @@ All bitwise ops operate on the current cell in-place, using `tape[ptr+1]` as the
 
 ---
 
-#### 8. System Calls
+#### 11. System Calls
 
 The `\` operator executes a raw Linux syscall. Arguments are read from the tape starting at `ptr`:
 
@@ -436,7 +538,7 @@ Arguments are at 8-byte intervals (one 64-bit cell each). For syscall usage, you
 
 ---
 
-#### 9. FFI (Foreign Function Interface)
+#### 12. FFI (Foreign Function Interface)
 
 Call C functions from shared libraries:
 
@@ -460,7 +562,7 @@ The compiler links `-ldl` automatically when FFI is used.
 
 ---
 
-#### 10. Framebuffer
+#### 13. Framebuffer
 
 Enable with `--framebuffer WxH`:
 
@@ -485,7 +587,7 @@ bfpp game.bfpp --framebuffer 80x60
 
 ---
 
-#### 11. Preprocessor
+#### 14. Preprocessor
 
 The `!include` directive splices another file's contents into the source before lexing:
 
@@ -504,6 +606,192 @@ The `!include` directive splices another file's contents into the source before 
 **Cycle detection:** Re-including an already-visited file is silently skipped, supporting diamond-shaped include graphs.
 
 **Max include depth:** 64 levels.
+
+---
+
+#### 15. Compiler Intrinsics
+
+Compiler intrinsics are subroutine calls with names prefixed by `__` (double underscore). Instead of generating BF++ subroutine call/return sequences, the compiler replaces each intrinsic call with inline C code. This provides direct access to OS facilities (terminal control, time, environment, process management) and the TUI runtime library without raw syscall setup.
+
+**Calling convention:** Intrinsics read inputs from `tape[ptr]` and adjacent cells, and write outputs to `tape[ptr]`. Same as regular subroutines but implemented in C.
+
+**Terminal Control Intrinsics:**
+
+| Intrinsic           | Input                | Output               | Description                                        |
+|---------------------|----------------------|----------------------|----------------------------------------------------|
+| `!#__term_raw`      | --                   | err on failure       | Enter raw terminal mode (disable echo, canonical)  |
+| `!#__term_restore`  | --                   | --                   | Restore original terminal settings                 |
+| `!#__term_size`     | --                   | `[ptr]=cols, [ptr+1]=rows` | Get terminal dimensions                    |
+| `!#__term_alt_on`   | --                   | --                   | Enter alternate screen buffer                      |
+| `!#__term_alt_off`  | --                   | --                   | Exit alternate screen buffer                       |
+| `!#__term_mouse_on` | --                   | --                   | Enable mouse tracking (SGR mode)                   |
+| `!#__term_mouse_off`| --                   | --                   | Disable mouse tracking                             |
+
+**Time Intrinsics:**
+
+| Intrinsic           | Input                | Output               | Description                                        |
+|---------------------|----------------------|----------------------|----------------------------------------------------|
+| `!#__sleep`         | `[ptr]=ms`           | --                   | Pause execution for N milliseconds                 |
+| `!#__time_ms`       | --                   | `[ptr]=timestamp`    | Monotonic timestamp in milliseconds                |
+
+**Environment / Process Intrinsics:**
+
+| Intrinsic           | Input                | Output               | Description                                        |
+|---------------------|----------------------|----------------------|----------------------------------------------------|
+| `!#__getenv`        | null-term name at ptr| value written at ptr | Read environment variable (err 2 if not found)     |
+| `!#__exit`          | `[ptr]=exit_code`    | (does not return)    | Exit process with given code                       |
+| `!#__getpid`        | --                   | `[ptr]=pid`          | Get current process ID                             |
+| `!#__poll_stdin`    | `[ptr]=timeout_ms`   | `[ptr]=0 or 1`      | Poll stdin for available data (1=ready, 0=timeout) |
+
+**TUI Runtime Intrinsics** (see TUI Runtime section below):
+
+| Intrinsic           | Input                                       | Output               | Description                              |
+|---------------------|---------------------------------------------|----------------------|------------------------------------------|
+| `!#__tui_init`      | --                                          | --                   | Initialize TUI (raw mode, alt screen)    |
+| `!#__tui_cleanup`   | --                                          | --                   | Restore terminal, exit alt screen        |
+| `!#__tui_size`      | --                                          | `[ptr]=cols, [ptr+1]=rows` | Get terminal size                  |
+| `!#__tui_begin`     | --                                          | --                   | Begin frame (clear back buffer)          |
+| `!#__tui_end`       | --                                          | --                   | End frame (diff and render to terminal)  |
+| `!#__tui_put`       | `[ptr]=row, [+1]=col, [+2]=char, [+3]=fg, [+4]=bg` | --          | Draw single character to back buffer     |
+| `!#__tui_puts`      | `[ptr]=row, [+1]=col, string at [+2], fg/bg after null` | --    | Draw string to back buffer               |
+| `!#__tui_fill`      | `[ptr]=row, [+1]=col, [+2]=w, [+3]=h, [+4]=ch, [+5]=fg, [+6]=bg` | -- | Fill rectangle with character      |
+| `!#__tui_box`       | `[ptr]=row, [+1]=col, [+2]=w, [+3]=h, [+4]=style` | --          | Draw box (0=ASCII, 1=single, 2=rounded)  |
+| `!#__tui_key`       | `[ptr]=timeout_ms`                          | `[ptr]=keycode`      | Poll for keypress (-1 on timeout)        |
+
+**Working example -- intrinsics demo:**
+
+```bfpp
+!include "io.bfpp"
+
+; Read and print the HOME environment variable
+"HOME\0"
+<<<<<                       ; back to start of string
+!#__getenv                  ; overwrites string with value
+!#.>                        ; print result
+#10 . [-]                   ; newline
+
+; Print the process ID
+[-]
+!#__getpid                  ; tape[ptr] = pid
+!#.+                        ; print as decimal
+#10 .                       ; newline
+
+; Measure elapsed time
+[-]
+!#__time_ms                 ; timestamp before
+!#.+
+#10 .
+
+[-] #50                     ; 50 milliseconds
+!#__sleep                   ; pause
+
+[-]
+!#__time_ms                 ; timestamp after
+!#.+
+#10 .
+
+; Exit cleanly
+[-] #0
+!#__exit
+```
+
+Unrecognized intrinsic names (any `!#__` name not in the table above) emit a C comment warning and are otherwise ignored.
+
+---
+
+#### 16. TUI Runtime
+
+The TUI runtime (`runtime/bfpp_rt.{h,c}`) provides a double-buffered terminal UI system. It is linked automatically when any `__tui_*` intrinsic is used. The runtime handles raw mode, alternate screen, cursor hiding, and efficient diff-based rendering.
+
+**Architecture:**
+
+- **Double buffering:** `begin_frame` clears the back buffer. Draw operations write to the back buffer. `end_frame` diffs back vs front, emits only changed cells as ANSI sequences, then swaps buffers.
+- **Cell model:** Each terminal position is a Cell with up to 4 UTF-8 bytes, foreground color, and background color. Unicode box-drawing characters are supported.
+- **Color model:** 256-color mode. -1 = default terminal color. 0-7 = standard colors. 8-15 = bright colors. 16-231 = RGB cube. 232-255 = grayscale ramp.
+- **Resize handling:** `begin_frame` re-queries terminal dimensions and reallocates buffers on resize.
+- **Crash safety:** `bfpp_tui_init` registers `bfpp_tui_cleanup` via `atexit`, so the terminal is restored even on abnormal exit.
+
+**Key constants** (returned by `!#__tui_key`):
+
+| Constant             | Value | Key           |
+|----------------------|-------|---------------|
+| `BFPP_KEY_UP`        | 1000  | Up arrow      |
+| `BFPP_KEY_DOWN`      | 1001  | Down arrow    |
+| `BFPP_KEY_RIGHT`     | 1002  | Right arrow   |
+| `BFPP_KEY_LEFT`      | 1003  | Left arrow    |
+| `BFPP_KEY_HOME`      | 1004  | Home          |
+| `BFPP_KEY_END`       | 1005  | End           |
+| `BFPP_KEY_PGUP`      | 1006  | Page Up       |
+| `BFPP_KEY_PGDN`      | 1007  | Page Down     |
+| `BFPP_KEY_DEL`       | 1008  | Delete        |
+| `BFPP_KEY_BACKSPACE` | 127   | Backspace     |
+| `BFPP_KEY_ENTER`     | 13    | Enter         |
+| `BFPP_KEY_TAB`       | 9     | Tab           |
+| `BFPP_KEY_ESC`       | 27    | Escape        |
+| -1                   | -1    | Timeout       |
+
+**Box styles** (for `!#__tui_box`):
+
+| Style | Appearance                     |
+|-------|--------------------------------|
+| 0     | ASCII: `+--+`, `|  |`, `+--+` |
+| 1     | Single line: Unicode box chars |
+| 2     | Rounded: Unicode rounded chars |
+
+**Tutorial -- basic TUI application:**
+
+```bfpp
+; Initialize TUI: enters raw mode, alternate screen, hides cursor
+!#__tui_init
+
+; --- Main render loop ---
+; Begin a new frame
+!#__tui_begin
+
+; Draw a rounded box at row 2, col 5, width 30, height 8
+#2 > #5 > #30 > #8 > #2 <<<< !#__tui_box
+
+; Put a character 'X' at row 0, col 0, fg=green(2), bg=default(-1)
+; Note: -1 as unsigned 8-bit = 255, interpreted as (int8_t)255 = -1
+#0 > #0 > #88 > #2 > #255 <<<< !#__tui_put
+
+; Fill a 10x3 area at row 10, col 5 with '#', fg=red(1), bg=blue(4)
+#10 > #5 > #10 > #3 > #35 > #1 > #4 <<<<<< !#__tui_fill
+
+; End frame: diffs against previous frame, emits minimal ANSI updates
+!#__tui_end
+
+; Wait for a keypress (0 = block indefinitely)
+[-] #0
+!#__tui_key
+; tape[ptr] now holds the keycode (e.g., 1000 for Up arrow, 27 for Escape)
+
+; Cleanup: restores terminal
+!#__tui_cleanup
+```
+
+**Tutorial -- `__tui_puts` string drawing:**
+
+`__tui_puts` reads a null-terminated string starting at `tape[ptr+2]`, with fg color at the byte after the null terminator and bg color at the byte after that.
+
+```bfpp
+!#__tui_init
+!#__tui_begin
+
+; Draw "Hello" at row 3, col 10, fg=214 (gold), bg=17 (dark blue)
+; Layout: [ptr]=row, [ptr+1]=col, [ptr+2..]=string\0, [after_null]=fg, [after_null+1]=bg
+#3 > #10 > "Hello\0" #214 > #17
+; Navigate back to the row cell (ptr+0)
+; "Hello\0" = 6 bytes, then fg, bg = 2 more. Total from ptr+2: 8 bytes forward.
+; So from current position (ptr+2+8=ptr+10), go back 10:
+<<<<<<<<<<
+!#__tui_puts
+
+!#__tui_end
+
+[-] #0 !#__tui_key
+!#__tui_cleanup
+```
 
 ---
 
@@ -677,51 +965,56 @@ All require the caller to set up 64-bit syscall params at `ptr` before calling. 
 
 #### Module: tui.bfpp
 
-Terminal UI via ANSI escape sequences.
+Terminal UI via ANSI escape sequences. Rewritten with `#N` numeric literals for readability. Depends on `io.bfpp`.
 
 ```bfpp
 !include "tui.bfpp"
 ```
 
-| Subroutine  | Symbol | Description                                           |
-|-------------|--------|-------------------------------------------------------|
-| cursor_move | `!#cm` | Move cursor to (row, col). Single-digit 1-9 only.    |
-| clear       | `!#cl` | Clear screen.                                         |
-| set_color   | `!#co` | Set terminal color (ANSI 0-7 fg, 8-15 bg).           |
-| draw_box    | `!#db` | Draw ASCII box at (row, col, width, height).          |
+| Subroutine    | Symbol | Input                              | Description                                     |
+|---------------|--------|------------------------------------|-------------------------------------------------|
+| cursor_move   | `!#cm` | `[ptr]=row, [ptr+1]=col`          | Move cursor to (row, col). Supports 1-999.      |
+| set_color     | `!#co` | `[ptr]=fg, [ptr+1]=bg`            | Set 256-color mode (ESC[38;5;Nm / ESC[48;5;Nm) |
+| clear         | `!#cl` | --                                 | Clear screen and home cursor                     |
+| cursor_hide   | `!#ch` | --                                 | Hide cursor (ESC[?25l)                           |
+| cursor_show   | `!#cs` | --                                 | Show cursor (ESC[?25h)                           |
+| color_reset   | `!#cr` | --                                 | Reset colors to terminal default (ESC[0m)        |
+| draw_box      | `!#db` | `[ptr]=row, [+1]=col, [+2]=w, [+3]=h` | Draw ASCII box (+, -, \|). Min 2x2.        |
+| draw_hline    | `!#dl` | `[ptr]=row, [+1]=col, [+2]=len, [+3]=char` | Draw horizontal line of repeated char  |
+| draw_vline    | `!#dv` | `[ptr]=row, [+1]=col, [+2]=len, [+3]=char` | Draw vertical line of repeated char    |
+| read_key      | `!#kb` | --                                 | Read single keypress from stdin -> `tape[ptr]`   |
 
-**Color codes:**
-
-| Value | FG Color | Value | BG Color  |
-|-------|----------|-------|-----------|
-| 0     | Black    | 8     | Black BG  |
-| 1     | Red      | 9     | Red BG    |
-| 2     | Green    | 10    | Green BG  |
-| 3     | Yellow   | 11    | Yellow BG |
-| 4     | Blue     | 12    | Blue BG   |
-| 5     | Magenta  | 13    | Magenta BG|
-| 6     | Cyan     | 14    | Cyan BG   |
-| 7     | White    | 15    | White BG  |
+**Color codes:** 256-color ANSI. 0-7 standard, 8-15 bright, 16-231 RGB cube, 232-255 grayscale. Pass 255 for default (interpreted as -1 via int8 cast).
 
 **Usage:**
 
 ```bfpp
 !include "tui.bfpp"
 
-!#cl                  ; clear screen
+!#cl                              ; clear screen
+!#ch                              ; hide cursor
 
 ; Move cursor to row 3, col 5
-[-] +++ > [-] +++++ <
-!#cm
+#3 > #5 < !#cm
 
-; Set foreground green
-[-] ++
-!#co
+; Set 256-color: fg=214 (gold), bg=17 (dark blue)
+#214 > #17 < !#co
 
-; Draw a 10x5 box at row 1, col 1
-[-] + > [-] + > [-] ++++++++++ > [-] +++++ <<<
-!#db
+; Draw a 40x10 box at row 1, col 1
+#1 > #1 > #40 > #10 <<< !#db
+
+; Draw horizontal line of '-' at row 5, col 1, length 40
+#5 > #1 > #40 > #45 <<< !#dl
+
+; Draw vertical line of '|' at row 1, col 5, length 10
+#1 > #5 > #10 > #124 <<< !#dv
+
+!#cr                              ; reset colors
+!#cs                              ; show cursor
+!#kb                              ; wait for keypress
 ```
+
+Note: For advanced TUI applications requiring double-buffered rendering, use the `__tui_*` compiler intrinsics directly (see section 16) instead of these ANSI-sequence wrappers.
 
 ---
 
@@ -741,6 +1034,106 @@ Memory management within the tape.
 | free       | `!#mf` | No-op for bump allocator.                            |
 
 Note: `memcpy` and `memset` have fundamental limitations due to BF's single-pointer architecture (documented in source). `malloc` requires compile-time constant support or 16-bit+ cells to address the heap metadata region, which is not yet practical. For memory management, use known tape regions with manual offset tracking.
+
+---
+
+#### Module: graphics.bfpp
+
+SDL2 framebuffer drawing primitives. Requires `--framebuffer WxH` flag when compiling. Depends on `math.bfpp`.
+
+```bfpp
+!include "graphics.bfpp"
+```
+
+| Subroutine   | Symbol | Input                                                         | Description                           |
+|--------------|--------|---------------------------------------------------------------|---------------------------------------|
+| set_pixel    | `!#px` | `[P+0]=fb_off, [+1]=width, [+2]=x, [+3]=y, [+4]=r, [+5]=g, [+6]=b` | Write RGB to pixel (x,y)       |
+| get_pixel    | `!#gx` | `[P+0]=fb_off, [+1]=width, [+2]=x, [+3]=y`                  | Push r, g, b to stack                |
+| clear_fb     | `!#gc` | `[P+0]=fb_off, [+1]=width, [+2]=height, [+3]=r, [+4]=g, [+5]=b`     | Fill entire framebuffer with color |
+| fill_rect    | `!#fl` | `[P+0]=fb_off, [+1]=width, [+2]=rx, [+3]=ry, [+4]=rw, [+5]=rh, [+6]=r, [+7]=g, [+8]=b` | Fill rectangular area |
+| draw_hline   | `!#lh` | Same as `!#fl` but P+5 forced to 1                           | Draw horizontal line (delegates to fl)|
+| draw_rect    | `!#rc` | --                                                            | Not implementable (stub, see notes)   |
+| draw_line    | `!#ln` | --                                                            | Not implementable (stub, see notes)   |
+
+**Architecture:** The framebuffer is an RGB24 pixel array at `tape[BFPP_FB_OFFSET]`, where `BFPP_FB_OFFSET = TAPE_SIZE - (WIDTH * HEIGHT * 3)`. Each pixel = 3 bytes (R, G, B), row-major order. All functions require 32-bit cell width (`%4`) because framebuffer offsets exceed 8/16-bit ranges.
+
+**Limitation:** After `@` jump into the framebuffer, the pointer cannot return to the parameter area. Functions that use `@` leave `ptr` inside the framebuffer. Callers must re-establish `ptr` position after calling. `draw_rect` and `draw_line` (Bresenham's) are not implementable due to this constraint.
+
+**Tutorial -- draw a red pixel at (10, 20) on a 320x200 framebuffer:**
+
+```bfpp
+!include "graphics.bfpp"
+
+; Compile: bfpp program.bfpp --framebuffer 320x200
+
+%4                          ; 32-bit cells required
+#40960 >                    ; P+0 = fb_offset (0xA000 for 320x200 on 64K tape)
+#320 >                      ; P+1 = screen width
+#10 >                       ; P+2 = x
+#20 >                       ; P+3 = y
+#255 >                      ; P+4 = r (red = 255)
+#0 >                        ; P+5 = g
+#0                          ; P+6 = b
+<<<<<<                      ; back to P+0
+!#px                        ; set_pixel
+F                           ; flush framebuffer to display
+```
+
+**Tutorial -- clear screen to blue:**
+
+```bfpp
+%4
+#40960 >                    ; P+0 = fb_offset
+#320 >                      ; P+1 = width
+#200 >                      ; P+2 = height
+#0 >                        ; P+3 = r
+#0 >                        ; P+4 = g
+#255                        ; P+5 = b (blue = 255)
+<<<<<                       ; back to P+0
+!#gc                        ; clear_fb
+F                           ; flush
+```
+
+**Tutorial -- fill a red rectangle:**
+
+```bfpp
+%4
+#40960 >                    ; P+0 = fb_offset
+#320 >                      ; P+1 = screen width
+#50 >                       ; P+2 = rect x
+#30 >                       ; P+3 = rect y
+#100 >                      ; P+4 = rect width
+#60 >                       ; P+5 = rect height
+#255 >                      ; P+6 = r
+#0 >                        ; P+7 = g
+#0                          ; P+8 = b
+<<<<<<<<                    ; back to P+0
+!#fl                        ; fill_rect
+F                           ; flush
+```
+
+Note: `fill_rect` uses linear fill. Correct when `rx == 0` or `rw == screen_width`. For narrow rectangles not starting at x=0, pixels wrap at row boundaries. True row-by-row fill is blocked by the `@` single-jump constraint.
+
+---
+
+#### C Runtime Library
+
+The C runtime library (`runtime/bfpp_rt.h` and `runtime/bfpp_rt.c`) implements the TUI subsystem. It is compiled and linked automatically when any `__tui_*` intrinsic is used. The library provides:
+
+- **Terminal management:** Raw mode entry/exit, alternate screen, cursor visibility
+- **Double-buffered rendering:** Back buffer for drawing, front buffer for diff comparison, minimal ANSI output
+- **Cell model:** Each terminal cell stores up to 4 UTF-8 bytes + fg/bg colors (int16)
+- **Box drawing:** ASCII, single-line Unicode, and rounded Unicode styles
+- **Key input:** Escape sequence parsing for arrow keys, home/end, page up/down, delete
+
+The runtime is not intended to be called directly from C code (though it can be). BF++ programs access it through the `__tui_*` intrinsics, which the compiler translates into C function calls.
+
+**Files:**
+
+| File                   | Contents                                           |
+|------------------------|----------------------------------------------------|
+| `runtime/bfpp_rt.h`   | Public API: function prototypes, key constants     |
+| `runtime/bfpp_rt.c`   | Implementation: buffers, rendering, input parsing  |
 
 ---
 

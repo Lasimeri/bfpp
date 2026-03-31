@@ -239,7 +239,11 @@ fn parse_single(tokens: &[Token], pos: &mut usize) -> Result<AstNode, ParseError
         Token::FramebufferFlush => Ok(AstNode::FramebufferFlush),
 
         // ── Immediate value & direct width ─────────────────────────
+        // NumericLit: #N or #0xHH — sets cell to an immediate value.
+        // The lexer already parsed the number; the AST stores it as u64.
         Token::NumericLit(val) => Ok(AstNode::SetValue(*val)),
+        // SetCellWidth: %1/%2/%4/%8 — sets cell width without cycling.
+        // Distinct from CellWidthCycle (bare %) which rotates through widths.
         Token::SetCellWidth(w) => Ok(AstNode::SetCellWidth(*w)),
 
         // ── FFI ─────────────────────────────────────────────────────

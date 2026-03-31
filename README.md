@@ -1,6 +1,6 @@
 # BF++
 
-A Brainfuck superset transpiler that compiles to C, adding syscalls, subroutines, error handling, bitwise ops, stack operations, FFI, and an optional SDL2 framebuffer. Written in Rust. Produces self-contained, single-file C programs with an embedded runtime.
+A Brainfuck superset transpiler that compiles to C, adding syscalls, subroutines, error handling, bitwise ops, stack operations, FFI, numeric literals, compiler intrinsics (terminal, TUI, process, I/O), and optional SDL2 framebuffer graphics. Written in Rust. Produces self-contained, single-file C programs with an embedded runtime. Includes an external C runtime library for double-buffered TUI rendering.
 
 ---
 
@@ -26,6 +26,9 @@ A Brainfuck superset transpiler that compiles to C, adding syscalls, subroutines
 | `@` | Absolute address | `ptr = tape[ptr]` -- jump pointer to address stored in current cell |
 | `*` | Dereference | Prefix modifier: saves ptr, sets `ptr = tape[ptr]`, executes next op, restores ptr. `*+` increments `tape[tape[ptr]]` |
 | `%` | Cell width cycle | Cycle cell bit-width at ptr: 8 -> 16 -> 32 -> 64 -> 8. Multi-byte cells use little-endian layout in consecutive tape bytes |
+| `%1` `%2` `%4` `%8` | Direct cell width | Set cell width at ptr to 1/2/4/8 bytes without cycling. `%4` = 32-bit. Avoids needing `%%%` to reach a known width |
+| `#N` | Numeric literal (decimal) | `tape[ptr] = N` -- set current cell to immediate value N. Respects cell width (e.g., `#36864` in a `%4` cell) |
+| `#0xHH` | Numeric literal (hex) | `tape[ptr] = 0xHH` -- hex variant. `#0xFF` sets cell to 255. Supports full 64-bit range |
 | `"..."` | String literal | Write bytes to tape at ptr, advance ptr past last byte. Supports `\0 \n \r \t \\ \" \xHH` escapes |
 
 ### Stack
@@ -90,7 +93,8 @@ A Brainfuck superset transpiler that compiles to C, adding syscalls, subroutines
 
 | Symbol | Name | Semantics |
 |--------|------|-----------|
-| `;` | Comment | Line comment (to end of line) |
+| `;` | Line comment | Line comment (to end of line) |
+| `/* ... */` | Block comment | Nestable block comment. `/* outer /* inner */ still comment */` is valid. Unterminated block comment is a lex error |
 | `!include "file"` | Include | Preprocessor directive: splice file contents into source before lexing |
 
 ---
@@ -129,11 +133,11 @@ source.bfpp
 | Stage | File | Key Mechanism |
 |-------|------|---------------|
 | Preprocess | `preprocess.rs` | Line-by-line `!include` expansion. Resolves relative to source dir, then `--include` paths, then `./stdlib/`, then exe-adjacent `stdlib/`. Cycle detection via canonical path HashSet. Max depth 64 |
-| Lex | `lexer.rs` | Peek-based character dispatcher. Multi-char tokens (strings, subroutines, fd specs, FFI) consume inline. Backslash lookahead cloning for `\ffi` vs `\` disambiguation |
+| Lex | `lexer.rs` | Peek-based character dispatcher. Multi-char tokens (strings, subroutines, fd specs, FFI, numeric literals, block comments) consume inline. Backslash lookahead cloning for `\ffi` vs `\` disambiguation. `#N`/`#0xHH` parsed as decimal/hex immediates. `/* */` with nesting depth counter. `%N` disambiguated by lookahead for 1/2/4/8 |
 | Parse | `parser.rs` | `parse_block`/`parse_single` recursive descent. `BlockEnd` enum tracks context (`]` vs `}` vs EOF). Consecutive movement/arithmetic tokens coalesced via `count_consecutive`. `*` recursively wraps the next single op. `R{...}K{...}` pairing enforced here |
 | Analyze | `analyzer.rs` | Four passes: (1) collect sub defs/calls into HashSets, check for undefined calls; (2) detect duplicate defs with separate `seen` set; (3) warn on top-level `^`; (4) reject empty FFI names |
 | Optimize | `optimizer.rs` | Ordered peephole passes: clear-loop -> scan-loop -> multiply-move -> error-folding. Each pass recurses into all block-containing nodes |
-| Codegen | `codegen.rs` | Emits C header (includes, defines, runtime state, helper functions, errno mapping, syscall wrapper, constructor, optional SDL2 framebuffer, optional dlfcn), forward-declares subs, emits sub bodies with call-depth guards, then main(). Subroutine names mangled for C identifier compatibility |
+| Codegen | `codegen.rs` | Emits C header (includes, defines, runtime state, helper functions, errno mapping, syscall wrapper, constructor, optional SDL2 framebuffer, optional dlfcn), forward-declares subs, emits sub bodies with call-depth guards, then main(). Subroutine names mangled for C identifier compatibility. `__`-prefixed sub calls are intercepted as compiler intrinsics (inline C emission). Intrinsic usage detection drives conditional `#include` emission and TUI runtime linking |
 
 ---
 
@@ -145,7 +149,7 @@ cargo build --release
 
 Binary at `target/release/bfpp`. Only dependency: `clap 4` (derive feature).
 
-Runtime requirements for generated programs: a C compiler (gcc/clang), POSIX libc. Optional: SDL2 (framebuffer mode), libdl (FFI mode).
+Runtime requirements for generated programs: a C compiler (gcc/clang), POSIX libc. Optional: SDL2 (framebuffer mode), libdl (FFI mode). Programs using `__tui_*` intrinsics require `runtime/bfpp_rt.{h,c}` (compiled and linked automatically by the `bfpp` driver).
 
 ---
 
@@ -215,11 +219,25 @@ bfpp ffi_demo.bfpp -o ffi_demo
 !#pr
 ```
 
+### Numeric Literals and Direct Cell Width
+
+```brainfuck
+/* Set a 32-bit cell to a large value */
+%4          ; 32-bit cell (direct, no cycling)
+#36864      ; tape[ptr] = 36864
+
+/* Hex literal for ASCII */
+#0x48 . #0 ; print 'H', then clear cell
+
+/* Mix with arithmetic */
+#65 +++++ . ; tape[ptr] = 65 + 5 = 70 = 'F', print
+```
+
 ### Error Handling
 
 ```brainfuck
 !#fail{
-  ++++++ e   ; set error register to 6 (ERR_INVALID_ARG)
+  #6 e       ; set error register to 6 (ERR_INVALID_ARG)
   ^
 }
 
@@ -227,7 +245,8 @@ R{
   !#fail     ; call subroutine that sets error
 }K{
   E          ; load error code into cell
-  ++++++++++++++++++++++++++++++++++++++++++++++++ .  ; add 48 -> ASCII '6', print
+  #48 >      ; put 48 ('0') in next cell
+  <[->+<]>.  ; add error code to 48 -> ASCII digit, print
 }
 ```
 
@@ -235,7 +254,7 @@ R{
 
 ## Standard Library
 
-8 modules, all written in BF++. Include via `!include "module.bfpp"` or `--include stdlib/`.
+9 modules, all written in BF++. Include via `!include "module.bfpp"` or `--include stdlib/`. All modules use `#N`/`%N` operators where applicable.
 
 ### Module Status
 
@@ -249,6 +268,7 @@ R{
 | **Memory** | `mem.bfpp` | `!#mc` memcpy, `!#ms` memset, `!#ma` malloc, `!#mf` free | Stubs. `!#ma` always returns ERR_OOM (4) -- bump allocator not feasible with 8-bit default cells (heap address >255). `!#mf` is a no-op. `!#mc`/`!#ms` fail due to @/stack round-trip limitations |
 | **TUI** | `tui.bfpp` | `!#cm` cursor_move, `!#cl` clear, `!#co` set_color, `!#db` draw_box | Working. ANSI escape sequences. `!#cm` limited to single-digit row/col (1-9). `!#db` draws box with +/-/\| characters |
 | **Error** | `err.bfpp` | `!#es` err_to_string, `!#ep` panic, `!#ea` assert | Working. `!#es` prints single-digit error codes (0-9). `!#ep` uses SYS_exit via `\`. `!#ea` calls `!#ep` on assertion failure |
+| **Graphics** | `graphics.bfpp` | `!#px` set_pixel, `!#gx` get_pixel, `!#gc` clear_fb, `!#fl` fill_rect, `!#lh` draw_hline, `!#rc` draw_rect (stub), `!#ln` draw_line (stub) | SDL2 framebuffer primitives. Requires `--framebuffer WxH` and `%4` (32-bit cells). `!#px`/`!#gx`/`!#gc`/`!#fl` working. `!#rc`/`!#ln` are stubs (not implementable due to `@` single-jump constraint). Includes math.bfpp for address computation |
 
 ### Calling Convention
 
@@ -339,17 +359,24 @@ Generated C uses `do { ... } while(0)` for the R block. `?` inside R emits `brea
 The codegen emits a single self-contained `.c` file. No external runtime library. Structure:
 
 ```
-[#includes: stdio, stdlib, string, stdint, errno, unistd, fcntl, socket, syscall, (dlfcn), (SDL2)]
+[#includes: stdio, stdlib, string, stdint, errno, unistd, fcntl, socket, syscall]
+[(conditional) termios, sys/ioctl.h  -- if __term_* intrinsics used]
+[(conditional) time.h               -- if __sleep/__time_ms used]
+[(conditional) poll.h               -- if __poll_stdin used]
+[(conditional) dlfcn.h              -- if FFI used]
+[(conditional) SDL2/SDL.h           -- if framebuffer enabled]
+[(conditional) bfpp_rt.h            -- if __tui_* intrinsics used]
 [#defines: TAPE_SIZE, TAPE_MASK, STACK_SIZE, CALL_DEPTH, BFPP_ERR_* codes, (FB dims)]
 [Static globals: tape[], ptr, bfpp_err, stack[], sp, bfpp_call_depth, cell_width[]]
-[Helper functions: bfpp_get/set (cell-width-aware), bfpp_push/pop, bfpp_cycle_width]
+[Helper functions: bfpp_get/set (cell-width-aware), bfpp_push/pop, bfpp_cycle_width, bfpp_set_width]
 [errno -> BFPP_ERR mapping: bfpp_errno_to_code()]
 [Syscall wrapper: bfpp_syscall_exec() -- reads 7 cells, issues syscall, maps errno]
 [Constructor: bfpp_init() -- memset tape/cell_width/stack via __attribute__((constructor))]
-[(SDL2 framebuffer: bfpp_fb_init/flush/cleanup)]
+[(conditional) terminal state: bfpp_saved_termios, bfpp_term_raw flag]
+[(conditional) SDL2 framebuffer: bfpp_fb_init/flush/cleanup]
 [Forward declarations: void bfpp_sub_NAME(void)]
 [Subroutine bodies: each with call-depth guard (prologue/epilogue)]
-[int main(void) { ... }]
+[int main(void) { ... }  -- intrinsic calls emitted inline]
 ```
 
 Key runtime properties:
@@ -361,7 +388,94 @@ Key runtime properties:
 
 ---
 
+## Compiler Intrinsics
+
+Subroutine calls with a `__` prefix are intercepted by the compiler and emitted as inline C code instead of BF++ subroutine call/return sequences. No `!#__name{...}` definition is needed -- these are built-in. The codegen detects which intrinsics a program uses and conditionally includes the required C headers (`<termios.h>`, `<sys/ioctl.h>`, `<poll.h>`, `<time.h>`, etc.).
+
+### Terminal Control
+
+| Intrinsic | Input | Output / Effect |
+|-----------|-------|-----------------|
+| `!#__term_raw` | -- | Enter raw terminal mode (disable echo, canonical mode, signals). Sets `bfpp_err = ERR_IO` on failure |
+| `!#__term_restore` | -- | Restore original terminal settings (saved at program start). No-op if not in raw mode |
+| `!#__term_size` | -- | `tape[ptr]` = columns, `tape[ptr+1]` = rows. Uses `ioctl(TIOCGWINSZ)` |
+| `!#__term_alt_on` | -- | Enter alternate screen buffer (`ESC[?1049h`) |
+| `!#__term_alt_off` | -- | Exit alternate screen buffer (`ESC[?1049l`) |
+| `!#__term_mouse_on` | -- | Enable mouse tracking (`ESC[?1000h`, SGR mode `ESC[?1006h`) |
+| `!#__term_mouse_off` | -- | Disable mouse tracking |
+
+### Time
+
+| Intrinsic | Input | Output / Effect |
+|-----------|-------|-----------------|
+| `!#__sleep` | `tape[ptr]` = milliseconds | Sleep for N milliseconds (`usleep`) |
+| `!#__time_ms` | -- | `tape[ptr]` = monotonic timestamp in milliseconds (`clock_gettime(CLOCK_MONOTONIC)`) |
+
+### Environment and Process
+
+| Intrinsic | Input | Output / Effect |
+|-----------|-------|-----------------|
+| `!#__getenv` | Null-terminated var name at `tape[ptr]` | Value written at `tape[ptr]` (overwrites name). Sets `ERR_NOT_FOUND` if undefined |
+| `!#__exit` | `tape[ptr]` = exit code | `exit(code)` -- terminates the program immediately |
+| `!#__getpid` | -- | `tape[ptr]` = current process ID |
+
+### Non-Blocking I/O
+
+| Intrinsic | Input | Output / Effect |
+|-----------|-------|-----------------|
+| `!#__poll_stdin` | `tape[ptr]` = timeout in ms | `tape[ptr]` = 1 if data available on stdin, 0 on timeout. Uses `poll()` |
+
+### TUI Runtime Intrinsics
+
+These require the C runtime library (`runtime/bfpp_rt.{h,c}`). The compiler auto-detects their usage and links the runtime.
+
+| Intrinsic | Input | Output / Effect |
+|-----------|-------|-----------------|
+| `!#__tui_init` | -- | Initialize TUI: save termios, enter raw mode, alternate screen, hide cursor. Registers `atexit` cleanup |
+| `!#__tui_cleanup` | -- | Restore terminal: show cursor, exit alternate screen, restore termios |
+| `!#__tui_size` | -- | `tape[ptr]` = columns, `tape[ptr+1]` = rows |
+| `!#__tui_begin` | -- | Begin frame: clear the back buffer for drawing |
+| `!#__tui_end` | -- | End frame: diff back buffer against front buffer, emit minimal ANSI updates |
+| `!#__tui_put` | `tape[ptr]` = row, `[ptr+1]` = col, `[ptr+2]` = char, `[ptr+3]` = fg, `[ptr+4]` = bg | Write single character to back buffer at (row, col) with colors |
+| `!#__tui_puts` | `tape[ptr]` = row, `[ptr+1]` = col, null-terminated string at `ptr+2`, fg/bg after null | Write string to back buffer |
+| `!#__tui_fill` | `tape[ptr]` = row, `[ptr+1]` = col, `[ptr+2]` = w, `[ptr+3]` = h, `[ptr+4]` = ch, `[ptr+5]` = fg, `[ptr+6]` = bg | Fill rectangular region in back buffer |
+| `!#__tui_box` | `tape[ptr]` = row, `[ptr+1]` = col, `[ptr+2]` = w, `[ptr+3]` = h, `[ptr+4]` = style | Draw box outline with border characters |
+| `!#__tui_key` | `tape[ptr]` = timeout in ms | `tape[ptr]` = keycode (ASCII or `BFPP_KEY_*` constants for arrows/special keys). Returns -1 on timeout |
+
+Color values: -1 = terminal default, 0-7 = standard ANSI, 8-15 = bright, 16-231 = 256-color RGB cube, 232-255 = grayscale.
+
+---
+
+## TUI Runtime Library
+
+`runtime/bfpp_rt.{h,c}` -- a C runtime library providing double-buffered terminal rendering. Compiled and linked automatically when any `__tui_*` intrinsic is used.
+
+### Architecture
+
+- **Double-buffered**: maintains `front[]` and `back[]` cell arrays. `begin_frame` clears the back buffer. Drawing primitives write to `back[]`. `end_frame` diffs against `front[]` and emits only changed cells as ANSI escape sequences, then swaps.
+- **Cell format**: each cell stores a UTF-8 character (up to 4 bytes), foreground color, and background color. Box-drawing characters (3-byte UTF-8) occupy one terminal column.
+- **Cursor optimization**: if the next changed cell is adjacent (same row, col+1), the cursor move sequence is omitted -- the terminal auto-advances. Reduces output by ~80% on typical screens.
+- **Input handling**: `poll_key` decodes ANSI escape sequences for arrow keys, Home/End, PgUp/PgDn, Delete into `BFPP_KEY_*` constants (1000+offset). Regular keys return their ASCII value.
+
+### Key Constants
+
+| Constant | Value | Key |
+|----------|-------|-----|
+| `BFPP_KEY_UP` | 1000 | Up arrow |
+| `BFPP_KEY_DOWN` | 1001 | Down arrow |
+| `BFPP_KEY_RIGHT` | 1002 | Right arrow |
+| `BFPP_KEY_LEFT` | 1003 | Left arrow |
+| `BFPP_KEY_HOME` | 1004 | Home |
+| `BFPP_KEY_END` | 1005 | End |
+| `BFPP_KEY_PGUP` | 1006 | Page Up |
+| `BFPP_KEY_PGDN` | 1007 | Page Down |
+| `BFPP_KEY_DEL` | 1008 | Delete |
+
+---
+
 ## Testing
+
+72 unit tests + 9 integration tests = 81 total.
 
 ### Unit Tests
 
@@ -369,7 +483,7 @@ Key runtime properties:
 cargo test
 ```
 
-Tests in each module: lexer (token emission for all operator classes, comments, strings, hex escapes, fd specs, FFI), parser (coalescing, nesting, bracket matching, deref, R/K pairing), analyzer (undefined subs, duplicates), optimizer (clear-loop, scan-loop, multiply-move, error-folding), codegen (hello world generation, sub codegen, error handling codegen, name mangling, tape addr, framebuffer, FFI), preprocessor (no-op, include resolution, cycle detection, escape handling, string-interior includes).
+Tests in each module: lexer (token emission for all operator classes, line comments, block comments, nested block comments, strings, hex escapes, fd specs, FFI, numeric literals, direct cell width), parser (coalescing, nesting, bracket matching, deref, R/K pairing), analyzer (undefined subs, duplicates), optimizer (clear-loop, scan-loop, multiply-move, error-folding), codegen (hello world generation, sub codegen, error handling codegen, name mangling, tape addr, framebuffer, FFI, intrinsics -- sleep, exit, tui, terminal), preprocessor (no-op, include resolution, cycle detection, escape handling, string-interior includes).
 
 ### Integration Tests
 
@@ -419,6 +533,7 @@ bfpp/
     mem.bfpp              -- memcpy (stub), memset (stub), malloc (stub), free (no-op)
     tui.bfpp              -- cursor_move, clear, set_color, draw_box
     err.bfpp              -- err_to_string, panic, assert
+    graphics.bfpp         -- SDL2 framebuffer: set_pixel, get_pixel, clear_fb, fill_rect, draw_hline
   spec/
     BFPP_SPEC.md          -- Full language specification
     ERROR_CODES.md        -- Error code table and errno mapping
@@ -439,7 +554,9 @@ bfpp/
       test_*.bfpp         -- Test source files
       classic_bf/         -- Classic BF compatibility tests
   benchmarks/             -- Performance benchmarks
-  runtime/                -- Runtime support files
+  runtime/
+    bfpp_rt.h             -- TUI runtime header (API, key constants, color defines)
+    bfpp_rt.c             -- TUI runtime impl (double-buffered renderer, input decoder)
 ```
 
 ---
@@ -461,7 +578,7 @@ Data stack (4096 x 64-bit entries), call stack (256 frames), and cell-width meta
 ## Known Limitations
 
 - **Stdlib multi-address operations**: `strcmp`, `strcpy`, `memcpy`, `memset`, `malloc` are stubs or severely constrained. BF's single-pointer architecture makes operations requiring two independent memory positions fundamentally difficult. `@` is a one-way jump that destroys positional context, and stack LIFO ordering prevents interleaving return addresses with data.
-- **8-bit default cells**: Syscall args, addresses, and heap operations require 64-bit cells (`%%%` to cycle width three times). Setting large values (>255) in cells requires repeated `+` or string literal tricks.
+- **8-bit default cells**: Syscall args, addresses, and heap operations require wider cells (`%4` for 32-bit or `%8` for 64-bit). Large values are set with `#N` (e.g., `%4 #36864`), eliminating the need for repeated `+` increments.
 - **Platform-specific syscall numbers**: `file.bfpp` and `net.bfpp` use Linux x86_64 syscall numbers (read=0, write=1, open=2, close=3, socket=41, etc.).
 - **Framebuffer resolution**: Bounded by tape size. Default 64KB tape supports ~90x90 pixels max. Increase with `--tape-size`.
 - **TUI single-digit coordinates**: `!#cm` cursor_move supports row/col 1-9 only.

@@ -1,14 +1,31 @@
 ; BF++ Standard Library: mem.bfpp
 ; Memory operations using #N (numeric literal) and %N (direct cell width).
 ;
-; Heap: bump allocator using tape[0x9000] as 16-bit next-free pointer.
-; Allocatable range: 0x1000-0xFFFF.
-; Call !#mi once before using !#ma.
+; ── Indirect Access Pattern: *$ and *~ ────────────────────────────
+;   *$ (deref-push): reads tape[tape[ptr]] without moving ptr.
+;     Internally: saves ptr, jumps to the address stored in the current cell,
+;     pushes the value found there onto the stack, then restores ptr.
+;   *~ (deref-pop): pops the stack into tape[tape[ptr]] without moving ptr.
+;     Internally: saves ptr, jumps to the address stored in the current cell,
+;     pops the top-of-stack into that cell, then restores ptr.
+;   These two operators make arbitrary-address read/write possible while
+;   keeping the pointer at the caller's working area. Without them, jumping
+;   to an address via @ is one-way (ptr cannot return).
+;
+; ── Heap Architecture ─────────────────────────────────────────────
+;   Bump allocator. tape[0x9000] holds a 16-bit "next free" pointer.
+;   Allocatable range: 0x1000-0xFFFF (avoids low tape used by programs).
+;   Call !#mi once before using !#ma.
+;   No free/coalesce — !#mf is a no-op. Reset via re-calling !#mi.
 
 ; !#mi — heap_init: initialize heap metadata
 ; Sets tape[0x9000] = 0x1000 (first allocatable address).
 ; Must be called once before any !#ma calls.
 ; Clobbers: ptr+0 (cleared after).
+;
+; Method: load 0x1000 into current cell, push to stack, load 0x9000 into
+; current cell, then *~ (deref-pop) writes the stacked 0x1000 into
+; tape[0x9000]. This avoids needing to move the pointer to address 0x9000.
 !#mi{
     [-]                         ; clear ptr+0
     %2 #0x1000                  ; ptr+0 = 0x1000 (initial heap base, 16-bit)
@@ -24,6 +41,14 @@
 ; Input:  tape[ptr] = requested size (in cells)
 ; Output: tape[ptr] = allocated base address (16-bit)
 ; Requires: !#mi called once before first use.
+;
+; Algorithm:
+;   1. Move size to ptr+1 (free up ptr+0 as scratch).
+;   2. Read tape[0x9000] (next-free pointer) via *$ into ptr+0.
+;   3. Split old_nf into two copies: ptr+2 (return value) and ptr+3 (for add).
+;   4. Add size to ptr+3 → new_nf = old_nf + size.
+;   5. Write new_nf back to tape[0x9000] via *~ (deref-pop).
+;   6. Move the saved old_nf from ptr+2 to ptr+0 as the return value.
 ;
 ; Cell layout: ptr+0 = working, ptr+1 = size, ptr+2 = old_nf, ptr+3 = new_nf
 ; LIMITATION: 16-bit addresses only (0-65535). No bounds checking.
@@ -77,9 +102,12 @@
 ; Uses *$ (deref-push) and *~ (deref-pop) for indirect memory access.
 ;
 ; Per iteration:
-;   1. *$ at src_addr → pushes tape[tape[src_addr]]
-;   2. *~ at dest_addr → pops into tape[tape[dest_addr]]
-;   3. Increment both addresses, decrement count
+;   1. *$ at src_addr → pushes tape[tape[src_addr]] (reads from source)
+;   2. *~ at dest_addr → pops into tape[tape[dest_addr]] (writes to dest)
+;   3. Increment both addresses (+), decrement count (-)
+; The addresses in ptr+0 and ptr+1 act as "address registers" that get
+; bumped each iteration, while *$ and *~ handle the indirection transparently.
+; ptr never leaves the working area (ptr+0..ptr+2).
 ;
 ; LIMITATION: src and dest ranges must not overlap.
 ; LIMITATION: Assumes byte-width cells at src/dest.

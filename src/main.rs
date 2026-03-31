@@ -242,8 +242,12 @@ fn main() {
         cc_cmd.args(["-ldl"]);
     }
 
-    // TUI runtime: compile bfpp_rt.c alongside the generated C and add its
-    // include path. Searches CWD/runtime first, then alongside the executable.
+    // TUI runtime: when any __tui_* intrinsic is used, the generated C calls
+    // functions defined in bfpp_rt.c (double-buffered cell grid, box drawing,
+    // key polling). We need to:
+    //   1. Add -I<dir> so the compiler finds bfpp_rt.h
+    //   2. Compile bfpp_rt.c as an additional source file
+    // Search order: ./runtime/ (development), then <exe_dir>/runtime/ (installed).
     if codegen_result.uses_tui_runtime {
         let runtime_paths = [
             PathBuf::from("runtime"),

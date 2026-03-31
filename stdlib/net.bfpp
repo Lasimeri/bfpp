@@ -134,7 +134,17 @@
     ; --- Save fd ---
     $                                       ; push fd. Stack: [fd]
 
-    ; --- Move input bytes into sockaddr_in ---
+    ; --- Move input bytes into sockaddr_in layout at P+8..P+23 ---
+    ; sockaddr_in is 16 bytes:
+    ;   P+8  = 0x02 (AF_INET)      P+9  = 0x00 (padding)
+    ;   P+10 = port_hi (big-endian) P+11 = port_lo
+    ;   P+12 = IP_A                 P+13 = IP_B
+    ;   P+14 = IP_C                 P+15 = IP_D
+    ;   P+16..P+23 = sin_zero (8 bytes of 0, already clean)
+    ;
+    ; Moves are destructive: each [->.....+.....<] zeroes the source cell
+    ; and adds its value to the destination. Input cells are consumed.
+
     ; port_hi: P+5 → P+10 (delta +5)
     >>>>> [->>>>>+<<<<<] <<<<<              ; ptr = P+0
 
@@ -153,12 +163,12 @@
     ; IP_D: P+4 → P+15 (delta +11)
     >>>> [->>>>>>>>>>>+<<<<<<<<<<<] <<<<    ; ptr = P+0
 
-    ; --- Set sockaddr_in header ---
+    ; --- Set sockaddr_in header byte ---
     >>>>>>>> %1 #2                          ; P+8 = AF_INET (0x02)
-    ; P+9 = 0x00 (already zero, high byte of AF_INET)
-    ; P+10 = port_hi, P+11 = port_lo  (moved above)
-    ; P+12..15 = IP_A..D              (moved above)
-    ; P+16..23 = 0                    (zero padding, clean area)
+    ; P+9 = 0x00 (already zero, high byte of AF_INET in little-endian)
+    ; P+10 = port_hi, P+11 = port_lo  (moved above, big-endian per spec)
+    ; P+12..15 = IP_A..D              (moved above, network byte order)
+    ; P+16..23 = 0                    (sin_zero padding, clean area)
 
     ; --- Push sockaddr address ---
     T                                       ; push &tape[P+8]. Stack: [fd, &sa]
@@ -282,10 +292,12 @@
     \                                       ; bind(fd, &sa, 16)
     ?                                       ; bail on error
 
-    ; fd is still at P+32 (syscall doesn't clobber arg cells)
+    ; fd is still at P+32 — the \ operator writes the return value to P+24
+    ; (slot 0) but leaves arg slots P+32/P+40/P+48 intact. This lets us
+    ; reuse fd in slot 1 across consecutive syscalls without re-pushing it.
 
     ; ═══ SYSCALL 3: listen(fd, 5) ═══
-    ; P+32 still has fd. Set other slots.
+    ; P+32 still has fd. Only need to set syscall nr and backlog.
     %8 #50                                  ; P+24 = SYS_listen
     >>>>>>>>>>>>>>>> %8 #5                  ; P+40 = backlog (5)
     >>>>>>>> %8 #0                          ; P+48 = 0 (unused)

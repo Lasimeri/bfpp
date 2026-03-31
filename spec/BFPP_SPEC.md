@@ -28,6 +28,17 @@ BF++ source files use UTF-8 encoding. Only ASCII characters are semantically sig
 +++ ; this is a comment
 ```
 
+### 2.2b Block Comments
+
+`/* ... */` encloses a block comment. Block comments may span multiple lines and support nesting.
+
+```
++ /* this is a block comment */ -
++ /* outer /* nested */ still comment */ -
+```
+
+Unterminated block comments are a compile-time error.
+
 ### 2.3 String Literals
 
 `"..."` encloses a string literal. Standard C escape sequences are supported:
@@ -70,11 +81,17 @@ Brackets must be balanced. Unmatched brackets are a compile-time error.
 | `@` | Absolute address | `ptr = tape[ptr]` — set pointer to the value stored in the current cell |
 | `*` | Dereference | Subsequent operation targets `tape[tape[ptr]]` instead of `tape[ptr]`. Modifier applies to the next single operator only. |
 | `%` | Cell width cycle | Cycle cell width at current position: 8 → 16 → 32 → 64 → 8 bits. Affects how the cell at `ptr` is interpreted for arithmetic and I/O. |
+| `%N` | Direct cell width | Set cell width at current position directly. N must be 1, 2, 4, or 8. See below. |
+| `#N` | Numeric literal | Set current cell to immediate value N. Supports decimal and `#0xHH` hex. See below. |
 | `"..."` | String literal | Write ASCII bytes to tape starting at `ptr`, advance `ptr` past last written byte. See Section 2.3. |
 
 **Dereference (`*`) details**: `*` is a prefix modifier. `*+` increments `tape[tape[ptr]]`. `*.` outputs `tape[tape[ptr]]`. `*,` reads into `tape[tape[ptr]]`. The modifier is consumed after one operation.
 
 **Cell width (`%`) details**: Cell width is tracked per-cell in a separate metadata array. Multi-byte cells occupy consecutive tape positions (little-endian). A 16-bit cell at position N uses bytes N and N+1. A 32-bit cell uses N..N+3. A 64-bit cell uses N..N+7.
+
+**Direct cell width (`%N`) details**: `%1`, `%2`, `%4`, `%8` set the cell width at the current position to the specified byte count directly, without cycling through intermediate widths. Before setting the new width, old continuation bytes from the previous width are released. If any sub-cell required by the new width is already in use (continuation byte of another cell or an independent wide cell), the operation reverts to width 1 and sets error register to 6 (`ERR_INVALID_ARG`). `%N` is preferred over `%` when the target width is known at write time.
+
+**Numeric literal (`#N`) details**: `#N` sets the current cell to the immediate value N. Supports decimal (`#72`, `#40960`) and hexadecimal (`#0xFF`, `#0x9000`). The value is written respecting the current cell width — writing a value larger than the cell width's range is truncated. `#N` replaces the previous cell value entirely (equivalent to `bfpp_set(ptr, N)`). This operator eliminates the need for long increment chains (`+++...+++`) to set cells to known values.
 
 ### 3.3 Stack & Subroutine Operators
 
@@ -154,6 +171,116 @@ All bitwise operations respect the current cell width at `ptr`.
 | `;` | Comment | Ignore all characters until end of line |
 
 Standard BF loops (`[`/`]`) remain the primary control flow mechanism. Combined with subroutines and error propagation, they provide sufficient control flow for systems programming.
+
+### 3.8 Compiler Intrinsics
+
+Compiler intrinsics are subroutine calls whose names start with `__` (double underscore). Instead of dispatching to a BF++ subroutine body, the compiler replaces the call with inline C code. This bridges the gap between BF++ operators and C-level system APIs that cannot be expressed in pure BF++.
+
+Intrinsics are invoked with standard subroutine call syntax: `!#__name`.
+
+#### 3.8.1 Terminal Control
+
+| Intrinsic | Args | Effect |
+|-----------|------|--------|
+| `__term_raw` | — | Enter raw terminal mode (disable echo, canonical mode, signals). Sets `bfpp_err` on failure. |
+| `__term_restore` | — | Restore terminal to saved state (before raw mode). No-op if not in raw mode. |
+| `__term_size` | — | `tape[ptr]` = columns, `tape[ptr+1]` = rows. Sets `bfpp_err` on ioctl failure. |
+| `__term_alt_on` | — | Enter alternate screen buffer (`ESC[?1049h`). |
+| `__term_alt_off` | — | Exit alternate screen buffer (`ESC[?1049l`). |
+| `__term_mouse_on` | — | Enable mouse tracking (`ESC[?1000h`, `ESC[?1006h`). |
+| `__term_mouse_off` | — | Disable mouse tracking. |
+
+Terminal intrinsics emit `#include <termios.h>` and `#include <sys/ioctl.h>`. The initial terminal state is captured in a constructor that runs before `main()`, so `__term_restore` always has a known-good state to revert to.
+
+#### 3.8.2 Time
+
+| Intrinsic | Args | Effect |
+|-----------|------|--------|
+| `__sleep` | `tape[ptr]` = milliseconds | Pause execution for the specified duration. |
+| `__time_ms` | — | `tape[ptr]` = monotonic timestamp in milliseconds (`CLOCK_MONOTONIC`). |
+
+#### 3.8.3 Environment
+
+| Intrinsic | Args | Effect |
+|-----------|------|--------|
+| `__getenv` | `ptr` -> null-terminated var name | Reads the environment variable. Value overwrites the name at `ptr`. Sets `bfpp_err = 2` if not found. |
+
+#### 3.8.4 Process
+
+| Intrinsic | Args | Effect |
+|-----------|------|--------|
+| `__exit` | `tape[ptr]` = exit code | Terminate the process immediately with the given exit code. |
+| `__getpid` | — | `tape[ptr]` = current process ID. |
+
+#### 3.8.5 Non-blocking I/O
+
+| Intrinsic | Args | Effect |
+|-----------|------|--------|
+| `__poll_stdin` | `tape[ptr]` = timeout in ms | `tape[ptr]` = 1 if data ready on stdin, 0 if timeout. |
+
+#### 3.8.6 TUI Runtime
+
+The TUI intrinsics require the C runtime library (`bfpp_rt.h`). When any `__tui_*` intrinsic is used, the compiler emits `#include "bfpp_rt.h"` and sets the `uses_tui_runtime` flag, which tells the build driver to compile and link the TUI runtime.
+
+| Intrinsic | Args | Effect |
+|-----------|------|--------|
+| `__tui_init` | — | Initialize TUI: save termios, enter raw mode, alternate screen, hide cursor. Registers atexit cleanup. |
+| `__tui_cleanup` | — | Restore terminal: show cursor, exit alternate screen, restore termios. |
+| `__tui_size` | — | `tape[ptr]` = columns, `tape[ptr+1]` = rows. |
+| `__tui_begin` | — | Begin a frame (clear back buffer for double-buffered rendering). |
+| `__tui_end` | — | End frame: diff back buffer against front buffer, emit minimal ANSI updates. |
+| `__tui_put` | `tape[ptr]`=row, `[ptr+1]`=col, `[ptr+2]`=char, `[ptr+3]`=fg, `[ptr+4]`=bg | Place a single character in the back buffer. |
+| `__tui_puts` | `tape[ptr]`=row, `[ptr+1]`=col, null-terminated string at ptr+2, fg after null, bg after fg | Place a string in the back buffer. |
+| `__tui_fill` | `tape[ptr]`=row, `[ptr+1]`=col, `[ptr+2]`=w, `[ptr+3]`=h, `[ptr+4]`=char, `[ptr+5]`=fg, `[ptr+6]`=bg | Fill a rectangular region in the back buffer. |
+| `__tui_box` | `tape[ptr]`=row, `[ptr+1]`=col, `[ptr+2]`=w, `[ptr+3]`=h, `[ptr+4]`=style | Draw a box with Unicode box-drawing characters. |
+| `__tui_key` | `tape[ptr]` = timeout in ms | `tape[ptr]` = keycode (-1 on timeout). Handles escape sequences for arrow/special keys. |
+
+**Color values**: -1 = default terminal color, 0-7 = standard colors, 8-15 = bright colors, 16-231 = 216-color RGB cube, 232-255 = grayscale ramp.
+
+**Special key constants** (returned by `__tui_key`):
+
+| Code | Key |
+|------|-----|
+| 1000 | Up |
+| 1001 | Down |
+| 1002 | Right |
+| 1003 | Left |
+| 1004 | Home |
+| 1005 | End |
+| 1006 | Page Up |
+| 1007 | Page Down |
+| 1008 | Delete |
+| 127 | Backspace |
+| 13 | Enter |
+| 9 | Tab |
+| 27 | Escape |
+
+### 3.9 C Runtime Library (`bfpp_rt.h`)
+
+The C runtime library provides a double-buffered TUI subsystem for programs that need terminal UI beyond what ANSI escape sequences in BF++ can efficiently provide. It is automatically linked when any `__tui_*` intrinsic is used.
+
+**Architecture**:
+- Double-buffered cell grid: back buffer is written to via draw primitives, `end_frame` diffs against the front buffer and emits only changed cells as ANSI escape sequences.
+- Raw terminal mode with atexit cleanup for crash safety.
+- Alternate screen buffer for clean terminal restore on exit.
+- Input polling with configurable timeout and escape sequence decoding for special keys (arrows, home/end, page up/down, delete).
+
+**API** (C functions, called indirectly via `__tui_*` intrinsics):
+
+| Function | Signature |
+|----------|-----------|
+| `bfpp_tui_init` | `void bfpp_tui_init(void)` |
+| `bfpp_tui_cleanup` | `void bfpp_tui_cleanup(void)` |
+| `bfpp_tui_get_size` | `void bfpp_tui_get_size(int *cols, int *rows)` |
+| `bfpp_tui_begin_frame` | `void bfpp_tui_begin_frame(void)` |
+| `bfpp_tui_end_frame` | `void bfpp_tui_end_frame(void)` |
+| `bfpp_tui_put` | `void bfpp_tui_put(int row, int col, uint8_t ch, int fg, int bg)` |
+| `bfpp_tui_puts` | `void bfpp_tui_puts(int row, int col, const char *str, int fg, int bg)` |
+| `bfpp_tui_fill` | `void bfpp_tui_fill(int row, int col, int w, int h, uint8_t ch, int fg, int bg)` |
+| `bfpp_tui_box` | `void bfpp_tui_box(int row, int col, int w, int h, int style)` |
+| `bfpp_tui_poll_key` | `int bfpp_tui_poll_key(int timeout_ms)` |
+
+The runtime is defined in `runtime/bfpp_rt.h` (header) with the implementation compiled and linked by the build driver.
 
 ---
 
@@ -281,6 +408,10 @@ BF++ transpiles to C11. The generated C code includes `bfpp_runtime.h` which pro
 | `s` | `tape[ptr] <<= tape[ptr+1];` |
 | `r` | `tape[ptr] >>= tape[ptr+1];` |
 | `n` | `tape[ptr] = ~tape[ptr];` |
+| `#N` | `bfpp_set(ptr, <value>ULL);` — e.g. `#72` emits `bfpp_set(ptr, 72ULL);` |
+| `%N` | `cell_width[ptr] = N;` (with sub-cell release/validation) |
+| `/* ... */` | *(removed during lexing)* |
+| `!#__name` | *(inline C — see Section 3.8)* |
 
 ### 6.3 Subroutine Transpilation
 

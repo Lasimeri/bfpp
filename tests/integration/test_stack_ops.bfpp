@@ -1,0 +1,21 @@
+; Push values, pop in reverse
+#65 $ [-]   ; push 'A', clear cell
+#66 $ [-]   ; push 'B'
+#67 $ [-]   ; push 'C'
+
+; Pop and print (LIFO: C, B, A)
+~ .         ; 'C'
+~ .         ; 'B'
+~ .         ; 'A'
+
+; Test T (tape address) — push address, verify it's nonzero
+[-]
+T           ; push &tape[ptr]
+~           ; pop address into cell
+; Address should be nonzero (it's a C pointer)
+; if nonzero: print 'Y'
+[
+    [-] #89 .       ; print 'Y'
+]
+
+#10 .               ; newline

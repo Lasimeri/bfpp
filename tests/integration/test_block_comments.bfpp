@@ -1,0 +1,12 @@
+; Test: Block comments — /* ... */ with nesting
+; Verifies: basic block comment, multi-line, nested comments
+
+#79 . /* this is a block comment */ #75 . #10 .  ; "OK\n"
+
+/* multi
+   line
+   comment */ #89 .                               ; 'Y'
+
+/* nested /* inner comment */ still in outer */ #69 . ; 'E'
+
+#83 . #10 .                                       ; "S\n"

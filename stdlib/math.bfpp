@@ -22,6 +22,10 @@
 
 ; !#m/ — unsigned divide: tape[ptr] = tape[ptr] / tape[ptr+1]
 ; Uses esolangs divmod algorithm. Workspace: ptr+2..ptr+4 must be zero.
+; NOTE: The divmod kernel [->-[>+>>]>[+[-<+>]>+>>]<<<<<] operates on the
+; layout [n d 0 0 0] but actually touches 6 cells (positions 0-5) during
+; its conditional branching. Position 5 must be zero on entry or results
+; are corrupted. The caller is responsible for ensuring ptr+5 is clear.
 ; Error 6 if divisor == 0.
 !#m/{
     >>[-]>[-]>[-]<<<<       ; clear ptr+2, ptr+3, ptr+4
@@ -42,6 +46,7 @@
 
 ; !#m% — unsigned modulo: tape[ptr] = tape[ptr] % tape[ptr+1]
 ; Uses esolangs divmod algorithm. Workspace: ptr+2..ptr+4 must be zero.
+; NOTE: Same 6-cell caveat as !#m/ — ptr+5 must be zero on entry.
 ; Error 6 if divisor == 0.
 !#m%{
     >>[-]>[-]>[-]<<<<       ; clear ptr+2, ptr+3, ptr+4

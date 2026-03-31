@@ -47,11 +47,13 @@ BF++ uses a flat tape with conventionally designated regions. The tape is a cont
        │                                  │
 0x9FFF ├──────────────────────────────────┤
 0xA000 │                                  │
-       │       Framebuffer                │
-       │       (24,576 bytes)             │
+       │       Framebuffer (if enabled)   │
+       │       (W * H * 3 bytes)          │
        │                                  │
        │  Pixel data (when --framebuffer  │
        │  is enabled). RGB888 format.     │
+       │  BFPP_FB_OFFSET is dynamic:      │
+       │  TAPE_SIZE - (W * H * 3).        │
        │  Unused if framebuffer disabled. │
        │                                  │
 0xFFFF └──────────────────────────────────┘
@@ -95,19 +97,25 @@ BF++ uses a flat tape with conventionally designated regions. The tape is a cont
   - 0x8100–0x87FF: Read buffer (1,792 bytes)
   - 0x8800–0x8FFF: Write buffer (2,048 bytes)
 
-### Reserved (0x9000–0x9FFF)
+### Reserved / Heap Metadata (0x9000–0x9FFF)
 
-- 4 KB reserved for future use
-- Potential uses: heap metadata for `malloc`/`free`, thread-local storage, debug info
+- 4 KB reserved for heap metadata and future use
+- **Heap allocator metadata** (used by `mem.bfpp`):
+  - `tape[0x9000]` (16-bit): next-free pointer for the bump allocator
+  - Initialized to `0x1000` by `!#mi` (heap_init)
+  - Allocatable range: `0x1000`–`0xFFFF` (or up to framebuffer offset if enabled)
+- Remaining space (0x9002–0x9FFF): reserved for future use (thread-local storage, debug info, etc.)
 
-### Framebuffer (0xA000–0xFFFF)
+### Framebuffer (dynamic offset–end of tape)
 
-- 24,576 bytes for pixel data
+- Pixel data region for SDL2 framebuffer rendering
 - Only active when `--framebuffer WxH` flag is passed to compiler
 - RGB888 format: 3 bytes per pixel (R, G, B)
-- Maximum resolution at default tape size: ~90x90 pixels (8,192 pixels)
-- Larger resolutions require `--tape-size` increase
-- Runtime flushes this region to an SDL surface each frame
+- **Dynamic offset**: `BFPP_FB_OFFSET = TAPE_SIZE - (WIDTH * HEIGHT * 3)`. The framebuffer is placed at the *end* of the tape, not at a hardcoded address. For the default 64 KB tape with 320x200 resolution: `65536 - (320 * 200 * 3) = 65536 - 192000` — which exceeds the default tape size, requiring `--tape-size` increase.
+- For a 320x200 framebuffer: requires `--tape-size` of at least 192000 + general purpose space. `BFPP_FB_OFFSET` would be e.g. `262144 - 192000 = 70144 (0x11200)` with a 256 KB tape.
+- The legacy address `0xA000` shown in the overview table is a convention for the default 64 KB tape with small framebuffers (e.g., 90x90). Always use `BFPP_FB_OFFSET` (a C `#define` in generated code) rather than hardcoding an address.
+- BF++ source code cannot reference C `#define` values directly. Callers must pass the framebuffer offset as a parameter (e.g., `#40960` for 0xA000) or compute it from known tape size and resolution.
+- Runtime flushes this region to an SDL texture each frame via the `F` operator
 
 ---
 

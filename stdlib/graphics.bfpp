@@ -98,8 +98,9 @@
     <<<<<<<<                    ; ptr=P+3
     <<<                         ; ptr=P+0
 
-    ; Step 3: Compute address in P+7..P+14
-    ; P+7=fb, P+8=w, P+9=x, P+10=y
+    ; Step 3: Compute pixel byte address in scratch cells P+7..P+14
+    ; Starting state: P+7=fb_offset, P+8=width, P+9=x, P+10=y
+    ; Goal: P+12 = fb_offset + (y * width + x) * 3
 
     ; Copy y (P+10) → P+11 using P+12
     >>>>>>>>>>                  ; P+10
@@ -172,9 +173,15 @@
 ; Input:  P+0 = fb_offset, P+1 = width, P+2 = x, P+3 = y
 ; Workspace: P+4..P+12 must be zero.
 ; Output: Stack (bottom→top): r, g, b. Caller pops b, g, r.
-;         All inputs preserved. ptr ends at pixel addr+2 in framebuffer.
+;         All inputs (P+0..P+3) preserved via copy-with-restore pattern.
+;         ptr ends at pixel addr+2 in framebuffer (not at P+0).
 ;
-; Algorithm: Compute pixel address, @ jump, push RGB to stack.
+; Algorithm:
+;   1. Copy y, w to scratch (P+4, P+5). Compute y*w via !#m*.
+;   2. Copy x to P+5, add to P+4 → linear pixel index.
+;   3. Multiply by 3 for byte offset. Add fb_offset → absolute address.
+;   4. @ jump to computed address.
+;   5. Push R, G, B bytes to stack (caller pops in reverse: b, g, r).
 !#gx{
     ; Copy y (P+3) → P+4 using P+5
     >>>                         ; P+3
@@ -287,6 +294,11 @@
     ; Layout: [0]=counter, [1]=r, [2]=g, [3]=b ✓
 
     ; Sliding-window fill loop
+    ; Pattern: a 4-cell window [counter, R, G, B] slides forward by 3 each
+    ; iteration. Each step copies R,G,B to the 3 cells immediately after B,
+    ; then moves the counter 3 cells forward. The RGB template stays adjacent
+    ; to the counter, so the window advances through the framebuffer linearly.
+    ; This avoids needing to return to a fixed origin — the working set moves.
     [                           ; while counter > 0
         -                       ; dec counter
 
@@ -346,9 +358,10 @@
 ;
 ; Algorithm:
 ;   1. Compute start address = fb_offset + (ry * screen_width + rx) * 3
-;   2. Compute fill_count = rw * rh
-;   3. Push r, g, b, fill_count; @ jump to start address
-;   4. Sliding-window fill (same as gc)
+;      Uses scratch area P+9..P+13 for intermediate multiply/add.
+;   2. Compute fill_count = rw * rh → P+12, using P+12..P+15 scratch.
+;   3. Push r, g, b, fill_count; @ jump to start address (P+10).
+;   4. Pop into [counter, b, g, r], swap b↔r, sliding-window fill (same as gc).
 !#fl{
     ; Compute start address → P+10
 
@@ -435,7 +448,7 @@
     >>>[-<<<+>>>]               ; [1]=r, [4]=0; ptr=[4]
     <<<<                        ; ptr=[0]
 
-    ; Fill loop (same sliding window as gc)
+    ; Fill loop (same sliding-window pattern as !#gc — see its comments)
     [
         -
         >[->>>+>>>+<<<<<<]>>>>>>[-<<<<<<+>>>>>>]<<<<<< ; copy r→+4, restore from +7

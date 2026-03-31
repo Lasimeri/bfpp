@@ -146,9 +146,14 @@
 ; Persistent state at P+10..P+13 (beyond !#cm/!#.+ workspace P+0..P+9):
 ;   P+10 = cur_row, P+11 = col, P+12 = w, P+13 = remaining middle rows
 ;
-; Non-destructive copy via double-push pattern:
-;   Go to P+N, push twice, clear, pop once to restore → second copy on stack.
-;   Navigate to target cell, pop → target gets the copy, P+N is intact.
+; Non-destructive copy via double-push pattern ($$[-]~):
+;   $ pushes the cell's value to the stack (reads without clearing).
+;   Second $ pushes another copy. [-] zeroes the cell. ~ pops one copy back,
+;   restoring the original value. The second copy remains on the stack.
+;   Navigate to the target cell, ~ pops the remaining copy into it.
+;   Net effect: cell is preserved, target gets a copy. No temp cells needed.
+;   This pattern is used throughout draw_box because !#cm clobbers P+0..P+9,
+;   so persistent values must live at P+10+ and be copied in before each call.
 ; ==========================================================================
 !#db{
     ; --- Setup: move inputs to persistent cells P+10..P+13 ---

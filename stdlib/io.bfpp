@@ -79,8 +79,12 @@
 
 ; !#,< — read_line: read from stdin until newline or EOF
 ; Reads bytes into tape starting at ptr. Null-terminates.
-; Returns bytes read count in tape[ptr] (after null).
-; Actually: just reads until newline, stores at ptr, null-terminates.
+;
+; LIMITATION: BF's , operator returns 0 on EOF in most interpreters, but
+; the BF++ runtime may vary. The loop exits on 0 (EOF) but does NOT detect
+; newline (10) — the newline byte is stored in the tape like any other char.
+; In cooked terminal mode, the OS delivers a full line including \n on Enter.
+; The caller must scan for and strip the trailing \n if needed.
 !#,<{
     ; Read char by char until newline (10) or EOF (0)
     ,                       ; read first byte

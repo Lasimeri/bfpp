@@ -1,6 +1,15 @@
 #ifndef BFPP_RT_H
 #define BFPP_RT_H
 
+/*
+ * bfpp_rt.h — Public API for the BF++ double-buffered TUI runtime.
+ *
+ * Lifecycle: init → (begin_frame → draw → end_frame)* → cleanup
+ * Drawing functions operate on a back buffer. end_frame() diffs against the
+ * front buffer and emits minimal ANSI updates to the terminal.
+ * Input is non-blocking via poll_key() with configurable timeout.
+ */
+
 #include <stdint.h>
 
 /* ── Terminal UI subsystem ─────────────────────────────────────── */
@@ -31,22 +40,30 @@ void bfpp_tui_box(int row, int col, int w, int h, int style);
 // for arrow keys (returns 1000+offset for special keys).
 int bfpp_tui_poll_key(int timeout_ms);
 
-// Key constants for special keys
-#define BFPP_KEY_UP     1000
-#define BFPP_KEY_DOWN   1001
-#define BFPP_KEY_RIGHT  1002
-#define BFPP_KEY_LEFT   1003
-#define BFPP_KEY_HOME   1004
-#define BFPP_KEY_END    1005
-#define BFPP_KEY_PGUP   1006
-#define BFPP_KEY_PGDN   1007
-#define BFPP_KEY_DEL    1008
-#define BFPP_KEY_BACKSPACE 127
-#define BFPP_KEY_ENTER  13
-#define BFPP_KEY_TAB    9
-#define BFPP_KEY_ESC    27
+// Key constants for special keys.
+// Values 1000+ are synthetic codes for multi-byte escape sequences,
+// chosen to avoid collision with any valid byte value (0-255).
+// Values below 128 are their literal ASCII/control codes.
+#define BFPP_KEY_UP     1000    // ESC [ A  or  ESC O A
+#define BFPP_KEY_DOWN   1001    // ESC [ B  or  ESC O B
+#define BFPP_KEY_RIGHT  1002    // ESC [ C  or  ESC O C
+#define BFPP_KEY_LEFT   1003    // ESC [ D  or  ESC O D
+#define BFPP_KEY_HOME   1004    // ESC [ H  or  ESC O H
+#define BFPP_KEY_END    1005    // ESC [ F  or  ESC O F
+#define BFPP_KEY_PGUP   1006    // ESC [ 5 ~
+#define BFPP_KEY_PGDN   1007    // ESC [ 6 ~
+#define BFPP_KEY_DEL    1008    // ESC [ 3 ~
+#define BFPP_KEY_BACKSPACE 127  // ASCII DEL
+#define BFPP_KEY_ENTER  13      // ASCII CR
+#define BFPP_KEY_TAB    9       // ASCII HT
+#define BFPP_KEY_ESC    27      // bare ESC (no following sequence bytes)
 
-// Colors: -1 = default, 0-7 standard, 8-15 bright, 16-231 RGB cube, 232-255 grayscale
+// Colors use xterm-256 encoding:
+//   -1       = terminal default (emits ESC[39m / ESC[49m)
+//   0-7      = standard ANSI colors (black, red, green, yellow, blue, magenta, cyan, white)
+//   8-15     = bright/bold variants of standard colors
+//   16-231   = 6x6x6 RGB color cube: index = 16 + 36*r + 6*g + b  (r,g,b in 0-5)
+//   232-255  = 24-step grayscale ramp (232=dark gray ... 255=white)
 #define BFPP_COLOR_DEFAULT (-1)
 
 #endif /* BFPP_RT_H */

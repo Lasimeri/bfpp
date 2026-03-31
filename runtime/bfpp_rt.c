@@ -1,3 +1,24 @@
+/*
+ * bfpp_rt.c — BF++ TUI runtime: double-buffered terminal rendering engine
+ *
+ * Architecture:
+ *   Two Cell buffers (front_buf and back_buf) represent the terminal grid.
+ *   Drawing functions write into back_buf only. On end_frame(), the engine
+ *   diffs back_buf against front_buf and emits the minimal set of ANSI
+ *   escape sequences to update the real terminal. After the diff, back_buf
+ *   is copied into front_buf so the next frame starts from a known state.
+ *
+ *   All ANSI output is batched into an 8KB write buffer (out_buf) and
+ *   flushed as a single write(2) call to minimize syscall overhead and
+ *   avoid tearing from interleaved partial writes.
+ *
+ *   Terminal is switched to raw mode (no echo, no line buffering, no signal
+ *   generation) and the alternate screen buffer for full-screen TUI. Cleanup
+ *   is registered via atexit() for crash safety.
+ *
+ * Threading: Not thread-safe. All calls must come from the main thread.
+ */
+
 #include "bfpp_rt.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,26 +43,31 @@ typedef struct {
 
 /* ── Static state ──────────────────────────────────────────────── */
 
-static struct termios orig_termios;
-static int raw_mode       = 0;
-static int tui_initialized = 0;
-static int term_cols      = 80;
-static int term_rows      = 24;
-static Cell *front_buf    = NULL;
-static Cell *back_buf     = NULL;
+static struct termios orig_termios;      /* saved terminal state for cleanup restore */
+static int raw_mode       = 0;          /* guard: prevent double-enter/exit of raw mode */
+static int tui_initialized = 0;         /* guard: prevent double-init and track cleanup eligibility */
+static int term_cols      = 80;         /* current terminal width (updated on begin_frame) */
+static int term_rows      = 24;         /* current terminal height (updated on begin_frame) */
+static Cell *front_buf    = NULL;       /* what the terminal currently displays */
+static Cell *back_buf     = NULL;       /* what the next frame should display */
 
 /* Track current terminal color state to avoid redundant SGR sequences.
    -2 = unknown/uninitialized, forcing first cell to always emit colors. */
 static int last_fg = -2;
 static int last_bg = -2;
 
-/* Output buffer for batching ANSI writes before flush */
+/* Output buffer: batches ANSI writes into a single write(2) call per flush.
+   Reduces syscall overhead and prevents tearing from partial writes.
+   8KB is large enough for a full-screen redraw of a typical 80x24 terminal
+   (worst case ~10 bytes/cell for cursor move + color + char ≈ 19KB),
+   but flushes mid-frame if the buffer fills during a heavily-changed frame. */
 #define OUT_BUF_SIZE 8192
 static char out_buf[OUT_BUF_SIZE];
 static int  out_len = 0;
 
 /* ── Output buffer helpers ─────────────────────────────────────── */
 
+/* Drain the output buffer to stdout via write(2). */
 static void flush_out(void)
 {
     if (out_len > 0) {
@@ -50,6 +76,8 @@ static void flush_out(void)
     }
 }
 
+/* Append raw bytes to the output buffer, flushing as needed.
+   Handles data larger than the buffer by chunking. */
 static void out_raw(const char *data, int len)
 {
     while (len > 0) {
@@ -71,6 +99,8 @@ static void out_str(const char *s)
     out_raw(s, (int)strlen(s));
 }
 
+/* Append a printf-formatted string to the output buffer.
+   Max 255 chars per call (sufficient for any single ANSI sequence). */
 static void out_fmt(const char *fmt, ...)
 {
     char tmp[256];
@@ -146,6 +176,10 @@ static int cell_eq(const Cell *a, const Cell *b)
     return memcmp(a->utf8, b->utf8, a->len) == 0;
 }
 
+/* Allocate (or reallocate on resize) both cell buffers.
+   The front buffer is poisoned with fg=-2 so that every cell miscompares
+   on the first end_frame(), forcing a full redraw. Subsequent frames
+   only redraw cells that actually changed. */
 static void alloc_buffers(void)
 {
     size_t count = (size_t)term_cols * (size_t)term_rows;
@@ -241,7 +275,9 @@ void bfpp_tui_begin_frame(void)
     }
 }
 
-/* Emit ANSI color codes, only when color actually changes */
+/* Emit ANSI SGR color sequences, only when color actually changes from the
+   last emitted value. Uses 256-color mode (ESC[38;5;Nm / ESC[48;5;Nm).
+   fg/bg = -1 means "default terminal color" (ESC[39m / ESC[49m). */
 static void emit_color(int fg, int bg)
 {
     if (fg != last_fg) {
@@ -262,15 +298,26 @@ static void emit_color(int fg, int bg)
     }
 }
 
+/* Diff back_buf against front_buf and emit the minimum ANSI output to
+   synchronize the real terminal. Algorithm:
+     1. Reset color tracking to force re-emission on first changed cell.
+     2. Walk every cell linearly. Skip unchanged cells (the common case).
+     3. For changed cells, emit a cursor-move only if the cursor isn't
+        already at the right position (sequential writes auto-advance).
+     4. Emit color changes only when fg or bg actually differs from the
+        last emitted color (tracked via last_fg/last_bg).
+     5. Write the cell's UTF-8 bytes (1-4 bytes per cell).
+     6. After the loop, flush the output buffer and memcpy back→front. */
 void bfpp_tui_end_frame(void)
 {
     size_t count = (size_t)term_cols * (size_t)term_rows;
 
-    /* Reset color tracking at start of frame emit */
+    /* Reset color tracking at start of frame emit — the terminal's actual
+       color state is unknown after the previous frame's final sequence */
     last_fg = -2;
     last_bg = -2;
 
-    int cursor_row = -1;
+    int cursor_row = -1;  /* -1 = unknown position */
     int cursor_col = -1;
 
     for (size_t i = 0; i < count; i++) {
@@ -332,6 +379,10 @@ void bfpp_tui_put(int row, int col, uint8_t ch, int fg, int bg)
     back_buf[idx].bg = (int16_t)bg;
 }
 
+/* Write a UTF-8 string into the back buffer at (row, col).
+   Advances by one cell per Unicode codepoint (not per byte), so multi-byte
+   characters like box-drawing glyphs (3 bytes each) occupy one cell each.
+   Validates continuation bytes are present before storing. */
 void bfpp_tui_puts(int row, int col, const char *str, int fg, int bg)
 {
     if (!str || row < 0 || row >= term_rows) return;
@@ -466,6 +517,23 @@ static int read_byte(int timeout_ms)
     return (int)c;
 }
 
+/* Poll for a keypress. Returns -1 on timeout, an ASCII code for regular keys,
+   or a BFPP_KEY_* constant for special keys (arrows, home, end, etc).
+
+   Escape sequence parsing strategy:
+     ESC alone (27) is ambiguous — it could be a bare ESC keypress or the start
+     of a multi-byte sequence. We disambiguate by reading the next byte with a
+     50ms timeout: terminals emit sequence bytes with no inter-byte delay, so a
+     timeout means it was a bare ESC.
+
+     Two sequence families are handled:
+       CSI (ESC [):  Standard terminal sequences. Single-letter finales (A-D, H, F)
+                     are arrow/home/end. Numeric + ~ sequences (3~, 5~, 6~) are
+                     delete/pgup/pgdn.
+       SS3 (ESC O):  Alternate sequences sent by some terminals for the same keys.
+
+     Unknown sequences are consumed and return -1 to avoid feeding raw escape
+     bytes back to the caller as phantom keypresses. */
 int bfpp_tui_poll_key(int timeout_ms)
 {
     int c = read_byte(timeout_ms);

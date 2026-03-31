@@ -35,9 +35,15 @@
 | **Optimization** | None (typically interpreted) | Clear-loop, scan-loop, multiply-move, error folding | `-O1` (basic), `-O2` (full) |
 | **Standard library** | None | 8 modules: io, math, string, mem, err, file, net, tui | Written in BF++ itself |
 | **Compilation** | Typically interpreted | Transpiled to C11, compiled via `cc`. `--emit-c` available | Also supports direct C output for inspection |
-| **Comments** | Non-operator chars ignored (implicit) | `;` line comments (explicit) | BF's implicit comment behavior preserved |
+| **Comments** | Non-operator chars ignored (implicit) | `;` line comments + `/* */` block comments (nestable) | BF's implicit comment behavior preserved |
 | **Memory layout** | Flat, unstructured | Structured regions: general purpose, syscall params, I/O buffer, framebuffer | Conventions enforced by stdlib, not hardware |
 | **String handling** | Manual byte-by-byte placement | String literals with escape sequences (`\n`, `\t`, `\xHH`, etc.) | Written sequentially to tape from pointer |
+| **Numeric literals** | None; must chain `+` ops (72 `+` ops for value 72) | `#N` decimal, `#0xHH` hex -- set cell to immediate value | Eliminates O(N) `+` chains; supports hex for bitmask work |
+| **Direct cell width** | No multi-byte support at all | `%N` sets cell width directly (N = 1, 2, 4, 8 bytes); `%` cycles | No cycling required; jump straight to needed width |
+| **Block comments** | None (non-operators ignored, but no structured comment syntax) | `/* ... */` with nesting support | Nestable; can comment out code containing other comments |
+| **Compiler intrinsics** | None | `!#__name` intrinsics for terminal, time, env, process, I/O | Direct system integration without raw syscalls or FFI |
+| **TUI runtime** | Not possible | C runtime library (`bfpp_rt.h`) with double-buffered rendering | Full terminal UI: box drawing, key input, color, cursor control |
+| **Graphics primitives** | Not possible | `bfpp_tui_put`, `bfpp_tui_box`, `bfpp_tui_fill` via intrinsics | Write to back buffer; diff-render to terminal on `end_frame` |
 
 ---
 
@@ -513,8 +519,12 @@ Separate memory regions (not on the tape):
 | `T` | Tape address | Store current pointer address into cell |
 | `F` | Framebuffer flush | Flush pixel buffer to display |
 | `\ffi "l" "f"` | FFI call | Call C function from shared library |
-| `;` | Comment | Ignore rest of line |
+| `#N` | Numeric literal | `tape[ptr] = N` (decimal or `#0xHH` hex) |
+| `%N` | Direct cell width | Set cell to N bytes (1, 2, 4, or 8) without cycling |
+| `;` | Line comment | Ignore rest of line |
+| `/* ... */` | Block comment | Nestable block comment; can span lines |
 | `!include "f"` | Include | Preprocessor: splice file contents |
+| `!#__name` | Intrinsic | Compiler intrinsic; emits inline C (see intrinsic table) |
 
 ---
 
@@ -653,4 +663,217 @@ $                     ; save fd
 
   +                   ; keep looping
 ]
+```
+
+### Setting a Cell to 72
+
+**Standard BF:**
+```
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; 72 individual + operations to set cell to 72 ('H')
+; No shorthand exists. Value N always costs N operators.
+```
+
+**BF++:**
+```
+#72                   ; one operator. Cell is now 72.
+; Also supports hex: #0x48 is identical.
+```
+
+`#N` accepts decimal or `#0xHH` hex. The compiler emits a single `bfpp_set(ptr, 72ULL)` -- no loop, no chain. For any value N, BF costs O(N) operators; BF++ costs O(1).
+
+---
+
+### Block Comments
+
+**Standard BF:**
+```
+; Non-operator characters are ignored, so "comments" are freeform text
+; between operators. But there is no way to comment out a block of code
+; containing operators -- the operators still execute.
+; There is no structured comment syntax at all.
+```
+
+**BF++:**
+```
+; Line comment (single line)
+
+/* Block comment: can span
+   multiple lines, and can
+   /* nest inside each other */
+   without breaking. */
+
+/* Commenting out code that contains operators: */
+/* +++ [-] .  <-- none of this executes */
+```
+
+Block comments use `/* ... */` with nesting support. A `/*` inside a block comment opens a nested level; the comment only ends when all levels are closed. This allows commenting out code that itself contains block comments.
+
+---
+
+### Direct Cell Width
+
+**Standard BF:**
+```
+; All cells are 8-bit. No multi-byte values.
+; Maximum storable value: 255.
+; No way to work with 16-bit, 32-bit, or 64-bit integers.
+```
+
+**BF++:**
+```
+%  ; cycle: 8 -> 16 -> 32 -> 64 -> 8 bits (original syntax)
+%4 ; jump directly to 32-bit (4-byte) cell, no cycling needed
+%8 ; jump directly to 64-bit (8-byte) cell
+
+%8 #36864             ; 64-bit cell, set to 36864 -- impossible in BF
+%2 #0xFFFF            ; 16-bit cell, set to 65535
+%1                    ; back to 8-bit
+```
+
+`%` alone cycles through widths. `%N` (where N is 1, 2, 4, or 8) sets the width directly. Multi-byte cells occupy consecutive tape positions; sub-cells are marked as continuation bytes in the parallel width metadata array.
+
+---
+
+### Compiler Intrinsics
+
+**Standard BF:**
+```
+; No system integration. No terminal control. No time.
+; No environment variables. No process control.
+; The only I/O is single-byte stdin/stdout.
+```
+
+**BF++ -- Full intrinsic table:**
+
+Intrinsics are called as `!#__name` -- the double-underscore prefix distinguishes them from user-defined subroutines. The compiler emits inline C rather than a function call.
+
+| Intrinsic | Category | Input (tape layout) | Output |
+|-----------|----------|---------------------|--------|
+| `!#__term_raw` | Terminal | -- | Enter raw mode (no echo, no line buffering, no signals) |
+| `!#__term_restore` | Terminal | -- | Restore original terminal settings |
+| `!#__term_size` | Terminal | -- | `tape[ptr]`=cols, `tape[ptr+1]`=rows |
+| `!#__term_alt_on` | Terminal | -- | Enter alternate screen buffer |
+| `!#__term_alt_off` | Terminal | -- | Exit alternate screen buffer |
+| `!#__term_mouse_on` | Terminal | -- | Enable mouse tracking (SGR mode) |
+| `!#__term_mouse_off` | Terminal | -- | Disable mouse tracking |
+| `!#__sleep` | Time | `tape[ptr]`=milliseconds | Sleeps for duration |
+| `!#__time_ms` | Time | -- | `tape[ptr]`=monotonic timestamp (ms) |
+| `!#__getenv` | Environment | Null-terminated name at `tape[ptr]` | Value overwrites name at `tape[ptr]`; error if not found |
+| `!#__exit` | Process | `tape[ptr]`=exit code | Terminates process |
+| `!#__getpid` | Process | -- | `tape[ptr]`=process ID |
+| `!#__poll_stdin` | I/O | `tape[ptr]`=timeout (ms) | `tape[ptr]`=1 if data ready, 0 if timeout |
+
+**BF++ -- Terminal raw mode (one intrinsic):**
+```
+!#__term_raw          ; terminal is now in raw mode
+,                     ; read a keypress (no enter required, no echo)
+.                     ; echo it back
+!#__term_restore      ; restore normal terminal behavior
+```
+
+In standard BF, raw mode is impossible -- there is no terminal control mechanism. Even with raw syscalls, BF has no way to call `tcsetattr` because it has no system call interface.
+
+---
+
+### TUI Runtime
+
+**Standard BF:**
+```
+; Terminal applications are not possible.
+; No cursor control, no colors, no screen clearing,
+; no key input beyond stdin bytes, no buffered rendering.
+```
+
+**BF++** provides a C runtime library (`bfpp_rt.h`) with a double-buffered TUI renderer. The back buffer accumulates draw calls; `end_frame` diffs against the front buffer and emits minimal ANSI escape sequences.
+
+**TUI intrinsic table:**
+
+| Intrinsic | Input (tape layout) | Effect |
+|-----------|---------------------|--------|
+| `!#__tui_init` | -- | Save termios, enter raw mode, alternate screen, hide cursor, register atexit cleanup |
+| `!#__tui_cleanup` | -- | Show cursor, exit alternate screen, restore termios |
+| `!#__tui_size` | -- | `tape[ptr]`=cols, `tape[ptr+1]`=rows |
+| `!#__tui_begin` | -- | Begin frame: clear back buffer for drawing |
+| `!#__tui_end` | -- | End frame: diff back buffer vs front buffer, emit minimal ANSI updates |
+| `!#__tui_put` | `[ptr]`=row, `[ptr+1]`=col, `[ptr+2]`=char, `[ptr+3]`=fg, `[ptr+4]`=bg | Place one character with color |
+| `!#__tui_puts` | `[ptr]`=row, `[ptr+1]`=col, string at `[ptr+2]`, fg/bg after null | Place a string with color |
+| `!#__tui_fill` | `[ptr]`=row, `[ptr+1]`=col, `[ptr+2]`=w, `[ptr+3]`=h, `[ptr+4]`=ch, `[ptr+5]`=fg, `[ptr+6]`=bg | Fill a rectangle |
+| `!#__tui_box` | `[ptr]`=row, `[ptr+1]`=col, `[ptr+2]`=w, `[ptr+3]`=h, `[ptr+4]`=style | Draw a box with border characters |
+| `!#__tui_key` | `[ptr]`=timeout (ms) | Poll for keypress; `tape[ptr]`=keycode (-1 on timeout). Arrow keys return 1000+ offset. |
+
+Colors: -1 = default, 0-7 standard ANSI, 8-15 bright, 16-231 RGB cube, 232-255 grayscale.
+
+Special key constants: UP=1000, DOWN=1001, RIGHT=1002, LEFT=1003, HOME=1004, END=1005, PGUP=1006, PGDN=1007, DEL=1008, BACKSPACE=127, ENTER=13, TAB=9, ESC=27.
+
+---
+
+### Drawing a TUI Box
+
+**Standard BF:**
+```
+; Not possible. No terminal control, no cursor positioning,
+; no box-drawing characters, no buffered rendering.
+; Even with ANSI escape sequences manually output byte-by-byte,
+; there is no way to handle input, no double buffering,
+; and no way to restore terminal state on exit.
+```
+
+**BF++:**
+```
+!#__tui_init          ; raw mode + alternate screen + atexit cleanup
+
+!#__tui_begin         ; start frame (clear back buffer)
+
+; Draw a 30x10 box at row 2, col 5, style 0 (single-line border)
+#2 > #5 > #30 > #10 > #0
+<<<<
+!#__tui_box
+
+; Put text inside the box
+#3 > #7 > "Hello, TUI!\0"
+; fg=2 (green), bg=-1 (default) after the null
+> #2 > [-] -          ; -1 for bg (default)
+<<<<<<<<<<<<<<<
+!#__tui_puts
+
+!#__tui_end           ; diff-render to terminal
+
+; Wait for a keypress
+#0 !#__tui_key        ; block until key pressed
+
+!#__tui_cleanup       ; restore terminal
+```
+
+The runtime handles all ANSI escape sequence generation, cursor optimization (skips redundant moves), and color state tracking. The double-buffer diff means only changed cells are redrawn each frame -- suitable for 60fps animation loops.
+
+---
+
+### Game Loop Pattern
+
+**Standard BF:**
+```
+; Not possible.
+```
+
+**BF++:**
+```
+!#__tui_init
+
+[                         ; main loop
+  !#__tui_begin           ; start frame
+
+  ; ... draw game state via tui_put/tui_box/tui_fill ...
+
+  !#__tui_end             ; render frame
+
+  #16 !#__tui_key         ; poll input (16ms timeout = ~60fps)
+
+  ; tape[ptr] now contains keycode or -1
+  ; ... handle input, update state ...
+
+  +                       ; keep looping (set cell nonzero)
+]
+
+!#__tui_cleanup
 ```

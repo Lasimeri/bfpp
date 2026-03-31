@@ -4,6 +4,16 @@
 ; Linux x86_64 syscall numbers:
 ;   SYS_read  = 0,  SYS_write = 1,  SYS_open  = 2,  SYS_close = 3
 ;
+; ── Syscall Frame Pattern ─────────────────────────────────────────
+; All functions in this file follow the same frame setup pattern:
+;   1. Push arguments to the stack (order matters — pop is LIFO).
+;   2. Navigate to a clean 32-byte region (S = start of syscall frame).
+;   3. Set each 64-bit slot with %8 and either #N (constant) or ~ (pop from stack).
+;   4. Navigate back to S, execute \ (syscall). Result lands in tape[S].
+;   5. Push result to stack if needed.
+;   6. Clean up: %1 #0 each slot (restore byte-width, zero residue).
+;   7. Navigate back to the caller's input position, pop result.
+;
 ; The \ operator reads syscall params from tape[ptr]:
 ;   tape[ptr]    = syscall number  (64-bit, via bfpp_get)
 ;   tape[ptr+8]  = arg1            (64-bit)
@@ -60,7 +70,9 @@
     <<<<<<<<<<<<<<<<<<<<<<<<    ; ptr=S (24 left from S+24)
     \                           ; SYS_close, result in tape[S]
 
-    ; Clean up: restore all slots to 1-byte width, clear values
+    ; Clean up: restore all slots to 1-byte width and zero their values.
+    ; This is critical — %8 cells span 8 bytes each. Leaving them wide would
+    ; cause future 1-byte operations in this region to read stale high bytes.
     %1 #0                       ; S
     >>>>>>>> %1 #0              ; S+8
     >>>>>>>> %1 #0              ; S+16
@@ -96,12 +108,23 @@
 ;
 ; Tape layout during syscall (S = first clean byte after mode):
 ;   S+0..S+7   = 2 (SYS_open)    [%8]
-;   S+8..S+15  = &path            [%8]  (raw C pointer)
+;   S+8..S+15  = &path            [%8]  (raw C pointer via T)
 ;   S+16..S+23 = flags            [%8]
 ;   S+24..S+31 = mode             [%8]
 ;
-; Navigation back: after cleanup, scan left through non-zero path
-; bytes to return to the start. Requires tape cell before path = 0.
+; Step-by-step:
+;   1. T pushes the raw C address of path start (for syscall arg1).
+;   2. Scan right past path to find null terminator, read flags and mode.
+;   3. Push flags and mode to stack (popped in reverse order into syscall slots).
+;   4. Advance past mode into clean region (S). Build syscall frame:
+;      - Pop mode → S+24, flags → S+16, path_addr → S+8 (reverse pop order).
+;   5. Execute \ at S. Push resulting fd to stack.
+;   6. Clean up all 4 %8 slots back to %1 #0.
+;   7. Navigate back: from S, go left to null_pos, then [<] scans left through
+;      non-zero path bytes to find the zero cell BEFORE the path → >  = P.
+;   8. Pop fd into tape[P].
+;
+; Navigation back requires the cell immediately before the path = 0.
 !#fo{
     ; ptr=P (first byte of path)
     T                           ; push &tape[P] (path address) onto stack

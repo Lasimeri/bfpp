@@ -29,17 +29,23 @@ impl Default for CodegenOptions {
     }
 }
 
-/// Result of code generation: C source and metadata flags
+/// Result of code generation: C source and metadata flags.
+/// The metadata fields inform the compiler driver (main.rs) which
+/// libraries to link and which runtime files to compile alongside.
 pub struct CodegenResult {
     pub c_source: String,
+    /// True if the program contains any \ffi calls — triggers -ldl linking
     pub uses_ffi: bool,
+    /// True if any __tui_* intrinsics are used — triggers bfpp_rt.c compilation
     pub uses_tui_runtime: bool,
 }
 
 pub fn generate(program: &Program, opts: &CodegenOptions) -> CodegenResult {
     // Pre-scan for FFI usage so we know whether to #include <dlfcn.h>
     let uses_ffi = program_uses_ffi(&program.nodes);
-    // Pre-scan for intrinsic usage (headers, TUI runtime, etc.)
+    // Pre-scan for intrinsic usage so emit_header knows which C headers,
+    // state variables, and constructors to include (e.g., termios for __term_*,
+    // time.h for __sleep, bfpp_rt.h for __tui_*)
     let intrinsics = detect_intrinsics(&program.nodes);
     let uses_tui_runtime = intrinsics.tui;
     let c_source = generate_c(program, opts, uses_ffi, &intrinsics);
@@ -204,18 +210,23 @@ fn emit_header(opts: &CodegenOptions, uses_ffi: bool, intrinsics: &IntrinsicUsag
     if uses_ffi {
         h.push_str("#include <dlfcn.h>\n");
     }
-    // Intrinsic-specific headers
+    // Intrinsic-specific headers — only included when the corresponding
+    // intrinsic category is detected. Keeps the generated C minimal and
+    // avoids requiring headers that the system might not have (e.g., poll.h
+    // on exotic targets).
     if intrinsics.terminal {
-        h.push_str("#include <termios.h>\n");
-        h.push_str("#include <sys/ioctl.h>\n");
+        h.push_str("#include <termios.h>\n");   // tcgetattr/tcsetattr for raw mode
+        h.push_str("#include <sys/ioctl.h>\n"); // ioctl(TIOCGWINSZ) for terminal size
     }
     if intrinsics.time {
-        h.push_str("#include <time.h>\n");
+        h.push_str("#include <time.h>\n");      // clock_gettime for __time_ms
     }
     if intrinsics.poll {
-        h.push_str("#include <poll.h>\n");
+        h.push_str("#include <poll.h>\n");      // poll() for __poll_stdin
     }
     if intrinsics.tui {
+        // TUI runtime provides double-buffered cell grid, box drawing, and
+        // non-blocking key input. Compiled as a separate .c file by the driver.
         h.push_str("#include \"bfpp_rt.h\"\n");
     }
     h.push('\n');
@@ -283,7 +294,10 @@ fn emit_header(opts: &CodegenOptions, uses_ffi: bool, intrinsics: &IntrinsicUsag
     h.push_str("static int sp = 0;\n");
     h.push_str("static int bfpp_call_depth = 0;\n");
     h.push_str("static uint8_t cell_width[TAPE_SIZE]; /* 0=continuation, 1,2,4,8 */\n");
-    // Terminal intrinsic state — saved termios for raw/restore
+    // Terminal intrinsic state: saved_termios captures the original terminal
+    // settings before __term_raw modifies them, so __term_restore can revert.
+    // bfpp_term_raw tracks whether we're currently in raw mode to avoid
+    // double-restoring (which would be harmless but wasteful).
     if intrinsics.terminal {
         h.push_str("static struct termios bfpp_saved_termios;\n");
         h.push_str("static int bfpp_term_raw = 0;\n");
@@ -616,6 +630,8 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
         AstNode::SubDef(_, _) => {
             // Handled at top level — skip in-line
         }
+        // SubCall: names starting with "__" are compiler intrinsics (emitted
+        // as inline C), everything else is a regular subroutine call.
         AstNode::SubCall(name) => {
             if name.starts_with("__") {
                 emit_intrinsic(out, name, ctx);
@@ -987,31 +1003,43 @@ fn mangle_name(name: &str) -> String {
 fn emit_intrinsic(out: &mut String, name: &str, ctx: &mut GenCtx) {
     match name {
         // ── Terminal control ─────────────────────────────────
+        // __term_raw: switch stdin to raw mode (no echo, no line buffering,
+        // no signal generation). Clones saved_termios so restore can revert.
+        // VMIN=1/VTIME=0 means read() blocks until at least 1 byte arrives.
         "__term_raw" => {
             indent(out, ctx.indent);
             out.push_str("{ struct termios raw = bfpp_saved_termios; raw.c_lflag &= ~(ECHO | ICANON | ISIG); raw.c_cc[VMIN] = 1; raw.c_cc[VTIME] = 0; if (tcsetattr(0, TCSAFLUSH, &raw) < 0) bfpp_err = BFPP_ERR_IO; else bfpp_term_raw = 1; }\n");
         }
+        // __term_restore: revert to the original terminal mode captured at
+        // program start. No-op if not currently in raw mode.
         "__term_restore" => {
             indent(out, ctx.indent);
             out.push_str("if (bfpp_term_raw) { tcsetattr(0, TCSAFLUSH, &bfpp_saved_termios); bfpp_term_raw = 0; }\n");
         }
+        // __term_size: query terminal dimensions via TIOCGWINSZ ioctl.
+        // Output: tape[ptr]=cols, tape[ptr+1]=rows
         "__term_size" => {
-            // Output: tape[ptr]=cols, tape[ptr+1]=rows
             indent(out, ctx.indent);
             out.push_str("{ struct winsize ws; if (ioctl(0, TIOCGWINSZ, &ws) == 0) { bfpp_set(ptr, ws.ws_col); bfpp_set((ptr+1) & TAPE_MASK, ws.ws_row); } else { bfpp_err = BFPP_ERR_IO; } }\n");
         }
+        // __term_alt_on: switch to the alternate screen buffer (xterm ?1049h).
+        // Used by TUI apps so they don't clobber the user's scrollback.
         "__term_alt_on" => {
             indent(out, ctx.indent);
             out.push_str("fputs(\"\\033[?1049h\", stdout); fflush(stdout);\n");
         }
+        // __term_alt_off: return to the main screen buffer.
         "__term_alt_off" => {
             indent(out, ctx.indent);
             out.push_str("fputs(\"\\033[?1049l\", stdout); fflush(stdout);\n");
         }
+        // __term_mouse_on: enable X11 basic mouse tracking (?1000h) and SGR
+        // extended mouse format (?1006h) for coordinates > 223.
         "__term_mouse_on" => {
             indent(out, ctx.indent);
             out.push_str("fputs(\"\\033[?1000h\\033[?1006h\", stdout); fflush(stdout);\n");
         }
+        // __term_mouse_off: disable both mouse tracking modes.
         "__term_mouse_off" => {
             indent(out, ctx.indent);
             out.push_str("fputs(\"\\033[?1000l\\033[?1006l\", stdout); fflush(stdout);\n");
@@ -1058,51 +1086,78 @@ fn emit_intrinsic(out: &mut String, name: &str, ctx: &mut GenCtx) {
         }
 
         // ── TUI Runtime ──────────────────────────────────────────
+        // These intrinsics delegate to the bfpp_rt.c double-buffered terminal
+        // UI runtime. It provides a cell grid with per-cell fg/bg colors,
+        // diff-based rendering (only changed cells are redrawn), box drawing,
+        // and non-blocking keyboard input. All functions are defined in
+        // runtime/bfpp_rt.c and declared in runtime/bfpp_rt.h.
+
+        // __tui_init: initialize the TUI runtime (allocates cell buffers,
+        // enters raw mode, switches to alt screen).
         "__tui_init" => {
             indent(out, ctx.indent);
             out.push_str("bfpp_tui_init();\n");
         }
+        // __tui_cleanup: tear down the TUI runtime (frees buffers, restores
+        // terminal mode, returns to main screen).
         "__tui_cleanup" => {
             indent(out, ctx.indent);
             out.push_str("bfpp_tui_cleanup();\n");
         }
+        // __tui_size: query the TUI grid dimensions.
+        // Output: tape[ptr]=cols, tape[ptr+1]=rows
         "__tui_size" => {
-            // Output: tape[ptr]=cols, tape[ptr+1]=rows
             indent(out, ctx.indent);
             out.push_str("{ int c,r; bfpp_tui_get_size(&c,&r); bfpp_set(ptr,c); bfpp_set((ptr+1)&TAPE_MASK,r); }\n");
         }
+        // __tui_begin: start a new frame. Marks the front buffer as "drawing"
+        // so changes accumulate without flushing to the terminal.
         "__tui_begin" => {
             indent(out, ctx.indent);
             out.push_str("bfpp_tui_begin_frame();\n");
         }
+        // __tui_end: finish the frame. Diffs the front buffer against the back
+        // buffer and emits only the changed cells as ANSI escape sequences.
         "__tui_end" => {
             indent(out, ctx.indent);
             out.push_str("bfpp_tui_end_frame();\n");
         }
+        // __tui_put: write a single character with color to the cell grid.
+        // Input: tape[ptr]=row, [ptr+1]=col, [ptr+2]=char, [ptr+3]=fg, [ptr+4]=bg
+        // fg/bg are cast through int8_t so values 0-7 are normal ANSI colors
+        // and -1 means "default/no change".
         "__tui_put" => {
-            // Input: tape[ptr]=row, [ptr+1]=col, [ptr+2]=char, [ptr+3]=fg, [ptr+4]=bg
             indent(out, ctx.indent);
             out.push_str("bfpp_tui_put((int)bfpp_get(ptr), (int)bfpp_get((ptr+1)&TAPE_MASK), (uint8_t)bfpp_get((ptr+2)&TAPE_MASK), (int)(int8_t)bfpp_get((ptr+3)&TAPE_MASK), (int)(int8_t)bfpp_get((ptr+4)&TAPE_MASK));\n");
         }
+        // __tui_puts: write a null-terminated string at a position with color.
+        // Input: tape[ptr]=row, [ptr+1]=col, null-terminated string at ptr+2,
+        // fg at first byte after the null terminator, bg at the byte after that.
+        // This layout lets the caller pack position+text+color contiguously.
         "__tui_puts" => {
-            // Input: tape[ptr]=row, [ptr+1]=col, null-terminated string at ptr+2
-            // fg at first byte after null, bg at byte after that
             indent(out, ctx.indent);
             out.push_str("{ int r=(int)bfpp_get(ptr), c=(int)bfpp_get((ptr+1)&TAPE_MASK); char *s=(char*)&tape[(ptr+2)&TAPE_MASK]; int sl=strlen(s); int fg=(int)(int8_t)tape[(ptr+2+sl+1)&TAPE_MASK]; int bg=(int)(int8_t)tape[(ptr+2+sl+2)&TAPE_MASK]; bfpp_tui_puts(r,c,s,fg,bg); }\n");
         }
+        // __tui_fill: fill a rectangular region with a character and color.
+        // Input: tape[ptr]=row,[ptr+1]=col,[ptr+2]=width,[ptr+3]=height,
+        //        [ptr+4]=char,[ptr+5]=fg,[ptr+6]=bg
         "__tui_fill" => {
-            // Input: tape[ptr]=row,[ptr+1]=col,[ptr+2]=w,[ptr+3]=h,[ptr+4]=ch,[ptr+5]=fg,[ptr+6]=bg
             indent(out, ctx.indent);
             out.push_str("bfpp_tui_fill((int)bfpp_get(ptr), (int)bfpp_get((ptr+1)&TAPE_MASK), (int)bfpp_get((ptr+2)&TAPE_MASK), (int)bfpp_get((ptr+3)&TAPE_MASK), (uint8_t)bfpp_get((ptr+4)&TAPE_MASK), (int)(int8_t)bfpp_get((ptr+5)&TAPE_MASK), (int)(int8_t)bfpp_get((ptr+6)&TAPE_MASK));\n");
         }
+        // __tui_box: draw a box with border characters (single/double line).
+        // Input: tape[ptr]=row,[ptr+1]=col,[ptr+2]=width,[ptr+3]=height,
+        //        [ptr+4]=style (0=single, 1=double)
         "__tui_box" => {
-            // Input: tape[ptr]=row,[ptr+1]=col,[ptr+2]=w,[ptr+3]=h,[ptr+4]=style
             indent(out, ctx.indent);
             out.push_str("bfpp_tui_box((int)bfpp_get(ptr), (int)bfpp_get((ptr+1)&TAPE_MASK), (int)bfpp_get((ptr+2)&TAPE_MASK), (int)bfpp_get((ptr+3)&TAPE_MASK), (int)bfpp_get((ptr+4)&TAPE_MASK));\n");
         }
+        // __tui_key: poll for a keypress with timeout.
+        // Input: tape[ptr]=timeout in milliseconds (0 = non-blocking)
+        // Output: tape[ptr]=keycode, or -1 (0xFFFFFFFF...) if no key within timeout.
+        // The double cast (int64_t then uint64_t) preserves the -1 sentinel
+        // through the unsigned tape cell.
         "__tui_key" => {
-            // Input: tape[ptr]=timeout_ms
-            // Output: tape[ptr]=keycode (-1 for timeout)
             indent(out, ctx.indent);
             out.push_str("bfpp_set(ptr, (uint64_t)(int64_t)bfpp_tui_poll_key((int)bfpp_get(ptr)));\n");
         }
@@ -1115,24 +1170,34 @@ fn emit_intrinsic(out: &mut String, name: &str, ctx: &mut GenCtx) {
     }
 }
 
-// Scan AST for intrinsic usage. Returns which categories are used so
-// emit_header can include the right C headers and state variables.
+// Tracks which categories of compiler intrinsics a program uses.
+// Each flag corresponds to a set of C headers, state variables, and/or
+// constructor functions that emit_header must include. This avoids
+// unconditionally including everything (e.g., termios.h, poll.h) which
+// would add unnecessary dependencies for programs that don't use those
+// features.
 #[derive(Default)]
 struct IntrinsicUsage {
-    terminal: bool,  // __term_* intrinsics
-    time: bool,      // __sleep, __time_ms
-    env: bool,       // __getenv
-    process: bool,   // __exit, __getpid
-    poll: bool,      // __poll_stdin
-    tui: bool,       // __tui_* intrinsics (requires bfpp_rt runtime)
+    terminal: bool,  // __term_* — requires <termios.h>, <sys/ioctl.h>, saved_termios state
+    time: bool,      // __sleep, __time_ms — requires <time.h>
+    env: bool,       // __getenv — no extra headers (stdlib.h covers getenv)
+    process: bool,   // __exit, __getpid — no extra headers (stdlib.h/unistd.h cover these)
+    poll: bool,      // __poll_stdin — requires <poll.h>
+    tui: bool,       // __tui_* — requires bfpp_rt.h/bfpp_rt.c external runtime
 }
 
+// Pre-scan the entire AST for intrinsic calls and return a summary of
+// which intrinsic categories are used. Called once before code generation
+// begins so that emit_header can emit the correct includes.
 fn detect_intrinsics(nodes: &[AstNode]) -> IntrinsicUsage {
     let mut usage = IntrinsicUsage::default();
     scan_intrinsics(nodes, &mut usage);
     usage
 }
 
+// Recursive AST walker that sets usage flags when it encounters SubCall
+// nodes with __ prefixed names. Recurses into loops, subroutine bodies,
+// result/catch blocks, and deref wrappers to catch intrinsics at any depth.
 fn scan_intrinsics(nodes: &[AstNode], usage: &mut IntrinsicUsage) {
     for node in nodes {
         match node {
@@ -1169,6 +1234,8 @@ mod tests {
     use crate::lexer::lex;
     use crate::parser::parse;
 
+    /// Smoke test: the classic BF hello-world program produces valid C
+    /// containing main(), a while loop, and putchar output.
     #[test]
     fn test_hello_world_generates() {
         let tokens = lex("++++++++[>++++[>++>+++>+++>+<<<<-]>+>+>->>+[<]<-]>>.>---.+++++++..+++.>>.<-.<.+++.------.--------.>>+.>++.").unwrap();
@@ -1179,6 +1246,8 @@ mod tests {
         assert!(result.c_source.contains("putchar"));
     }
 
+    /// Subroutines emit a forward declaration and a C function definition,
+    /// and call sites emit bfpp_sub_*() invocations.
     #[test]
     fn test_subroutine_codegen() {
         let tokens = lex("!#pr{.^} !#pr").unwrap();
@@ -1188,6 +1257,7 @@ mod tests {
         assert!(result.c_source.contains("bfpp_sub_pr();"));
     }
 
+    /// R{...}K{...} blocks emit saved_err / do-while(0) / if(bfpp_err) structure.
     #[test]
     fn test_error_handling_codegen() {
         let tokens = lex("R{+}K{-}").unwrap();
@@ -1197,6 +1267,8 @@ mod tests {
         assert!(result.c_source.contains("if (bfpp_err)"));
     }
 
+    /// Name mangling replaces BF++ operator chars with readable ASCII words
+    /// so subroutine names become valid C identifiers.
     #[test]
     fn test_name_mangling() {
         assert_eq!(mangle_name(".>"), "dotgt");
@@ -1205,6 +1277,7 @@ mod tests {
         assert_eq!(mangle_name("tcp"), "tcp");
     }
 
+    /// T (TapeAddr) emits a bfpp_push of the raw C pointer to tape[ptr].
     #[test]
     fn test_tape_addr_codegen() {
         let tokens = lex("T").unwrap();
@@ -1213,6 +1286,7 @@ mod tests {
         assert!(result.c_source.contains("bfpp_push((uint64_t)(uintptr_t)&tape[ptr])"));
     }
 
+    /// F (FramebufferFlush) emits a guarded bfpp_fb_flush() call.
     #[test]
     fn test_framebuffer_flush_codegen() {
         let tokens = lex("F").unwrap();
@@ -1221,6 +1295,7 @@ mod tests {
         assert!(result.c_source.contains("bfpp_fb_flush"));
     }
 
+    /// FFI calls emit dlopen/dlsym boilerplate and set the uses_ffi metadata flag.
     #[test]
     fn test_ffi_codegen() {
         let tokens = lex(r#"\ffi "libm.so.6" "ceil""#).unwrap();
@@ -1233,6 +1308,7 @@ mod tests {
         assert!(result.uses_ffi);
     }
 
+    /// #N (SetValue) emits bfpp_set with a ULL-suffixed literal.
     #[test]
     fn test_set_value_codegen() {
         let tokens = lex("#42 .").unwrap();
@@ -1242,6 +1318,8 @@ mod tests {
         assert!(result.c_source.contains("putchar"));
     }
 
+    /// Hex literals (#0xFF) are resolved at lex/parse time; codegen sees
+    /// the decimal value and emits it as a ULL constant.
     #[test]
     fn test_set_value_hex_codegen() {
         let tokens = lex("#0xFF").unwrap();
@@ -1250,6 +1328,8 @@ mod tests {
         assert!(result.c_source.contains("bfpp_set(ptr, 255ULL)"));
     }
 
+    /// %N (SetCellWidth) emits inline C that releases old sub-cells and
+    /// marks new continuation bytes, matching the bfpp_cycle_width logic.
     #[test]
     fn test_set_cell_width_codegen() {
         let tokens = lex("%8 #100").unwrap();
@@ -1259,6 +1339,7 @@ mod tests {
         assert!(result.c_source.contains("bfpp_set(ptr, 100ULL)"));
     }
 
+    /// __sleep intrinsic emits usleep() and triggers the time.h include.
     #[test]
     fn test_intrinsic_sleep_codegen() {
         let tokens = lex("#100 !#__sleep").unwrap();
@@ -1268,6 +1349,7 @@ mod tests {
         assert!(result.c_source.contains("#include <time.h>"));
     }
 
+    /// __exit intrinsic emits exit() with the cell value as the exit code.
     #[test]
     fn test_intrinsic_exit_codegen() {
         let tokens = lex("#0 !#__exit").unwrap();
@@ -1276,6 +1358,8 @@ mod tests {
         assert!(result.c_source.contains("exit((int)bfpp_get(ptr))"));
     }
 
+    /// TUI intrinsics emit bfpp_tui_*() calls, include bfpp_rt.h, and set
+    /// the uses_tui_runtime flag so the compiler driver links the runtime.
     #[test]
     fn test_intrinsic_tui_codegen() {
         let tokens = lex("!#__tui_init !#__tui_cleanup").unwrap();
@@ -1287,6 +1371,8 @@ mod tests {
         assert!(result.uses_tui_runtime);
     }
 
+    /// Terminal intrinsics emit tcsetattr/ioctl calls, include termios.h,
+    /// and emit the saved_termios state variable and constructor.
     #[test]
     fn test_intrinsic_term_codegen() {
         let tokens = lex("!#__term_raw !#__term_size !#__term_restore").unwrap();

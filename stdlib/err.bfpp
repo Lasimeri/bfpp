@@ -7,6 +7,7 @@
 ; Then issues SYS_exit(1) via the \ syscall operator.
 ; Syscall layout: tape[ptr]=syscall_nr (8-byte), tape[ptr+8]=arg1 (8-byte).
 !#ep{
+    ; .{2} is BF++ extended output: print byte to fd 2 (stderr) instead of stdout.
     [.{2}>]                     ; print message bytes to stderr (fd 2)
     ; Set up SYS_exit(1) syscall
     %8 #60                      ; tape[ptr] = 60 (SYS_exit), 8-byte cell
@@ -45,11 +46,13 @@
         ^                       ; return — assertion passed
     ]
     ; Condition was 0 — assertion failed.
+    ; The "..." operator writes each character as a byte at consecutive cells
+    ; starting from ptr, advancing ptr past the end. We then rewind a fixed
+    ; number of cells to get back to the start of the string for !#ep to print.
     "assertion failed\n\0"
-    ; String is written forward from ptr. Rewind to start of message.
     ; "assertion failed\n\0" = 18 bytes (17 chars + null)
-    ; ptr is now past the null. Rewind 18 cells.
+    ; ptr is now past the null. Rewind 18 cells to string start.
     <<<<<<<<<<<<<<<<<<
-    !#ep                        ; panic — prints message and exits
+    !#ep                        ; panic — prints message to stderr and exits
     ^
 }
