@@ -96,6 +96,51 @@ run_test "ffi" \
     "$SCRIPT_DIR/test_ffi.bfpp" \
     "$SCRIPT_DIR/expected_ffi.txt"
 
+# Numeric literals (#N, #0xHH)
+run_test "numeric_lit" \
+    "$SCRIPT_DIR/test_numeric_lit.bfpp" \
+    "$SCRIPT_DIR/expected_numeric_lit.txt"
+
+# Cell width directives (%1, %2, %4, %8)
+run_test "cell_width" \
+    "$SCRIPT_DIR/test_cell_width.bfpp" \
+    "$SCRIPT_DIR/expected_cell_width.txt"
+
+# Block comments (/* */ with nesting)
+run_test "block_comments" \
+    "$SCRIPT_DIR/test_block_comments.bfpp" \
+    "$SCRIPT_DIR/expected_block_comments.txt"
+
+# R{...}K{...} error propagation with ?
+run_test "error_propagation" \
+    "$SCRIPT_DIR/test_error_propagation.bfpp" \
+    "$SCRIPT_DIR/expected_error_propagation.txt"
+
+# Subroutine def/call, return, call depth
+run_test "subroutines" \
+    "$SCRIPT_DIR/test_subroutines.bfpp" \
+    "$SCRIPT_DIR/expected_subroutines.txt"
+
+# Stack ops ($, ~, T)
+run_test "stack_ops" \
+    "$SCRIPT_DIR/test_stack_ops.bfpp" \
+    "$SCRIPT_DIR/expected_stack_ops.txt"
+
+# Compiler intrinsics (__getpid, __sleep, __time_ms, __getenv, __exit)
+run_test "intrinsics" \
+    "$SCRIPT_DIR/test_intrinsics.bfpp" \
+    "$SCRIPT_DIR/expected_intrinsics.txt"
+
+# Bitwise operators (|, &, x, s, r, n)
+run_test "bitwise" \
+    "$SCRIPT_DIR/test_bitwise.bfpp" \
+    "$SCRIPT_DIR/expected_bitwise.txt"
+
+# Optimizer synthetic nodes (clear, increment coalescing, multiply-move, scan)
+run_test "optimizer" \
+    "$SCRIPT_DIR/test_optimizer.bfpp" \
+    "$SCRIPT_DIR/expected_optimizer.txt"
+
 # Classic BF tests (if any exist)
 for bf_file in "$SCRIPT_DIR/classic_bf/"*.bfpp; do
     [ -f "$bf_file" ] || continue

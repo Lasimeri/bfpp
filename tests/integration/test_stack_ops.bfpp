@@ -5,17 +5,18 @@
 
 ; Pop and print (LIFO: C, B, A)
 ~ .         ; 'C'
-~ .         ; 'B'
-~ .         ; 'A'
+[-] ~ .     ; 'B'
+[-] ~ .     ; 'A'
 
 ; Test T (tape address) — push address, verify it's nonzero
 [-]
 T           ; push &tape[ptr]
 ~           ; pop address into cell
 ; Address should be nonzero (it's a C pointer)
-; if nonzero: print 'Y'
+; if nonzero: print 'Y', else print 'N'
 [
-    [-] #89 .       ; print 'Y'
+    [-]             ; clear the large pointer value
+    #89 . [-]       ; print 'Y', clear
 ]
 
 #10 .               ; newline

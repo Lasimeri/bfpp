@@ -1,0 +1,36 @@
+!include "io.bfpp"
+
+; Test __getpid: should return a positive number (low byte nonzero for most PIDs)
+[-]
+!#__getpid
+; PID mod 256 should be nonzero (true for vast majority of PIDs).
+; If nonzero: print 'P', then zero the cell. If zero: skip.
+[#80.[-]]
+
+; Test __time_ms: should return a positive number
+[-]
+!#__time_ms
+; Timestamp mod 256 should be nonzero (overwhelmingly likely)
+[#84.[-]]
+
+; Test __sleep: sleep 1ms (just verify it doesn't crash)
+[-] #1
+!#__sleep
+#83 .          ; print 'S' (we survived)
+
+; Test __getenv with HOME
+[-]
+"HOME\0"
+<<<<<
+!#__getenv
+; HOME should start with '/' on Linux
+; Check first byte is '/' (47)
+; Subtract 47, if zero it was '/'
+-----------------------------------------------  ; subtract 47
+[#78.[-]^]     ; if nonzero: print 'N' (wrong) and exit
+#69 .          ; print 'E' (env worked, first char was '/')
+
+#10 .          ; newline
+
+; Exit cleanly
+[-] #0 !#__exit

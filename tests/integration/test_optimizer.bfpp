@@ -1,0 +1,20 @@
+; Test clear loop: [-] should zero the cell
+; Set to 99, clear, add 65, print
+#99 [-] #65 . ; 'A' — clear worked if we get 'A' not something else
+
+; Test increment coalescing: ++++ should be Increment(4)
+[-] +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ . ; 65='A'
+
+; Test multiply-move: multiply to get a known ASCII value
+[-] > [-] < #13    ; cell = 13
+[->+++++<]          ; cell[1] = 13*5 = 65 = 'A'
+> .                 ; print 'A'
+
+; Test scan right: [>] scans to first zero cell
+< [-] #1 > #1 > #1 > [-] <<< ; tape: [1,1,1,0,...], ptr at first 1
+[>]                 ; scan right to zero cell
+; ptr is now at the zero cell (3 positions right)
+#66 .               ; 'B'
+
+#10 .               ; newline
+; Expected: AAAB\n

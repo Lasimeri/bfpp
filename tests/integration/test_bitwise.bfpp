@@ -1,0 +1,22 @@
+; Bitwise OR: 0x41 | 0x20 = 0x61 = 'a'
+#0x41 > #0x20 < | .
+
+; Bitwise AND: 0x61 & 0xDF = 0x41 = 'A'  (uppercase mask)
+[-] #0x61 > [-] #0xDF < & .
+
+; Bitwise XOR: 0x41 ^ 0x20 = 0x61 = 'a'
+[-] #0x41 > [-] #0x20 < x .
+
+; Shift left: 1 << 6 = 64 = '@'
+[-] #1 > [-] #6 < s .
+
+; Shift right: 128 >> 1 = 64 = '@'
+[-] #128 > [-] #1 < r .
+
+; Bitwise NOT of 0xBE = 0x41 = 'A' (for 8-bit cells)
+[-] > [-] < #0xBE n .
+
+; Newline
+[-] #10 .
+
+; Expected: aAa@@A\n
