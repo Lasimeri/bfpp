@@ -1,8 +1,8 @@
 # BF++ Language Specification
 
-**Version**: 0.1.0
+**Version**: 0.3.0
 **Status**: Draft
-**Date**: 2026-02-13
+**Date**: 2026-03-31
 
 ---
 
@@ -254,6 +254,90 @@ The TUI intrinsics require the C runtime library (`bfpp_rt.h`). When any `__tui_
 | 13 | Enter |
 | 9 | Tab |
 | 27 | Escape |
+
+#### 3.8.7 3D Rendering
+
+The 3D rendering subsystem is a three-tier intrinsic architecture for hardware-accelerated (OpenGL 3.3) or software-fallback rendering. All 3D intrinsics take `(uint8_t *tape, int ptr)` internally — parameters are read from `tape[ptr + N*4]`. Numeric values use **Q16.16 fixed-point** format: `65536` = `1.0`, `32768` = `0.5`, `-65536` = `-1.0`.
+
+When any `__gl_*`, `__fp_*`, `__mesh_*`, or `__scene_*` intrinsic is used, the compiler emits includes for the 3D runtime headers and sets the `uses_3d_runtime` flag, which tells the build driver to compile and link the 3D runtime libraries (`bfpp_rt_3d.c`, `bfpp_rt_3d_math.c`, `bfpp_rt_3d_meshgen.c`, `bfpp_rt_3d_software.c`, `bfpp_rt_3d_multigpu.c`, `bfpp_rt_3d_oracle.c`).
+
+**Tier 1 — GL Proxies** (OpenGL 3.3 core, software fallback):
+
+| Intrinsic | Input Tape Layout | Output | Effect |
+|-----------|-------------------|--------|--------|
+| `__gl_init` | `[ptr]`=width, `[ptr+4]`=height | — | Initialize GL context (or software rasterizer). |
+| `__gl_cleanup` | — | — | Destroy GL context, free resources. |
+| `__gl_create_buffer` | — | `tape[ptr]` = buffer ID | Create a vertex/index buffer object. |
+| `__gl_buffer_data` | `[ptr]`=buffer_id, `[ptr+4]`=data_ptr (tape offset), `[ptr+8]`=size_bytes | — | Upload data to buffer. |
+| `__gl_delete_buffer` | `[ptr]`=buffer_id | — | Delete buffer object. |
+| `__gl_create_vao` | — | `tape[ptr]` = VAO ID | Create vertex array object. |
+| `__gl_bind_vao` | `[ptr]`=vao_id | — | Bind VAO. |
+| `__gl_vertex_attrib` | `[ptr]`=index, `[ptr+4]`=size, `[ptr+8]`=stride, `[ptr+12]`=offset | — | Configure vertex attribute pointer. |
+| `__gl_delete_vao` | `[ptr]`=vao_id | — | Delete VAO. |
+| `__gl_create_shader` | `[ptr]`=type (0=vertex, 1=fragment) | `tape[ptr]` = shader ID | Create shader object. |
+| `__gl_shader_source` | `[ptr]`=shader_id, `[ptr+4]`=source_ptr (tape offset) | — | Set shader source (null-terminated at tape offset). |
+| `__gl_compile_shader` | `[ptr]`=shader_id | `tape[ptr]` = 1 on success, 0 on failure | Compile shader. |
+| `__gl_create_program` | — | `tape[ptr]` = program ID | Create shader program. |
+| `__gl_attach_shader` | `[ptr]`=program_id, `[ptr+4]`=shader_id | — | Attach shader to program. |
+| `__gl_link_program` | `[ptr]`=program_id | `tape[ptr]` = 1 on success, 0 on failure | Link shader program. |
+| `__gl_use_program` | `[ptr]`=program_id | — | Bind shader program for rendering. |
+| `__gl_uniform_loc` | `[ptr]`=program_id, `[ptr+4]`=name_ptr (tape offset) | `tape[ptr]` = uniform location | Query uniform location by name. |
+| `__gl_uniform_1f` | `[ptr]`=location, `[ptr+4]`=value (Q16.16) | — | Set float uniform. |
+| `__gl_uniform_3f` | `[ptr]`=location, `[ptr+4]`=x, `[ptr+8]`=y, `[ptr+12]`=z (Q16.16) | — | Set vec3 uniform. |
+| `__gl_uniform_4f` | `[ptr]`=location, `[ptr+4..+16]`=x,y,z,w (Q16.16) | — | Set vec4 uniform. |
+| `__gl_uniform_mat4` | `[ptr]`=location, `[ptr+4..+67]`=16 floats (Q16.16) | — | Set mat4 uniform (column-major). |
+| `__gl_clear` | `[ptr]`=r, `[ptr+4]`=g, `[ptr+8]`=b (Q16.16, 0–65536) | — | Clear color and depth buffers. |
+| `__gl_draw_arrays` | `[ptr]`=mode, `[ptr+4]`=first, `[ptr+8]`=count | — | Draw primitives from arrays. |
+| `__gl_draw_elements` | `[ptr]`=mode, `[ptr+4]`=count, `[ptr+8]`=index_offset | — | Draw indexed primitives. |
+| `__gl_viewport` | `[ptr]`=x, `[ptr+4]`=y, `[ptr+8]`=w, `[ptr+12]`=h | — | Set viewport rectangle. |
+| `__gl_depth_test` | `[ptr]`=enable (1=on, 0=off) | — | Enable/disable depth testing. |
+| `__gl_present` | — | — | Swap buffers / present frame. |
+| `__gl_shadow_enable` | — | — | Enable shadow mapping. |
+| `__gl_shadow_disable` | — | — | Disable shadow mapping. |
+| `__gl_shadow_quality` | `[ptr]`=quality (shadow map resolution) | — | Set shadow map quality. |
+
+**Tier 2 — Fixed-Point Math** (Q16.16):
+
+| Intrinsic | Input Tape Layout | Output | Effect |
+|-----------|-------------------|--------|--------|
+| `__fp_mul` | `[ptr]`=a, `[ptr+4]`=b (Q16.16) | `tape[ptr]` = a*b (Q16.16) | Fixed-point multiply. |
+| `__fp_div` | `[ptr]`=a, `[ptr+4]`=b (Q16.16) | `tape[ptr]` = a/b (Q16.16) | Fixed-point divide. |
+| `__fp_sin` | `[ptr]`=angle (Q16.16 radians) | `tape[ptr]` = sin(angle) (Q16.16) | Sine via LUT. |
+| `__fp_cos` | `[ptr]`=angle (Q16.16 radians) | `tape[ptr]` = cos(angle) (Q16.16) | Cosine via LUT. |
+| `__fp_sqrt` | `[ptr]`=value (Q16.16) | `tape[ptr]` = sqrt(value) (Q16.16) | Square root. |
+| `__mat4_identity` | `[ptr]`=dest_ptr (tape offset) | 16 Q16.16 values written at dest | Write 4x4 identity matrix. |
+| `__mat4_multiply` | `[ptr]`=a_ptr, `[ptr+4]`=b_ptr, `[ptr+8]`=dest_ptr | 16 Q16.16 values at dest | Matrix multiply A * B. |
+| `__mat4_rotate` | `[ptr]`=src_ptr, `[ptr+4]`=angle, `[ptr+8]`=ax, `[ptr+12]`=ay, `[ptr+16]`=az, `[ptr+20]`=dest_ptr | Rotated matrix at dest | Rotate matrix by angle around axis. |
+| `__mat4_translate` | `[ptr]`=src_ptr, `[ptr+4]`=tx, `[ptr+8]`=ty, `[ptr+12]`=tz, `[ptr+16]`=dest_ptr | Translated matrix at dest | Apply translation to matrix. |
+| `__mat4_perspective` | `[ptr]`=fov, `[ptr+4]`=aspect, `[ptr+8]`=near, `[ptr+12]`=far, `[ptr+16]`=dest_ptr | Perspective matrix at dest | Build perspective projection matrix. All params Q16.16. |
+
+**Tier 3 — Mesh Generators**:
+
+| Intrinsic | Input Tape Layout | Output | Effect |
+|-----------|-------------------|--------|--------|
+| `__mesh_cube` | `[ptr]`=dest_ptr (tape offset), `[ptr+4]`=size (Q16.16) | Vertex data at dest, `tape[ptr]` = vertex count | Generate unit cube mesh. |
+| `__mesh_sphere` | `[ptr]`=dest_ptr, `[ptr+4]`=radius, `[ptr+8]`=slices, `[ptr+12]`=stacks | Vertex data at dest, `tape[ptr]` = vertex count | Generate UV sphere mesh. |
+| `__mesh_torus` | `[ptr]`=dest_ptr, `[ptr+4]`=major_r, `[ptr+8]`=minor_r, `[ptr+12]`=slices, `[ptr+16]`=stacks | Vertex data at dest, `tape[ptr]` = vertex count | Generate torus mesh. |
+| `__mesh_plane` | `[ptr]`=dest_ptr, `[ptr+4]`=width, `[ptr+8]`=depth | Vertex data at dest, `tape[ptr]` = vertex count | Generate plane (quad). |
+| `__mesh_cylinder` | `[ptr]`=dest_ptr, `[ptr+4]`=radius, `[ptr+8]`=height, `[ptr+12]`=slices | Vertex data at dest, `tape[ptr]` = vertex count | Generate cylinder mesh. |
+
+**Multi-GPU**:
+
+| Intrinsic | Input Tape Layout | Output | Effect |
+|-----------|-------------------|--------|--------|
+| `__gl_multi_gpu` | `[ptr]`=mode (0=disabled, 1=SFR, 2=AFR) | — | Enable multi-GPU rendering mode. SFR = split-frame rendering, AFR = alternate frame rendering. |
+| `__gl_gpu_count` | — | `tape[ptr]` = number of GPUs | Query available GPU count. |
+| `__gl_frame_time` | — | `tape[ptr]` = frame time in microseconds | Query last frame render time. |
+
+**Scene Oracle** (lock-free triple-buffered scene publishing for decoupled simulation/render):
+
+| Intrinsic | Input Tape Layout | Output | Effect |
+|-----------|-------------------|--------|--------|
+| `__scene_publish` | — | — | Publish current scene state (triple-buffer swap). |
+| `__scene_mode` | `[ptr]`=mode (0=normal, 1=extrapolation) | — | Set scene oracle mode. |
+| `__scene_extrap_ms` | `[ptr]`=milliseconds | — | Set extrapolation lookahead time. |
+
+**Runtime files**: `bfpp_rt_3d.c/h` (GL proxy layer), `bfpp_rt_3d_math.c` (Q16.16 math with sin LUT), `bfpp_rt_3d_meshgen.c` (mesh generators), `bfpp_rt_3d_software.c` (SSE software rasterizer with Blinn-Phong), `bfpp_rt_3d_shaders.h` (GLSL shaders), `bfpp_rt_3d_multigpu.c/h` (multi-GPU via EGL, SFR/AFR), `bfpp_rt_3d_oracle.c/h` (Scene Oracle with lock-free triple buffer).
 
 ### 3.9 C Runtime Library (`bfpp_rt.h`)
 

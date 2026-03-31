@@ -33,7 +33,7 @@
 | **Call stack** | None | 256-frame call stack for subroutines | Stores return address + saved error state |
 | **Preprocessing** | None | `!include "file"` with search paths and cycle detection | Text-level expansion before lexing |
 | **Optimization** | None (typically interpreted) | Clear-loop, scan-loop, multiply-move, error folding | `-O1` (basic), `-O2` (full) |
-| **Standard library** | None | 8 modules: io, math, string, mem, err, file, net, tui | Written in BF++ itself |
+| **Standard library** | None | 10 modules: io, math, string, mem, err, file, net, tui, graphics, 3d | Written in BF++ itself |
 | **Compilation** | Typically interpreted | Transpiled to C11, compiled via `cc`. `--emit-c` available | Also supports direct C output for inspection |
 | **Comments** | Non-operator chars ignored (implicit) | `;` line comments + `/* */` block comments (nestable) | BF's implicit comment behavior preserved |
 | **Memory layout** | Flat, unstructured | Structured regions: general purpose, syscall params, I/O buffer, framebuffer | Conventions enforced by stdlib, not hardware |
@@ -44,6 +44,9 @@
 | **Compiler intrinsics** | None | `!#__name` intrinsics for terminal, time, env, process, I/O | Direct system integration without raw syscalls or FFI |
 | **TUI runtime** | Not possible | C runtime library (`bfpp_rt.h`) with double-buffered rendering | Full terminal UI: box drawing, key input, color, cursor control |
 | **Graphics primitives** | Not possible | `bfpp_tui_put`, `bfpp_tui_box`, `bfpp_tui_fill` via intrinsics | Write to back buffer; diff-render to terminal on `end_frame` |
+| **3D rendering** | None | OpenGL 3.3 core profile + software rasterizer fallback, ~45 intrinsics | Blinn-Phong shading, PCF shadow mapping. FBO render → PBO async readback → tape → SDL2 present |
+| **Multi-GPU** | N/A | EGL multi-context with SFR/AFR/AUTO modes | Per-GPU GL contexts, command recording + replay, NUMA-aware allocation, frame pacing with dropout recovery |
+| **Fixed-point math** | Manual (chain `+`/`-` for any arithmetic) | Q16.16 intrinsics with sin/cos LUT, matrix ops | Hardware-free trig and linear algebra via lookup tables and fixed-point multiply/divide |
 
 ---
 

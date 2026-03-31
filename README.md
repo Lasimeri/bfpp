@@ -1,6 +1,6 @@
 # BF++
 
-A Brainfuck superset transpiler that compiles to C, adding syscalls, subroutines, error handling, bitwise ops, stack operations, FFI, numeric literals, compiler intrinsics (terminal, TUI, process, I/O), and optional SDL2 framebuffer graphics. Written in Rust. Produces self-contained, single-file C programs with an embedded runtime. Includes an external C runtime library for double-buffered TUI rendering.
+A Brainfuck superset transpiler that compiles to C, adding syscalls, subroutines, error handling, bitwise ops, stack operations, FFI, numeric literals, compiler intrinsics (terminal, TUI, process, I/O), optional SDL2 framebuffer graphics, 3D rendering (OpenGL 3.3 + software rasterizer fallback), and multi-GPU support (EGL multi-context SFR/AFR/AUTO). Written in Rust. Produces self-contained, single-file C programs with an embedded runtime. Includes external C runtime libraries for double-buffered TUI rendering, 3D rendering, and multi-GPU coordination.
 
 ---
 
@@ -163,7 +163,7 @@ cargo build --release
 
 Binary at `target/release/bfpp`. Only dependency: `clap 4` (derive feature).
 
-Runtime requirements for generated programs: a C compiler (gcc/clang), POSIX libc. Optional: SDL2 (framebuffer mode), libdl (FFI mode). Programs using `__tui_*` intrinsics require `runtime/bfpp_rt.{h,c}` (compiled and linked automatically by the `bfpp` driver).
+Runtime requirements for generated programs: a C compiler (gcc/clang), POSIX libc. Optional: SDL2 (framebuffer mode), libdl (FFI mode), libGL + libGLEW (3D intrinsics), libEGL (multi-GPU intrinsics), libm (3D math). Programs using `__tui_*` intrinsics require `runtime/bfpp_rt.{h,c}` (compiled and linked automatically by the `bfpp` driver). Programs using 3D intrinsics require `runtime/bfpp_rt_3d*.{h,c}` (6 files, auto-linked).
 
 ---
 
@@ -181,7 +181,8 @@ bfpp [OPTIONS] <INPUT>
 | `--tape-size <N>` | 65536 | Tape size in bytes. Must be power of 2 (bitmask wrapping) |
 | `--stack-size <N>` | 4096 | Data stack entries (64-bit each) |
 | `--call-depth <N>` | 256 | Max subroutine recursion depth. Overflow is fatal |
-| `--framebuffer <WxH>` | none | Enable SDL2 framebuffer with given dimensions (e.g., `80x60`). Links `-lSDL2` |
+| `--framebuffer <WxH>` | none | Enable SDL2 framebuffer with given dimensions (e.g., `80x60`). Links `-lSDL2`. Also enables 3D rendering support |
+| `--render-threads <N>` | 8 | Number of render threads for framebuffer/3D pipeline |
 | `--no-optimize` | false | Disable all optimizer passes |
 | `-O <LEVEL>` | 1 | Optimization level: 0=none, 1=basic, 2+=full |
 | `--include <PATH>` | none | Additional include search path (repeatable) |
@@ -205,6 +206,9 @@ bfpp game.bfpp --framebuffer 80x60 --tape-size 131072 -o game
 
 # FFI (links libdl automatically)
 bfpp ffi_demo.bfpp -o ffi_demo
+
+# 3D rendering (links GL, GLEW, math; requires SDL2 framebuffer)
+bfpp examples/3d_demo.bfpp --include stdlib --framebuffer 640x480 --tape-size 1048576 -o 3d_demo
 ```
 
 ---
@@ -268,7 +272,7 @@ R{
 
 ## Standard Library
 
-9 modules, all written in BF++. Include via `!include "module.bfpp"` or `--include stdlib/`. All modules use `#N`/`%N` operators where applicable.
+10 modules, all written in BF++. Include via `!include "module.bfpp"` or `--include stdlib/`. All modules use `#N`/`%N` operators where applicable.
 
 ### Module Status
 
@@ -283,6 +287,7 @@ R{
 | **TUI** | `tui.bfpp` | `!#cm` cursor_move, `!#cl` clear, `!#co` set_color, `!#db` draw_box | Working. ANSI escape sequences. `!#cm` limited to single-digit row/col (1-9). `!#db` draws box with +/-/\| characters |
 | **Error** | `err.bfpp` | `!#es` err_to_string, `!#ep` panic, `!#ea` assert | Working. `!#es` prints single-digit error codes (0-9). `!#ep` uses SYS_exit via `\`. `!#ea` calls `!#ep` on assertion failure |
 | **Graphics** | `graphics.bfpp` | `!#px` set_pixel, `!#gx` get_pixel, `!#gc` clear_fb, `!#fl` fill_rect, `!#lh` draw_hline, `!#rc` draw_rect (stub), `!#ln` draw_line (stub) | SDL2 framebuffer primitives. Requires `--framebuffer WxH` and `%4` (32-bit cells). `!#px`/`!#gx`/`!#gc`/`!#fl` working. `!#rc`/`!#ln` are stubs (not implementable due to `@` single-jump constraint). Includes math.bfpp for address computation |
+| **3D** | `3d.bfpp` | ~45 intrinsics across 3 tiers: GL proxy intrinsics, Q16.16 fixed-point math, mesh generators | OpenGL 3.3 core profile with software rasterizer fallback. Blinn-Phong shading, PCF shadow mapping. Renders to offscreen FBO, async PBO readback to tape[FB_OFFSET]. Multi-GPU support via EGL (SFR/AFR/AUTO). Scene oracle for lock-free triple-buffered CPU-GPU data transfer. 485 lines |
 
 ### Calling Convention
 
@@ -398,7 +403,7 @@ Key runtime properties:
 - **Cell width**: parallel `cell_width[]` array. `bfpp_get`/`bfpp_set` use `memcpy` for safe unaligned multi-byte access. Width 0 = continuation byte (accessing it sets `ERR_INVALID_ARG`)
 - **Call depth**: each subroutine entry increments `bfpp_call_depth`, checks against `CALL_DEPTH`, and decrements on exit/return. Overflow aborts
 - **Subroutine names**: mangled for C compatibility (`>` -> `gt`, `*` -> `star`, `.` -> `dot`, etc.)
-- **CC flags**: `-O2 -Wall -Wno-unused-variable -Wno-unused-function`. Plus `-lSDL2` if framebuffer, `-ldl` if FFI
+- **CC flags**: `-O2 -Wall -Wno-unused-variable -Wno-unused-function`. Plus `-lSDL2` if framebuffer, `-ldl` if FFI, `-lGL -lGLEW -lm` if 3D intrinsics, `-lEGL` if multi-GPU intrinsics
 
 ---
 
@@ -490,6 +495,43 @@ Available when `--framebuffer WxH` is active. The pipeline uses 8 render threads
 | `!#__fb_sync` | -- | Block until the next frame is presented to the display (vsync wait point) |
 | `!#__fb_pixel_nt` | `tape[ptr]` = x, `[ptr+1]` = y, `[ptr+2]` = r, `[ptr+3]` = g, `[ptr+4]` = b | Non-temporal pixel write to framebuffer (cache-bypassing) |
 
+### 3D Rendering Intrinsics
+
+Available when `--framebuffer WxH` is active and 3D stdlib (`!include "3d.bfpp"`) is used. Requires `libGL`, `libGLEW`, and `-lm`. Falls back to a software rasterizer when OpenGL is unavailable. ~45 intrinsics across 3 tiers:
+
+**Tier 1 -- GL Proxy Intrinsics:** Direct OpenGL 3.3 core profile operations (shader compilation, buffer management, draw calls, uniform setting, texture binding). These map to GL calls and are intercepted by the compiler to emit inline C.
+
+**Tier 2 -- Q16.16 Fixed-Point Math:** Fixed-point arithmetic intrinsics with sin/cos lookup tables. Provides multiply, divide, sin, cos, sqrt, matrix operations -- all in Q16.16 format suitable for tape-based computation without floating point.
+
+**Tier 3 -- Mesh Generators:** Procedural geometry generation (cube, sphere, plane, etc.) that populate vertex/index buffers on the tape.
+
+**Rendering pipeline:** Renders to an offscreen FBO, uses PBO for async readback, writes pixels to `tape[FB_OFFSET]`, then the existing framebuffer pipeline (`F` flush) presents via SDL2.
+
+**Shading:** Blinn-Phong lighting with PCF (Percentage Closer Filtering) shadow mapping.
+
+**Software fallback:** When GL context creation fails, all GL proxy intrinsics dispatch to an edge-function software rasterizer with perspective-correct interpolation. Same API, no code changes needed.
+
+### Multi-GPU Intrinsics
+
+Requires `libEGL` (typically included with NVIDIA drivers; `libegl-dev` on Debian). Provides:
+
+- **EGL device enumeration** for per-GPU GL context creation
+- **Split-Frame Rendering (SFR):** Strip-parallel -- each GPU renders horizontal strips
+- **Alternate-Frame Rendering (AFR):** GPUs alternate full frames
+- **AUTO mode:** Runtime selection based on GPU count and workload
+- **GL command recording + replay** across GPU contexts
+- **NUMA-aware buffer allocation** and per-GPU thread pinning
+- **Frame pacing** with dropout recovery
+
+### Scene Oracle
+
+Lock-free SPSC triple-buffered scene snapshot system:
+
+- CPU publishes scene state at ~1000Hz
+- Each GPU independently samples and extrapolates via Rodrigues rotation + linear velocity
+- Temporal extrapolation decouples simulation rate from render rate
+- Runtime files: `bfpp_rt_3d_oracle.{c,h}`
+
 ---
 
 ## TUI Runtime Library
@@ -521,7 +563,7 @@ Available when `--framebuffer WxH` is active. The pipeline uses 8 render threads
 
 ## Testing
 
-72 unit tests + 9 integration tests = 81 total.
+86 unit tests, all passing. Zero clippy warnings.
 
 ### Unit Tests
 
@@ -580,6 +622,7 @@ bfpp/
     tui.bfpp              -- cursor_move, clear, set_color, draw_box
     err.bfpp              -- err_to_string, panic, assert
     graphics.bfpp         -- SDL2 framebuffer: set_pixel, get_pixel, clear_fb, fill_rect, draw_hline
+    3d.bfpp               -- 3D rendering: ~45 intrinsics (GL proxy, Q16.16 math, mesh generators)
   spec/
     BFPP_SPEC.md          -- Full language specification
     ERROR_CODES.md        -- Error code table and errno mapping
@@ -593,6 +636,7 @@ bfpp/
     error_handling.bfpp   -- R/K demo with error propagation
     framebuffer_demo.bfpp -- SDL2 framebuffer example
     tui_demo.bfpp         -- ANSI terminal UI demo
+    3d_demo.bfpp          -- 3D rendering demo (OpenGL + software fallback)
   tests/
     integration/
       test_runner.sh      -- Integration test harness
@@ -603,6 +647,16 @@ bfpp/
   runtime/
     bfpp_rt.h             -- TUI runtime header (API, key constants, color defines)
     bfpp_rt.c             -- TUI runtime impl (double-buffered renderer, input decoder)
+    bfpp_rt_3d.h          -- 3D rendering header (GL proxy, software rasterizer API)
+    bfpp_rt_3d.c          -- 3D rendering impl (FBO, PBO readback, Blinn-Phong, PCF shadows)
+    bfpp_rt_3d_shaders.h  -- Embedded GLSL shaders (Blinn-Phong + PCF shadows)
+    bfpp_rt_3d_math.c     -- Q16.16 fixed-point math (sin/cos LUT, 4x4 matrices)
+    bfpp_rt_3d_meshgen.c  -- Mesh generators (cube, sphere, torus, plane, cylinder)
+    bfpp_rt_3d_software.c -- Software rasterizer fallback (edge-function, SSE SIMD)
+    bfpp_rt_3d_multigpu.h -- Multi-GPU header (EGL contexts, SFR/AFR/AUTO, command replay)
+    bfpp_rt_3d_multigpu.c -- Multi-GPU impl (NUMA-aware alloc, thread pinning, frame pacing)
+    bfpp_rt_3d_oracle.h   -- Scene oracle header (lock-free SPSC triple buffer)
+    bfpp_rt_3d_oracle.c   -- Scene oracle impl (temporal extrapolation, Rodrigues rotation)
 ```
 
 ---

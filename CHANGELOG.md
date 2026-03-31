@@ -1,5 +1,56 @@
 # Changelog
 
+## [0.3.0] - 2026-03-31
+
+### Added
+- **3D Rendering Subsystem** (~45 intrinsics, 6 new runtime files)
+  - Tier 1 — GL Proxies: `__gl_init/cleanup`, buffer/VAO/shader/program management, uniform uploads, draw calls, shadow mapping (`__gl_shadow_enable/disable/quality`)
+  - Tier 2 — Q16.16 Fixed-Point Math: `__fp_mul/div/sin/cos/sqrt`, `__mat4_identity/multiply/rotate/translate/perspective`
+  - Tier 3 — Mesh Generators: `__mesh_cube/sphere/torus/plane/cylinder`
+  - OpenGL 3.3 core profile renders to offscreen FBO
+  - PBO double-buffered async readback (eliminates 2-15ms glReadPixels stall)
+  - Automatic software rasterizer fallback (edge-function, Blinn-Phong, SSE SIMD)
+  - Embedded GLSL shaders: Blinn-Phong vertex/fragment with PCF shadow mapping
+  - Frame timing intrinsic: `__gl_frame_time`
+- **Multi-GPU Rendering** (transparent to BF++ programs)
+  - EGL device enumeration (`eglQueryDevicesEXT`) for per-GPU GL contexts
+  - SFR (strip-parallel): each GPU renders its horizontal strip via `glScissor`
+  - AFR (alternate frame): round-robin with sequence-ordered presentation queue
+  - AUTO mode: adaptive selection based on frame time measurement
+  - GL command recording + replay across GPU contexts
+  - NUMA-aware buffer allocation (`mbind` when `numaif.h` available)
+  - Per-GPU thread pinning (desktop: cores 8+, rack: per-NUMA-node)
+  - Frame pacing: deadline-based presentation, dropout recovery, SFR strip rebalancing
+  - Intrinsics: `__gl_multi_gpu`, `__gl_gpu_count`
+- **Scene Oracle** (CPU-decoupled temporal rendering)
+  - Lock-free SPSC triple-buffered scene snapshots (acquire/release ordering)
+  - CPU publishes scene state at ~1000Hz, GPUs independently sample + extrapolate
+  - Temporal extrapolation: Rodrigues rotation + linear velocity, bounded lookahead
+  - Confidence-based freeze when data goes stale
+  - Intrinsics: `__scene_publish`, `__scene_mode`, `__scene_extrap_ms`
+- **New runtime files**:
+  - `runtime/bfpp_rt_3d.c/h` — GL proxy layer (1200+ lines)
+  - `runtime/bfpp_rt_3d_shaders.h` — GLSL Blinn-Phong + PCF shadows
+  - `runtime/bfpp_rt_3d_math.c` — Q16.16 math, sin LUT, 4×4 matrices
+  - `runtime/bfpp_rt_3d_meshgen.c` — 5 mesh generators
+  - `runtime/bfpp_rt_3d_software.c` — Software rasterizer with SSE
+  - `runtime/bfpp_rt_3d_multigpu.c/h` — Multi-GPU (EGL, SFR/AFR, pacing)
+  - `runtime/bfpp_rt_3d_oracle.c/h` — Scene Oracle (lock-free triple buffer)
+- **stdlib/3d.bfpp** (485 lines): wrapper subroutines for all 3D/multi-GPU/oracle intrinsics
+- **examples/3d_demo.bfpp** (169 lines): rotating cube + orbiting sphere, Blinn-Phong lighting, shadows
+
+### Changed
+- `bfpp_gl_present()` now uses PBO double-buffered readback (+1 frame latency, eliminates GPU sync stall)
+- `bfpp_err` gets external linkage when 3D intrinsics active (runtime needs cross-TU access)
+- `_GNU_SOURCE` guarded with `#ifndef` across all runtime files (prevents redefinition warning with SDL2)
+- Compiler auto-links `-lGL -lGLEW -lm` for 3D, `-lEGL` for multi-GPU
+- Compiler auto-compiles all required runtime .c files based on intrinsic detection
+
+### Tests
+- 86 unit tests, all passing
+- Zero clippy warnings
+- All C runtime files compile clean with `-Wall -Wextra`
+
 ## [0.2.0] - 2026-03-31
 
 ### Added
@@ -54,7 +105,7 @@
 - `Cargo.toml` edition fixed from "2024" to "2021"
 
 ### Tests
-- 72 unit tests + 9 integration tests = 81 total, all passing
+- 86 unit tests, all passing (up from 47 in 0.1.0)
 - Zero compiler warnings, zero clippy warnings
 
 ## [0.1.0] - 2026-02-15

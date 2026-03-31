@@ -13,6 +13,12 @@ BF++ is a Rust project that transpiles BF++ source to C, then invokes a C compil
 - Rust toolchain (cargo, rustc)
 - A C compiler (`cc`, `gcc`, or `clang`) on PATH
 - SDL2 development libraries (only if using `--framebuffer`)
+- GLEW development libraries (only if using 3D intrinsics via `3d.bfpp`)
+  - Arch: `sudo pacman -S glew`
+  - Debian/Ubuntu: `sudo apt install libglew-dev`
+- EGL headers (only if using multi-GPU intrinsics)
+  - Debian/Ubuntu: `sudo apt install libegl-dev`
+  - Usually included with NVIDIA proprietary drivers; no extra package needed on Arch with NVIDIA
 
 Build from source:
 
@@ -584,6 +590,15 @@ Tape size must accommodate the framebuffer plus at least 256 bytes of working sp
 ; 80x60 RGB = 14,400 bytes. Default 64K tape is sufficient.
 bfpp game.bfpp --framebuffer 80x60
 ```
+
+**3D rendering:** When using 3D intrinsics (via `!include "3d.bfpp"`), the framebuffer flag also enables the OpenGL 3.3 rendering pipeline. The 3D system renders to an offscreen FBO, performs async PBO readback to `tape[FB_OFFSET]`, and the existing `F` flush presents via SDL2.
+
+```sh
+# Compile the 3D demo (links GL, GLEW, math automatically)
+bfpp examples/3d_demo.bfpp --include stdlib --framebuffer 640x480 --tape-size 1048576 -o 3d_demo
+```
+
+**Software fallback:** When an OpenGL 3.3 context cannot be created (headless systems, missing GPU drivers), the runtime falls back to a software rasterizer automatically. No code changes are needed -- the same BF++ source works on both paths. The software rasterizer uses edge-function triangle rasterization with perspective-correct interpolation.
 
 ---
 

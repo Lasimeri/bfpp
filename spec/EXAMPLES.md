@@ -1,6 +1,6 @@
 # BF++ Examples
 
-**Version**: 0.1.0
+**Version**: 0.3.0
 
 Annotated examples demonstrating BF++ language features.
 
@@ -497,4 +497,71 @@ F                           ; flush to screen
 ; Draw a red pixel at (160, 100) — center of screen
 ; (ptr is now inside FB, so navigate to a clean area first)
 ; ... set up params at known clean tape position ...
+```
+
+---
+
+## 23. 3D Rendering — Rotating Cube with Lighting
+
+A complete 3D demo: rotating cube + orbiting sphere with Blinn-Phong lighting, two lights, 300-frame render loop. Demonstrates Q16.16 fixed-point math, matrix operations, mesh generation, shader setup, and multi-GPU support. 169 lines.
+
+**Compile**:
+```bash
+bfpp examples/3d_demo.bfpp --include stdlib --framebuffer 640x480 --tape-size 1048576 -o 3d_demo
+```
+
+**Key concepts demonstrated**:
+- **Q16.16 fixed-point**: All numeric values use `65536 = 1.0`. E.g., `#65536` for 1.0, `#32768` for 0.5.
+- **Matrix operations**: `\m4i` (identity), `\m4r` (rotate), `\m4t` (translate), `\m4p` (perspective projection), `\m4m` (multiply) — compose model-view-projection matrices.
+- **Mesh generation**: `\mcb` (cube), `\msp` (sphere) — generate vertex data on the tape, return vertex count.
+- **Shader pipeline**: Create program, attach vertex/fragment shaders, link, set uniforms for MVP matrix + light positions + material properties.
+- **Render loop**: 300 frames with per-frame angle increment, matrix rebuild, clear, draw, present.
+- **Multi-GPU** (optional): `\mgpu` to enable SFR/AFR mode on multi-GPU systems.
+- **Scene Oracle**: `\spub` publishes scene state via lock-free triple buffer for decoupled simulation/render.
+
+```bfpp
+; 3D Demo — Rotating cube + orbiting sphere with Blinn-Phong lighting
+; Compile: bfpp examples/3d_demo.bfpp --include stdlib --framebuffer 640x480 --tape-size 1048576 -o 3d_demo
+
+!include "3d.bfpp"
+
+; Initialize GL context (640x480)
+#640 > #480 <
+\g3i
+
+; Enable depth testing
+#1 \gdt
+
+; Generate cube mesh at tape offset 0x10000
+#65536 > #65536 <          ; dest=0x10000, size=1.0 (Q16.16)
+\mcb                        ; tape[ptr] = vertex count
+$                           ; save cube vertex count
+
+; Generate sphere mesh at tape offset 0x20000
+#131072 > #32768 > #16 > #16 <<<  ; dest=0x20000, radius=0.5, 16 slices, 16 stacks
+\msp                        ; tape[ptr] = vertex count
+$                           ; save sphere vertex count
+
+; Build perspective matrix at tape offset 0x30000
+; fov=60deg (Q16.16), aspect=640/480, near=0.1, far=100.0
+#68813 > #87381 > #6554 > #6553600 > #196608 <<<<<
+\m4p                        ; perspective matrix at 0x30000
+
+; --- Render loop (300 frames) ---
+#300                        ; frame counter
+[
+    ; Clear to dark gray
+    #6554 > #6554 > #6554 <<<
+    \gcl
+
+    ; ... (build model matrix, set uniforms, draw cube + sphere)
+
+    \g3p                    ; present frame
+    \spub                   ; publish scene state
+
+    -                       ; decrement frame counter
+]
+
+; Cleanup
+\g3c
 ```

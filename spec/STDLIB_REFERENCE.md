@@ -1,6 +1,6 @@
 # BF++ Standard Library Reference
 
-**Version**: 0.1.0
+**Version**: 0.3.0
 
 ---
 
@@ -211,3 +211,82 @@ After calling any function that uses `@` to jump into the framebuffer, `ptr` end
 !#px                        ; set_pixel
 F                           ; flush to screen
 ```
+
+---
+
+## Module: `3d.bfpp`
+
+3D rendering wrappers for all `__gl_*`, `__fp_*`, `__mesh_*`, and `__scene_*` compiler intrinsics. Provides thin subroutines that set up tape parameters and call the corresponding intrinsic. 485 lines.
+
+**Status**: Working. All subroutines are thin wrappers (tape setup + intrinsic call + return). Numeric values use Q16.16 fixed-point (65536 = 1.0).
+
+**Tier 1 — GL Proxy Wrappers**:
+
+| Subroutine | Symbol | Intrinsic Called | Description |
+|------------|--------|------------------|-------------|
+| gl_init | `\g3i` | `__gl_init` | Initialize GL context. `tape[ptr]`=width, `[ptr+4]`=height. |
+| gl_cleanup | `\g3c` | `__gl_cleanup` | Destroy GL context and free resources. |
+| gl_create_buffer | `\gcb` | `__gl_create_buffer` | Create buffer. Returns buffer ID in `tape[ptr]`. |
+| gl_buffer_data | `\gbd` | `__gl_buffer_data` | Upload data to buffer. |
+| gl_delete_buffer | `\gdb` | `__gl_delete_buffer` | Delete buffer. |
+| gl_create_vao | `\gva` | `__gl_create_vao` | Create VAO. Returns VAO ID. |
+| gl_bind_vao | `\gbv` | `__gl_bind_vao` | Bind VAO. |
+| gl_vertex_attrib | `\gat` | `__gl_vertex_attrib` | Configure vertex attribute. |
+| gl_delete_vao | `\gdv` | `__gl_delete_vao` | Delete VAO. |
+| gl_create_shader | `\gcs` | `__gl_create_shader` | Create shader (0=vertex, 1=fragment). |
+| gl_shader_source | `\gss` | `__gl_shader_source` | Set shader source. |
+| gl_compile_shader | `\gcc` | `__gl_compile_shader` | Compile shader. Returns 1/0. |
+| gl_create_program | `\gcp` | `__gl_create_program` | Create program. Returns program ID. |
+| gl_attach_shader | `\gas` | `__gl_attach_shader` | Attach shader to program. |
+| gl_link_program | `\glp` | `__gl_link_program` | Link program. Returns 1/0. |
+| gl_use_program | `\gup` | `__gl_use_program` | Bind program. |
+| gl_uniform_loc | `\gul` | `__gl_uniform_loc` | Query uniform location. |
+| gl_uniform_1f | `\gu1` | `__gl_uniform_1f` | Set float uniform (Q16.16). |
+| gl_uniform_3f | `\gu3` | `__gl_uniform_3f` | Set vec3 uniform (Q16.16). |
+| gl_uniform_4f | `\gu4` | `__gl_uniform_4f` | Set vec4 uniform (Q16.16). |
+| gl_uniform_mat4 | `\gum` | `__gl_uniform_mat4` | Set mat4 uniform (Q16.16). |
+| gl_clear | `\gcl` | `__gl_clear` | Clear color+depth buffers. |
+| gl_draw_arrays | `\gda` | `__gl_draw_arrays` | Draw from arrays. |
+| gl_draw_elements | `\gde` | `__gl_draw_elements` | Draw indexed. |
+| gl_viewport | `\gvp` | `__gl_viewport` | Set viewport. |
+| gl_depth_test | `\gdt` | `__gl_depth_test` | Enable/disable depth test. |
+| gl_present | `\g3p` | `__gl_present` | Swap buffers / present frame. |
+| gl_shadow_enable | `\gse` | `__gl_shadow_enable` | Enable shadow mapping. |
+| gl_shadow_disable | `\gsd` | `__gl_shadow_disable` | Disable shadow mapping. |
+| gl_shadow_quality | `\gsq` | `__gl_shadow_quality` | Set shadow map quality. |
+
+**Tier 2 — Fixed-Point Math Wrappers**:
+
+| Subroutine | Symbol | Intrinsic Called | Description |
+|------------|--------|------------------|-------------|
+| fp_mul | `\fpm` | `__fp_mul` | Q16.16 multiply. |
+| fp_div | `\fpd` | `__fp_div` | Q16.16 divide. |
+| fp_sin | `\fps` | `__fp_sin` | Sine (LUT-based). |
+| fp_cos | `\fpc` | `__fp_cos` | Cosine (LUT-based). |
+| fp_sqrt | `\fpq` | `__fp_sqrt` | Square root. |
+| mat4_identity | `\m4i` | `__mat4_identity` | Write identity matrix. |
+| mat4_multiply | `\m4m` | `__mat4_multiply` | Matrix multiply. |
+| mat4_rotate | `\m4r` | `__mat4_rotate` | Rotate matrix around axis. |
+| mat4_translate | `\m4t` | `__mat4_translate` | Translate matrix. |
+| mat4_perspective | `\m4p` | `__mat4_perspective` | Build perspective projection. |
+
+**Tier 3 — Mesh Generator Wrappers**:
+
+| Subroutine | Symbol | Intrinsic Called | Description |
+|------------|--------|------------------|-------------|
+| mesh_cube | `\mcb` | `__mesh_cube` | Generate cube mesh. Returns vertex count. |
+| mesh_sphere | `\msp` | `__mesh_sphere` | Generate UV sphere. Returns vertex count. |
+| mesh_torus | `\mto` | `__mesh_torus` | Generate torus. Returns vertex count. |
+| mesh_plane | `\mpl` | `__mesh_plane` | Generate plane quad. Returns vertex count. |
+| mesh_cylinder | `\mcy` | `__mesh_cylinder` | Generate cylinder. Returns vertex count. |
+
+**Multi-GPU & Scene Oracle Wrappers**:
+
+| Subroutine | Symbol | Intrinsic Called | Description |
+|------------|--------|------------------|-------------|
+| multi_gpu | `\mgpu` | `__gl_multi_gpu` | Set multi-GPU mode (0=off, 1=SFR, 2=AFR). |
+| gpu_count | `\gcnt` | `__gl_gpu_count` | Query GPU count. |
+| frame_time | `\gft` | `__gl_frame_time` | Query last frame time (microseconds). |
+| scene_publish | `\spub` | `__scene_publish` | Publish scene state (triple-buffer swap). |
+| scene_mode | `\smod` | `__scene_mode` | Set scene oracle mode. |
+| scene_extrap | `\sext` | `__scene_extrap_ms` | Set extrapolation lookahead (ms). |

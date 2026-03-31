@@ -1,6 +1,6 @@
 # BF++ Memory Map
 
-**Version**: 0.1.0
+**Version**: 0.3.0
 
 ---
 
@@ -116,6 +116,24 @@ BF++ uses a flat tape with conventionally designated regions. The tape is a cont
 - The legacy address `0xA000` shown in the overview table is a convention for the default 64 KB tape with small framebuffers (e.g., 90x90). Always use `BFPP_FB_OFFSET` (a C `#define` in generated code) rather than hardcoding an address.
 - BF++ source code cannot reference C `#define` values directly. Callers must pass the framebuffer offset as a parameter (e.g., `#40960` for 0xA000) or compute it from known tape size and resolution.
 - Runtime flushes this region to an SDL texture each frame via the `F` operator
+- When 3D rendering is active (`__gl_*` intrinsics), `bfpp_gl_present()` writes to this same region via `glReadPixels` (PBO async readback), then triggers the FB pipeline flush
+- The 3D Scene Oracle's snapshot data is managed internally by the runtime (not in tape) — only the final rendered pixels land in `tape[FB_OFFSET]`
+
+### 3D Rendering Data (user-managed tape regions)
+
+When using 3D intrinsics, BF++ programs typically reserve tape regions for:
+- **Mesh data** (written by `__mesh_*`): vertex_count (4B) + index_count (4B) + vertices (24B each: pos xyz + normal xyz, Q16.16) + indices (4B each)
+- **Matrix storage** (used by `__mat4_*`): 16 × Q16.16 values = 64 bytes per 4×4 matrix
+- **Intrinsic parameters**: read from `tape[ptr + N*4]` — typically 4-20 bytes per call
+
+Recommended layout for 3D programs (with `--tape-size 1048576`):
+```
+0x00000–0x000FF  Scratch / intrinsic params (256 bytes)
+0x00100–0x007FF  Matrix storage (view, proj, model × N)
+0x00800–0x0FFFF  Mesh data (~60 KB for several meshes)
+0x10000–0xEFFFF  General purpose / scene data
+FB_OFFSET–end    Framebuffer (W×H×3 bytes)
+```
 
 ---
 
