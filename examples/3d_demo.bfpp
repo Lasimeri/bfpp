@@ -1,0 +1,169 @@
+; BF++ 3D Demo — Rotating cube and orbiting sphere with Blinn-Phong lighting
+;
+; Compile: bfpp examples/3d_demo.bfpp --include stdlib --framebuffer 640x480 -o 3d_demo
+; Run:     ./3d_demo
+;
+; Tape layout (32-bit cells):
+;   Cell 0..19  — scratch / intrinsic params
+;   Cell 20     — cube VAO id       Cell 21     — sphere VAO id
+;   Cell 25     — frame counter     Cell 26     — angle accumulator (Q16.16)
+;   Cell 28..29 — trig scratch
+;   Addr 400    — projection matrix (16 Q16.16)
+;   Addr 656    — view matrix
+;   Addr 912    — cube model matrix
+;   Addr 1168   — sphere model matrix
+;   Addr 2000+  — cube mesh data    Addr 3200+  — sphere mesh data
+;
+; Q16.16: 65536=1.0  131072=2.0  327680=5.0
+;
+; Uniform locations (assumed, default Blinn-Phong shader):
+;   0=uModel 1=uView 2=uProjection 7=uObjectColor 8=uViewPos 9=uAmbient
+;   10=uLights[0].position 11=.color 12=.intensity
+;   14=uLights[1].position 15=.color 16=.intensity 18=uNumLights
+
+%4                                  ; 32-bit cells for Q16.16
+!include "3d.bfpp"
+
+; ── Init ──
+!#g3i                               ; init GL context + FBO + default shaders
+#1 !#g3dt [-]                       ; enable depth test
+
+; ── Generate meshes ──
+#2000 !#__mesh_cube [-]             ; cube at addr 2000 (36 verts, 36 idx)
+#3200 > #2 < !#__mesh_sphere        ; sphere at addr 3200, subdiv=2
+[-] > [-] <
+
+; ── Cube VBO + VAO ──
+[-] !#__gl_create_buffer $          ; create VBO, save id
+~                                   ; P+0 = vbo_id
+> #2008 > #864 > #0 <<<            ; data_addr=2008, bytes=36*24=864, static
+!#__gl_buffer_data
+> [-] > [-] > [-] > [-] <<<<        ; clear
+!#__gl_create_vao $                 ; create VAO, save id
+~ !#__gl_bind_vao                   ; bind
+[-] > #3 > #24 > [-] <<<           ; attrib 0: pos (3f, stride 24, off 0)
+!#__gl_vertex_attrib
+#1 > #3 > #24 > #12 <<<            ; attrib 1: normal (3f, stride 24, off 12)
+!#__gl_vertex_attrib
+[-] > [-] > [-] > [-] <<<
+>20 ~ <20                           ; save cube VAO id → cell 20
+
+; ── Sphere VBO + VAO ──
+[-] !#__gl_create_buffer $
+~ > #3208 > #3888 > #0 <<<         ; data_addr=3208, bytes=162*24=3888, static
+!#__gl_buffer_data
+> [-] > [-] > [-] > [-] <<<<
+!#__gl_create_vao $ ~ !#__gl_bind_vao
+[-] > #3 > #24 > [-] <<<
+!#__gl_vertex_attrib
+#1 > #3 > #24 > #12 <<<
+!#__gl_vertex_attrib
+[-] > [-] > [-] > [-] <<<
+>21 ~ <21                           ; save sphere VAO id → cell 21
+
+; ── Projection matrix (45° fov, 4:3, near=0.1, far=100) ──
+[-]
+#400 > #51445 > #87381 > #6554 > #6553600 <<<<
+!#__mat4_perspective
+[-] > [-] > [-] > [-] > [-] <<<<
+
+; ── View matrix (camera at 0, -2, -5 — negated translation) ──
+#656 > #0 > #4294836224 > #4294639616 <<<
+!#__mat4_translate
+[-] > [-] > [-] > [-] <<<
+
+; ── Static uniforms ──
+; Projection (loc=2)
+#2 > #400 < !#__gl_uniform_mat4 [-] > [-] <
+; View (loc=1)
+#1 > #656 < !#__gl_uniform_mat4 [-] > [-] <
+; Ambient (loc=9): 0.15 = 9830
+#9 > #9830 > #9830 > #9830 <<< !#__gl_uniform_3f [-] > [-] > [-] > [-] <<<
+; Camera pos (loc=8): (0, 2, 5)
+#8 > #0 > #131072 > #327680 <<< !#__gl_uniform_3f [-] > [-] > [-] > [-] <<<
+; Num lights (loc=18): 2.0 = 131072
+#18 > #131072 < !#__gl_uniform_1f [-] > [-] <
+
+; Light 0: warm key at (3, 4, 2)
+#10 > #196608 > #262144 > #131072 <<< !#__gl_uniform_3f [-] > [-] > [-] > [-] <<<
+; color (1.0, 0.95, 0.8)
+#11 > #65536 > #62259 > #52429 <<< !#__gl_uniform_3f [-] > [-] > [-] > [-] <<<
+; intensity 1.0
+#12 > #65536 < !#__gl_uniform_1f [-] > [-] <
+
+; Light 1: cool blue fill from (-2, 3, -1)
+#14 > #4294836224 > #196608 > #4294901760 <<< !#__gl_uniform_3f [-] > [-] > [-] > [-] <<<
+; color (0.4, 0.5, 0.9)
+#15 > #26214 > #32768 > #58982 <<< !#__gl_uniform_3f [-] > [-] > [-] > [-] <<<
+; intensity 0.6
+#16 > #39322 < !#__gl_uniform_1f [-] > [-] <
+
+; ── Render loop (300 frames) ──
+>25 [-] #300 <25                    ; frame counter at cell 25
+>26 [-] <26                         ; angle at cell 26
+
+>25                                 ; ptr → frame counter
+[
+    <25                             ; ptr → cell 0
+
+    ; Clear (dark gray: 25, 25, 30)
+    #25 > #25 > #30 << !#__gl_clear [-] > [-] > [-] <<
+
+    ; ── Cube: rotate around Y ──
+    #912                            ; model matrix addr
+    > [-] < >26 $ <26 > ~ <         ; copy angle from cell 26 → P+1
+    >> #0 > #65536 > #0 <<<<        ; axis = Y
+    !#__mat4_rotate
+    [-] > [-] > [-] > [-] > [-] <<<<
+    #0 > #912 < !#__gl_uniform_mat4 [-] > [-] <   ; set uModel
+    #7 > #58982 > #13107 > #9830 <<< !#__gl_uniform_3f  ; red
+    [-] > [-] > [-] > [-] <<<
+
+    ; Bind cube VAO and draw 36 triangles
+    >20 $ <20 ~ !#__gl_bind_vao [-]
+    #0 > #0 > #36 << !#__gl_draw_arrays [-] > [-] > [-] <<
+
+    ; ── Sphere: orbit at radius 2 ──
+    ; cos(angle)
+    >26 $ <26 ~ !#__fp_cos $ >28 [-] ~ <28
+    ; sin(angle)
+    >26 $ <26 ~ !#__fp_sin $ >29 [-] ~ <29
+
+    ; tx = 2*cos
+    >28 $ <28 ~ > #131072 < !#__fp_mul $ > [-] <
+    ; tz = 2*sin
+    >29 $ <29 ~ > #131072 < !#__fp_mul $ [-]
+
+    ; Build translation matrix at addr 1168
+    #1168 > [-] <
+    >>> [-] ~ <<<                   ; pop tz → P+3
+    > ~ <                           ; pop tx → P+1
+    >> [-] <<                       ; P+2 = ty = 0
+    !#__mat4_translate
+    [-] > [-] > [-] > [-] <<<
+    #0 > #1168 < !#__gl_uniform_mat4 [-] > [-] <   ; set uModel
+    #7 > #13107 > #19661 > #58982 <<< !#__gl_uniform_3f  ; blue
+    [-] > [-] > [-] > [-] <<<
+
+    ; Bind sphere VAO and draw
+    >21 $ <21 ~ !#__gl_bind_vao [-]
+    #0 > #0 > #960 << !#__gl_draw_arrays [-] > [-] > [-] <<
+
+    ; Present + sync
+    !#g3p !#g3s
+
+    ; Increment angle by pi/32 ≈ 6434 Q16.16
+    >30 [-] #6434 $ [-] <30         ; push delta
+    >26 > [-] ~ [-<+>] <            ; pop → cell 27, add into cell 26
+    <26
+
+    ; Decrement frame counter
+    >25 -
+]
+
+<25
+
+; ── Cleanup ──
+#100 !#__sleep [-]                  ; brief pause to show final frame
+!#g3c                               ; teardown GL
+#0 !#__exit

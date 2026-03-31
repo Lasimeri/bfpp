@@ -262,6 +262,41 @@ fn main() {
         cc_cmd.args(["-ldl"]);
     }
 
+    // 3D rendering runtime: when any __gl_*/__fp_*/__mat4_*/__mesh_* intrinsic is used,
+    // link OpenGL + GLEW + math and compile the 3D runtime files.
+    if codegen_result.uses_3d {
+        cc_cmd.args(["-lGL", "-lGLEW", "-lm"]);
+        if !codegen_result.uses_fb_pipeline {
+            // 3D requires SDL2 + pthread even without explicit --framebuffer
+            cc_cmd.args(["-lSDL2", "-pthread", "-msse4.1"]);
+        }
+        let runtime_paths = [
+            PathBuf::from("runtime"),
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("runtime")))
+                .unwrap_or_default(),
+        ];
+        let rt_3d_files = [
+            "bfpp_rt_3d.c",
+            "bfpp_rt_3d_math.c",
+            "bfpp_rt_3d_meshgen.c",
+            "bfpp_rt_3d_software.c",
+        ];
+        for rt_dir in &runtime_paths {
+            if rt_dir.join("bfpp_rt_3d.c").exists() {
+                cc_cmd.arg(format!("-I{}", rt_dir.display()));
+                for f in &rt_3d_files {
+                    let path = rt_dir.join(f);
+                    if path.exists() {
+                        cc_cmd.arg(path.to_str().unwrap());
+                    }
+                }
+                break;
+            }
+        }
+    }
+
     // Threading runtime: when any __spawn/__join/__mutex_*/__atomic_*/__barrier_*
     // intrinsic is used, link pthread and compile the parallel runtime.
     if codegen_result.uses_threading {

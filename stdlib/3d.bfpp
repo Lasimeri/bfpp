@@ -1,0 +1,467 @@
+; BF++ Standard Library: 3d.bfpp
+; 3D rendering convenience wrappers around __gl_*, __fp_*, __mat4_*, __mesh_* intrinsics.
+; Requires: --framebuffer WxH flag when compiling (enables SDL + GL subsystem).
+;
+; Architecture:
+;   All intrinsics operate on 32-bit cells (%4 mode). Values at tape[ptr + N*4].
+;   Numeric values are either raw uint32 (IDs, enums, byte counts) or Q16.16
+;   fixed-point (positions, colors, angles). Q16.16: 65536 = 1.0, 32768 = 0.5.
+;
+;   The 3D subsystem renders to an offscreen FBO, then readback to tape[FB_OFFSET]
+;   via __gl_present. The FB pipeline presents the frame in an SDL window.
+;
+;   Default shader (compiled at init) expects these uniforms:
+;     uModel, uView, uProjection (mat4)
+;     uObjectColor, uViewPos, uAmbient (vec3)
+;     uLights[N].position, .color (vec3), .intensity (float), .castShadow (int)
+;     uNumLights (int)
+;
+; Cell width: All subroutines assume %4 (32-bit). Caller must set this.
+;
+; Usage:
+;   %4                              ; required: 32-bit cells
+;   !include "3d.bfpp"
+;   !#g3i                           ; init 3D subsystem
+;   ...                             ; set up meshes, uniforms, draw
+;   !#g3p                           ; present frame
+;   !#g3c                           ; cleanup
+
+!include "math.bfpp"
+
+; ============================================================================
+; LIFECYCLE
+; ============================================================================
+
+; !#g3i — init_3d()
+; No tape input required. Initializes GL context, FBO, default shaders.
+; Called once at program start.
+!#g3i{
+    !#__gl_init
+    ^
+}
+
+; !#g3c — cleanup_3d()
+; Tears down all GL state, frees resources.
+!#g3c{
+    !#__gl_cleanup
+    ^
+}
+
+; !#g3p — present_3d()
+; Reads rendered FBO into tape framebuffer, flushes to SDL window.
+; No tape input.
+!#g3p{
+    !#__gl_present
+    ^
+}
+
+; !#g3s — sync_3d()
+; Blocks until the current frame is presented by the FB pipeline.
+; Use in render loops to throttle to display refresh.
+!#g3s{
+    !#__fb_sync
+    ^
+}
+
+; ============================================================================
+; CLEAR / VIEWPORT / DEPTH
+; ============================================================================
+
+; !#g3cl — clear(r, g, b)
+; Input: P+0=red(0-255), P+1=green(0-255), P+2=blue(0-255)
+; Clears color + depth buffers.
+!#g3cl{
+    !#__gl_clear
+    ^
+}
+
+; !#g3vp — viewport(x, y, w, h)
+; Input: P+0=x, P+1=y, P+2=width, P+3=height (all uint32)
+!#g3vp{
+    !#__gl_viewport
+    ^
+}
+
+; !#g3dt — depth_test(enable)
+; Input: P+0 = 0 to disable, 1 to enable
+!#g3dt{
+    !#__gl_depth_test
+    ^
+}
+
+; ============================================================================
+; BUFFER MANAGEMENT
+; ============================================================================
+
+; !#g3cb — create_buffer()
+; Output: P+0 ← buffer_id (uint32)
+!#g3cb{
+    !#__gl_create_buffer
+    ^
+}
+
+; !#g3bd — buffer_data(buf_id, data_addr, byte_count, usage)
+; Input: P+0=buffer_id, P+1=data_addr, P+2=byte_count, P+3=usage(0=static,1=dynamic,2=stream)
+; Data at data_addr is Q16.16 vertex values (4 bytes each), converted to float on upload.
+!#g3bd{
+    !#__gl_buffer_data
+    ^
+}
+
+; !#g3db — delete_buffer(buf_id)
+; Input: P+0 = buffer_id
+!#g3db{
+    !#__gl_delete_buffer
+    ^
+}
+
+; ============================================================================
+; VAO MANAGEMENT
+; ============================================================================
+
+; !#g3cv — create_vao()
+; Output: P+0 ← vao_id (uint32)
+!#g3cv{
+    !#__gl_create_vao
+    ^
+}
+
+; !#g3bv — bind_vao(vao_id)
+; Input: P+0 = vao_id
+!#g3bv{
+    !#__gl_bind_vao
+    ^
+}
+
+; !#g3va — vertex_attrib(index, size, stride, offset)
+; Input: P+0=attrib_index, P+1=component_count(1-4), P+2=stride_bytes, P+3=offset_bytes
+; Always GL_FLOAT, not normalized. Enables the attribute.
+!#g3va{
+    !#__gl_vertex_attrib
+    ^
+}
+
+; !#g3dv — delete_vao(vao_id)
+; Input: P+0 = vao_id
+!#g3dv{
+    !#__gl_delete_vao
+    ^
+}
+
+; ============================================================================
+; SHADER / PROGRAM MANAGEMENT
+; ============================================================================
+
+; !#g3cs — create_shader(type)
+; Input: P+0 = type (0=vertex, 1=fragment)
+; Output: P+0 ← shader_id (overwrites type)
+!#g3cs{
+    !#__gl_create_shader
+    ^
+}
+
+; !#g3ss — shader_source(shader_id, source_addr)
+; Input: P+0=shader_id, P+1=source_addr (tape addr of null-terminated GLSL string)
+!#g3ss{
+    !#__gl_shader_source
+    ^
+}
+
+; !#g3sc — compile_shader(shader_id)
+; Input: P+0 = shader_id. Sets bfpp_err on failure.
+!#g3sc{
+    !#__gl_compile_shader
+    ^
+}
+
+; !#g3cp — create_program()
+; Output: P+0 ← program_id
+!#g3cp{
+    !#__gl_create_program
+    ^
+}
+
+; !#g3as — attach_shader(program_id, shader_id)
+; Input: P+0=program_id, P+1=shader_id
+!#g3as{
+    !#__gl_attach_shader
+    ^
+}
+
+; !#g3lp — link_program(program_id)
+; Input: P+0 = program_id. Sets bfpp_err on failure.
+!#g3lp{
+    !#__gl_link_program
+    ^
+}
+
+; !#g3up — use_program(program_id)
+; Input: P+0 = program_id (0 to unbind)
+!#g3up{
+    !#__gl_use_program
+    ^
+}
+
+; ============================================================================
+; UNIFORMS
+; ============================================================================
+
+; !#g3ul — uniform_location(program_id, name_addr)
+; Input: P+0=program_id, P+1=name_addr (tape addr of null-terminated name)
+; Output: P+2 ← location (int32, -1 if not found)
+!#g3ul{
+    !#__gl_uniform_loc
+    ^
+}
+
+; !#g3u1 — uniform_1f(location, value)
+; Input: P+0=location(int32), P+1=value(Q16.16)
+!#g3u1{
+    !#__gl_uniform_1f
+    ^
+}
+
+; !#g3u3 — uniform_3f(location, x, y, z)
+; Input: P+0=location, P+1=x(Q16.16), P+2=y(Q16.16), P+3=z(Q16.16)
+!#g3u3{
+    !#__gl_uniform_3f
+    ^
+}
+
+; !#g3u4 — uniform_4f(location, x, y, z, w)
+; Input: P+0=location, P+1=x, P+2=y, P+3=z, P+4=w (all Q16.16)
+!#g3u4{
+    !#__gl_uniform_4f
+    ^
+}
+
+; !#g3um — uniform_mat4(location, matrix_addr)
+; Input: P+0=location(int32), P+1=matrix_addr(uint32 — tape addr of 16 Q16.16 values)
+; Matrix is 4x4, column-major, at the given tape address.
+!#g3um{
+    !#__gl_uniform_mat4
+    ^
+}
+
+; ============================================================================
+; DRAWING
+; ============================================================================
+
+; !#g3da — draw_arrays(mode, first, count)
+; Input: P+0=mode(0=triangles,1=lines,2=points,3=tri_strip,4=tri_fan,5=line_strip),
+;        P+1=first, P+2=count
+!#g3da{
+    !#__gl_draw_arrays
+    ^
+}
+
+; !#g3de — draw_elements(mode, index_count, index_buffer_id)
+; Input: P+0=mode, P+1=index_count, P+2=index_buffer_id
+!#g3de{
+    !#__gl_draw_elements
+    ^
+}
+
+; ============================================================================
+; SHADOW MAPPING
+; ============================================================================
+
+; !#g3se — shadow_enable(light_index)
+; Input: P+0 = light index (0-3)
+!#g3se{
+    !#__gl_shadow_enable
+    ^
+}
+
+; !#g3sd — shadow_disable(light_index)
+; Input: P+0 = light index (0-3)
+!#g3sd{
+    !#__gl_shadow_disable
+    ^
+}
+
+; !#g3sq — shadow_quality(quality)
+; Input: P+0 = quality (0=off, 1=hard, 2=soft PCF)
+!#g3sq{
+    !#__gl_shadow_quality
+    ^
+}
+
+; ============================================================================
+; FIXED-POINT MATH (Q16.16)
+; ============================================================================
+
+; !#fpm — fp_multiply(a, b)
+; Input: P+0=a(Q16.16), P+1=b(Q16.16)
+; Output: P+0 = a * b (Q16.16)
+!#fpm{
+    !#__fp_mul
+    ^
+}
+
+; !#fpd — fp_divide(a, b)
+; Input: P+0=a(Q16.16), P+1=b(Q16.16)
+; Output: P+0 = a / b (Q16.16)
+!#fpd{
+    !#__fp_div
+    ^
+}
+
+; !#fps — fp_sin(angle)
+; Input: P+0 = angle in Q16.16 radians
+; Output: P+0 = sin(angle) (Q16.16)
+!#fps{
+    !#__fp_sin
+    ^
+}
+
+; !#fpc — fp_cos(angle)
+; Input: P+0 = angle in Q16.16 radians
+; Output: P+0 = cos(angle) (Q16.16)
+!#fpc{
+    !#__fp_cos
+    ^
+}
+
+; !#fpq — fp_sqrt(value)
+; Input: P+0 = value (Q16.16)
+; Output: P+0 = sqrt(value) (Q16.16)
+!#fpq{
+    !#__fp_sqrt
+    ^
+}
+
+; ============================================================================
+; MATRIX OPERATIONS
+; ============================================================================
+; All mat4 operations work on 16 Q16.16 values (64 bytes) at a tape address.
+; Matrices are column-major (OpenGL convention).
+
+; !#m4i — mat4_identity(addr)
+; Input: P+0 = tape address where 16 Q16.16 values will be written
+; Output: identity matrix at that address
+!#m4i{
+    !#__mat4_identity
+    ^
+}
+
+; !#m4m — mat4_multiply(dst_addr, a_addr, b_addr)
+; Input: P+0=dest_addr, P+1=matrix_a_addr, P+2=matrix_b_addr
+; Output: dest = a * b (matrix multiply)
+!#m4m{
+    !#__mat4_multiply
+    ^
+}
+
+; !#m4r — mat4_rotate(addr, angle, axis_x, axis_y, axis_z)
+; Input: P+0=matrix_addr, P+1=angle(Q16.16 radians),
+;        P+2=axis_x(Q16.16), P+3=axis_y(Q16.16), P+4=axis_z(Q16.16)
+; Output: rotation matrix at addr
+!#m4r{
+    !#__mat4_rotate
+    ^
+}
+
+; !#m4t — mat4_translate(addr, tx, ty, tz)
+; Input: P+0=matrix_addr, P+1=tx(Q16.16), P+2=ty(Q16.16), P+3=tz(Q16.16)
+; Output: translation matrix at addr
+!#m4t{
+    !#__mat4_translate
+    ^
+}
+
+; !#m4p — mat4_perspective(addr, fov, aspect, near, far)
+; Input: P+0=matrix_addr, P+1=fov_radians(Q16.16), P+2=aspect_ratio(Q16.16),
+;        P+3=near_plane(Q16.16), P+4=far_plane(Q16.16)
+; Output: perspective projection matrix at addr
+!#m4p{
+    !#__mat4_perspective
+    ^
+}
+
+; ============================================================================
+; MESH GENERATORS
+; ============================================================================
+; Each generator writes to a tape region. Output layout at the target address:
+;   [+0..+3]  vertex_count (uint32)
+;   [+4..+7]  index_count  (uint32)
+;   [+8..]    vertex data  (vertex_count * 24 bytes — 6 Q16.16 per vert: pos xyz + normal xyz)
+;   [after]   index data   (index_count * 4 bytes — uint32 indices)
+
+; !#mc — mesh_cube(dest_addr)
+; Input: P+0 = tape address for mesh output
+; Generates a unit cube (±0.5) centered at origin. 36 verts, 36 indices.
+; Total output: 8 + 36*24 + 36*4 = 1016 bytes
+!#mc{
+    !#__mesh_cube
+    ^
+}
+
+; !#ms — mesh_sphere(dest_addr, subdivisions)
+; Input: P+0=tape address for output, P+1=subdivision level (1-4, clamped)
+; Generates an icosphere of radius 1.0 centered at origin.
+; subdiv=2: 162 verts, 960 indices → ~4656 bytes
+!#ms{
+    !#__mesh_sphere
+    ^
+}
+
+; !#mt — mesh_torus(dest_addr)
+; Input: P+0 = tape address for mesh output
+!#mt{
+    !#__mesh_torus
+    ^
+}
+
+; !#mp — mesh_plane(dest_addr)
+; Input: P+0 = tape address for mesh output
+!#mp{
+    !#__mesh_plane
+    ^
+}
+
+; !#my — mesh_cylinder(dest_addr)
+; Input: P+0 = tape address for mesh output
+!#my{
+    !#__mesh_cylinder
+    ^
+}
+
+; ============================================================================
+; MESH UPLOAD PATTERN (DOCUMENTATION)
+; ============================================================================
+;
+; Complex multi-intrinsic operations (create VBO + VAO + configure attribs)
+; are best expressed as sequential intrinsic calls in caller code, because
+; the tape layout between steps requires careful pointer management that
+; doesn't compress well into a single subroutine.
+;
+; Recommended pattern for mesh upload (in caller code):
+;
+;   ; Assume mesh data generated at tape addr MESH_ADDR
+;   ; After __mesh_cube, header: [vert_count, idx_count, vertex_data..., index_data...]
+;
+;   ; 1. Create VBO
+;   [-] !#__gl_create_buffer        ; P+0 ← vbo_id
+;   $                               ; save vbo_id
+;
+;   ; 2. Upload vertex data to VBO
+;   ~                               ; P+0 = vbo_id
+;   > #DATA_ADDR >                  ; P+1 = MESH_ADDR + 8 (skip header)
+;   #BYTE_COUNT >                   ; P+2 = vert_count * 24
+;   #0                              ; P+3 = STATIC_DRAW
+;   <<< !#__gl_buffer_data
+;
+;   ; 3. Create and bind VAO
+;   [-] > [-] > [-] > [-] <<<       ; clear
+;   !#__gl_create_vao               ; P+0 ← vao_id
+;   !#__gl_bind_vao                 ; bind it
+;   $                               ; save vao_id
+;
+;   ; 4. Attrib 0: position (3 floats, stride 24, offset 0)
+;   [-] > #3 > #24 > [-] <<<       ; index=0, size=3, stride=24, offset=0
+;   !#__gl_vertex_attrib
+;
+;   ; 5. Attrib 1: normal (3 floats, stride 24, offset 12)
+;   #1 > #3 > #24 > #12 <<<        ; index=1, size=3, stride=24, offset=12
+;   !#__gl_vertex_attrib

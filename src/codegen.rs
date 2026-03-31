@@ -44,6 +44,8 @@ pub struct CodegenResult {
     pub uses_fb_pipeline: bool,
     /// True if any threading intrinsics are used — triggers -pthread and bfpp_rt_parallel.c
     pub uses_threading: bool,
+    /// True if any 3D intrinsics are used — triggers bfpp_rt_3d*.c compilation + GL/GLEW linking
+    pub uses_3d: bool,
 }
 
 pub fn generate(program: &Program, opts: &CodegenOptions) -> CodegenResult {
@@ -56,8 +58,9 @@ pub fn generate(program: &Program, opts: &CodegenOptions) -> CodegenResult {
     let uses_tui_runtime = intrinsics.tui;
     let uses_fb_pipeline = opts.framebuffer.is_some();
     let uses_threading = intrinsics.threading;
+    let uses_3d = intrinsics.gl3d;
     let c_source = generate_c(program, opts, uses_ffi, &intrinsics);
-    CodegenResult { c_source, uses_ffi, uses_tui_runtime, uses_fb_pipeline, uses_threading }
+    CodegenResult { c_source, uses_ffi, uses_tui_runtime, uses_fb_pipeline, uses_threading, uses_3d }
 }
 
 // Recursively checks whether any node in the AST uses \ffi calls.
@@ -254,6 +257,10 @@ fn emit_header(opts: &CodegenOptions, uses_ffi: bool, intrinsics: &IntrinsicUsag
         h.push_str("#include <sched.h>\n");
         h.push_str("#include \"bfpp_rt_parallel.h\"\n");
     }
+    if intrinsics.gl3d {
+        // 3D rendering: OpenGL proxy layer, fixed-point math, mesh generators, software fallback.
+        h.push_str("#include \"bfpp_rt_3d.h\"\n");
+    }
     h.push('\n');
 
     // Framebuffer: maps the last W*H*3 bytes of the tape as an RGB24 pixel
@@ -328,6 +335,15 @@ fn emit_header(opts: &CodegenOptions, uses_ffi: bool, intrinsics: &IntrinsicUsag
         h.push_str("_Thread_local int sp = 0;\n");
         h.push_str("_Thread_local int bfpp_call_depth = 0;\n");
         h.push_str("_Thread_local uint8_t cell_width[TAPE_SIZE];\n");
+    } else if intrinsics.gl3d {
+        // 3D runtime references bfpp_err via extern — give it external linkage.
+        // Other variables stay static (no threading, only bfpp_err crosses TU boundary).
+        h.push_str("static int ptr = 0;\n");
+        h.push_str("int bfpp_err = 0;\n");
+        h.push_str("static uint64_t stack[STACK_SIZE];\n");
+        h.push_str("static int sp = 0;\n");
+        h.push_str("static int bfpp_call_depth = 0;\n");
+        h.push_str("static uint8_t cell_width[TAPE_SIZE]; /* 0=continuation, 1,2,4,8 */\n");
     } else {
         h.push_str("static int ptr = 0;\n");
         h.push_str("static int bfpp_err = 0;\n");
@@ -1276,6 +1292,206 @@ fn emit_intrinsic(out: &mut String, name: &str, ctx: &mut GenCtx) {
             out.push_str("#endif\n");
         }
 
+        // ── 3D Rendering intrinsics ────────────────────────
+        // Lifecycle
+        "__gl_init" => {
+            indent(out, ctx.indent);
+            out.push_str("#ifdef BFPP_FRAMEBUFFER\n");
+            indent(out, ctx.indent);
+            out.push_str("bfpp_3d_init(BFPP_FB_WIDTH, BFPP_FB_HEIGHT, tape, BFPP_FB_OFFSET);\n");
+            indent(out, ctx.indent);
+            out.push_str("#endif\n");
+        }
+        "__gl_cleanup" => {
+            indent(out, ctx.indent);
+            out.push_str("#ifdef BFPP_FRAMEBUFFER\n");
+            indent(out, ctx.indent);
+            out.push_str("bfpp_3d_cleanup();\n");
+            indent(out, ctx.indent);
+            out.push_str("#endif\n");
+        }
+        // Buffer management
+        "__gl_create_buffer" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_create_buffer(tape, ptr);\n");
+        }
+        "__gl_buffer_data" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_buffer_data(tape, ptr);\n");
+        }
+        "__gl_delete_buffer" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_delete_buffer(tape, ptr);\n");
+        }
+        // VAO management
+        "__gl_create_vao" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_create_vao(tape, ptr);\n");
+        }
+        "__gl_bind_vao" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_bind_vao(tape, ptr);\n");
+        }
+        "__gl_vertex_attrib" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_vertex_attrib(tape, ptr);\n");
+        }
+        "__gl_delete_vao" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_delete_vao(tape, ptr);\n");
+        }
+        // Shader management
+        "__gl_create_shader" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_create_shader(tape, ptr);\n");
+        }
+        "__gl_shader_source" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_shader_source(tape, ptr);\n");
+        }
+        "__gl_compile_shader" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_compile_shader(tape, ptr);\n");
+        }
+        "__gl_create_program" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_create_program(tape, ptr);\n");
+        }
+        "__gl_attach_shader" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_attach_shader(tape, ptr);\n");
+        }
+        "__gl_link_program" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_link_program(tape, ptr);\n");
+        }
+        "__gl_use_program" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_use_program(tape, ptr);\n");
+        }
+        // Uniforms
+        "__gl_uniform_loc" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_uniform_loc(tape, ptr);\n");
+        }
+        "__gl_uniform_1f" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_uniform_1f(tape, ptr);\n");
+        }
+        "__gl_uniform_3f" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_uniform_3f(tape, ptr);\n");
+        }
+        "__gl_uniform_4f" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_uniform_4f(tape, ptr);\n");
+        }
+        "__gl_uniform_mat4" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_uniform_mat4(tape, ptr);\n");
+        }
+        // Drawing
+        "__gl_clear" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_clear(tape, ptr);\n");
+        }
+        "__gl_draw_arrays" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_draw_arrays(tape, ptr);\n");
+        }
+        "__gl_draw_elements" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_draw_elements(tape, ptr);\n");
+        }
+        "__gl_viewport" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_viewport(tape, ptr);\n");
+        }
+        "__gl_depth_test" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_depth_test(tape, ptr);\n");
+        }
+        "__gl_present" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_present(tape, ptr);\n");
+        }
+        // Shadow mapping
+        "__gl_shadow_enable" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_shadow_enable(tape, ptr);\n");
+        }
+        "__gl_shadow_disable" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_shadow_disable(tape, ptr);\n");
+        }
+        "__gl_shadow_quality" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_shadow_quality(tape, ptr);\n");
+        }
+        // Fixed-point math (Tier 2)
+        "__fp_mul" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_fp_mul(tape, ptr);\n");
+        }
+        "__fp_div" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_fp_div(tape, ptr);\n");
+        }
+        "__fp_sin" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_fp_sin(tape, ptr);\n");
+        }
+        "__fp_cos" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_fp_cos(tape, ptr);\n");
+        }
+        "__fp_sqrt" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_fp_sqrt(tape, ptr);\n");
+        }
+        // Matrix operations (Tier 2)
+        "__mat4_identity" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_mat4_identity(tape, ptr);\n");
+        }
+        "__mat4_multiply" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_mat4_multiply(tape, ptr);\n");
+        }
+        "__mat4_rotate" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_mat4_rotate(tape, ptr);\n");
+        }
+        "__mat4_translate" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_mat4_translate(tape, ptr);\n");
+        }
+        "__mat4_perspective" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_mat4_perspective(tape, ptr);\n");
+        }
+        // Mesh generators (Tier 3)
+        "__mesh_cube" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_mesh_cube(tape, ptr);\n");
+        }
+        "__mesh_sphere" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_mesh_sphere(tape, ptr);\n");
+        }
+        "__mesh_torus" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_mesh_torus(tape, ptr);\n");
+        }
+        "__mesh_plane" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_mesh_plane(tape, ptr);\n");
+        }
+        "__mesh_cylinder" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_mesh_cylinder(tape, ptr);\n");
+        }
+
         // ── Threading intrinsics ────────────────────────────
         "__spawn" => {
             // Input: tape[ptr]=subroutine_index, tape[ptr+8]=start_ptr
@@ -1373,6 +1589,7 @@ struct IntrinsicUsage {
     tui: bool,       // __tui_* — requires bfpp_rt.h/bfpp_rt.c external runtime
     threading: bool, // __spawn, __join, __mutex_*, __atomic_*, __barrier_* — requires -pthread + bfpp_rt_parallel
     fb_sync: bool,   // __fb_sync, __fb_pixel_nt — framebuffer pipeline intrinsics
+    gl3d: bool,      // __gl_*, __fp_*, __mat4_*, __mesh_* — requires bfpp_rt_3d + OpenGL/GLEW + math
 }
 
 // Pre-scan the entire AST for intrinsic calls and return a summary of
@@ -1408,6 +1625,22 @@ fn scan_intrinsics(nodes: &[AstNode], usage: &mut IntrinsicUsage) {
                     "__atomic_load" | "__atomic_store" | "__atomic_add" | "__atomic_cas" |
                     "__barrier_init" | "__barrier_wait" => usage.threading = true,
                     "__fb_sync" | "__fb_pixel_nt" => usage.fb_sync = true,
+                    "__gl_init" | "__gl_cleanup" | "__gl_create_buffer" |
+                    "__gl_buffer_data" | "__gl_delete_buffer" |
+                    "__gl_create_vao" | "__gl_bind_vao" | "__gl_vertex_attrib" |
+                    "__gl_delete_vao" | "__gl_create_shader" | "__gl_shader_source" |
+                    "__gl_compile_shader" | "__gl_create_program" | "__gl_attach_shader" |
+                    "__gl_link_program" | "__gl_use_program" |
+                    "__gl_uniform_loc" | "__gl_uniform_1f" | "__gl_uniform_3f" |
+                    "__gl_uniform_4f" | "__gl_uniform_mat4" |
+                    "__gl_clear" | "__gl_draw_arrays" | "__gl_draw_elements" |
+                    "__gl_viewport" | "__gl_depth_test" | "__gl_present" |
+                    "__gl_shadow_enable" | "__gl_shadow_disable" | "__gl_shadow_quality" |
+                    "__fp_mul" | "__fp_div" | "__fp_sin" | "__fp_cos" | "__fp_sqrt" |
+                    "__mat4_identity" | "__mat4_multiply" | "__mat4_rotate" |
+                    "__mat4_translate" | "__mat4_perspective" |
+                    "__mesh_cube" | "__mesh_sphere" | "__mesh_torus" |
+                    "__mesh_plane" | "__mesh_cylinder" => usage.gl3d = true,
                     _ => {}
                 }
             }

@@ -1,3 +1,5 @@
+#define _GNU_SOURCE  /* CPU_ZERO, CPU_SET, pthread_setaffinity_np */
+
 /*
  * bfpp_fb_pipeline.c — BF++ 4K@60fps tiled render pipeline
  *
