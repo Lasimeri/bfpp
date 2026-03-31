@@ -1,0 +1,80 @@
+; BF++ Standard Library: net.bfpp
+; TCP networking using raw syscalls.
+;
+; Linux x86_64 syscall numbers:
+;   SYS_socket  = 41,  SYS_connect = 42,  SYS_accept  = 43
+;   SYS_bind    = 49,  SYS_listen  = 50
+;   SYS_read    = 0,   SYS_write   = 1,   SYS_close   = 3
+;
+; Constants:
+;   AF_INET = 2,  SOCK_STREAM = 1
+;
+; All network ops require the caller to set up 64-bit syscall params
+; at ptr (or the syscall region at 0x8000). The \ operator reads:
+;   tape[ptr] = syscall_num, tape[ptr+8] = arg1, etc.
+;
+; Addresses (sockaddr_in) require 16 bytes:
+;   [family:2, port:2(BE), addr:4, zero:8]
+; Caller must construct sockaddr_in in the I/O buffer region (0x8100+)
+; and pass its address (via T) as the sockaddr argument.
+
+; !#tcp — tcp_connect: create TCP socket
+; This is a thin wrapper — just executes the socket() syscall.
+; Caller must set up the syscall area at ptr before calling:
+;   tape[ptr]    = 41 (SYS_socket)
+;   tape[ptr+8]  = 2  (AF_INET)
+;   tape[ptr+16] = 1  (SOCK_STREAM)
+;   tape[ptr+24] = 0  (protocol)
+; After: tape[ptr] = socket fd (or -1, error in register)
+;
+; Complete TCP client example (two-step):
+;   ; Step 1: Create socket
+;   %%%                     ; 8-byte cells for 64-bit syscall args
+;   [-]++++++++++[>++++<-]>+  ; tape[ptr] = 41 (SYS_socket)
+;   >>>>>>>>[-]++<<<<<<<<   ; tape[ptr+8] = 2 (AF_INET)
+;   >>>>>>>>>>>>>>>>[-]+<<<<<<<<<<<<<<<<  ; tape[ptr+16] = 1 (SOCK_STREAM)
+;   \                       ; syscall → fd in tape[ptr]
+;   ; Step 2: Connect (set up new syscall with fd, sockaddr, etc.)
+;   ; ... caller manages the connect syscall setup
+;
+; NOTE: For connect(), caller must construct a sockaddr_in struct
+; (16 bytes: family=2, port in big-endian, addr, zeros) at a known
+; tape address and pass its pointer via T.
+!#tcp{
+    \                       ; execute pre-configured socket syscall
+    ^
+}
+
+; !#tl — tcp_listen: create server socket (socket + bind + listen)
+; Caller sets up three syscalls in sequence.
+; This is a convenience wrapper for the socket creation step.
+!#tl{
+    ; Create socket
+    \                       ; syscall(41, AF_INET, SOCK_STREAM, 0) → fd
+    ^
+}
+
+; !#ta — tcp_accept: accept incoming connection
+; Caller sets up: tape[ptr]=43(SYS_accept), tape[ptr+8]=server_fd,
+;                 tape[ptr+16]=0(NULL), tape[ptr+24]=0(NULL)
+; Returns: tape[ptr] = client fd
+!#ta{
+    \
+    ^
+}
+
+; !#ts — tcp_send: send data on socket (uses SYS_write=1)
+; Caller sets up: tape[ptr]=1, tape[ptr+8]=fd, tape[ptr+16]=buf_addr, tape[ptr+24]=count
+; Returns: tape[ptr] = bytes sent
+!#ts{
+    \
+    ^
+}
+
+; !#tr — tcp_recv: receive data from socket (uses SYS_read=0)
+; Caller sets up: tape[ptr]=0, tape[ptr+8]=fd, tape[ptr+16]=buf_addr, tape[ptr+24]=max_count
+; Returns: tape[ptr] = bytes received
+!#tr{
+    \
+    ^
+}

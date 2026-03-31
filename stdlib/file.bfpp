@@ -1,0 +1,89 @@
+; BF++ Standard Library: file.bfpp
+; File operations using raw syscalls.
+;
+; Linux x86_64 syscall numbers:
+;   SYS_read  = 0,  SYS_write = 1,  SYS_open  = 2,  SYS_close = 3
+;
+; The \ operator reads syscall params from tape[ptr]:
+;   tape[ptr]    = syscall number
+;   tape[ptr+8]  = arg1
+;   tape[ptr+16] = arg2
+;   tape[ptr+24] = arg3
+;   ... (6 args max, 8 bytes apart)
+;
+; For file_close: works with 8-bit cells (fd and syscall num are small).
+; For file_open/read/write: caller must set up 64-bit cells at ptr
+; and provide pointer arguments (via T) since buffer addresses are large.
+
+; !#fc — file_close: close a file descriptor
+; Input: tape[ptr] = fd
+; Output: error register set on failure
+; Workspace: ptr+8 must be zero.
+!#fc{
+    ; Save fd, set up syscall at ptr
+    $                       ; push fd
+    [-]+++                  ; tape[ptr] = 3 (SYS_close)
+    >>>>>>>>[-]~<<<<<<<<    ; tape[ptr+8] = fd (arg1)
+    \                       ; execute syscall
+    [-]                     ; clear result
+    >>>>>>>>[-]<<<<<<<<     ; clear arg1
+    ^
+}
+
+; !#fo — file_open: open a file
+; This is a thin wrapper around the \ syscall operator.
+; Caller must set up syscall area with 64-bit cells:
+;   tape[ptr] = 2 (SYS_open), width 64
+;   tape[ptr+8] = absolute address of path (from T at path location)
+;   tape[ptr+16] = open flags (O_RDONLY=0, O_WRONLY|O_CREAT|O_TRUNC=577, etc.)
+;   tape[ptr+24] = mode (0644=420 for create, 0 otherwise)
+; After calling: tape[ptr] = fd (or error in error register).
+;
+; Complete usage example (open "hi.txt" read-only):
+;   "hi.txt\0"              ; write path to tape starting at ptr
+;   <<<<<<                   ; back to start of path (6 chars + null = 7 bytes)
+;   T                        ; push &tape[ptr] onto stack (path address)
+;   >>>>>>>                  ; move past path to clean area
+;   %%%                      ; cycle width to 8-byte (1→2→4→8) for 64-bit syscall
+;   [-]++                    ; tape[ptr] = 2 (SYS_open)
+;   >>>>>>>>                 ; move to arg1 slot (ptr+8)
+;   %%%                      ; 8-byte width for address
+;   [-]~                     ; pop path address from stack into arg1
+;   >>>>>>>>[-]<<<<<<<<      ; arg2 (flags) = 0 (O_RDONLY)
+;   <<<<<<<<                 ; back to syscall number
+;   \                        ; execute syscall — tape[ptr] now has fd
+;   E                        ; check error register after call
+;
+; NOTE: After the syscall, tape[ptr] contains the file descriptor
+; as a 64-bit value. Use E to check if bfpp_err was set.
+; To use the fd with !#fr/!#fw, copy it to the arg1 slot.
+!#fo{
+    ; Expects caller to set up syscall params at ptr.
+    ; Just execute the syscall.
+    \
+    ^
+}
+
+; !#fr — file_read: read from file descriptor
+; Caller sets up syscall area:
+;   tape[ptr] = 0 (SYS_read)
+;   tape[ptr+8] = fd
+;   tape[ptr+16] = buffer address (from T)
+;   tape[ptr+24] = count
+; After: tape[ptr] = bytes read (or -1, error in register).
+!#fr{
+    \
+    ^
+}
+
+; !#fw — file_write: write to file descriptor
+; Caller sets up syscall area:
+;   tape[ptr] = 1 (SYS_write)
+;   tape[ptr+8] = fd
+;   tape[ptr+16] = buffer address (from T)
+;   tape[ptr+24] = count
+; After: tape[ptr] = bytes written (or -1, error in register).
+!#fw{
+    \
+    ^
+}

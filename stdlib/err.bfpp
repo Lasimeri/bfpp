@@ -1,0 +1,57 @@
+; BF++ Standard Library: err.bfpp
+; Error handling utilities.
+; Depends on: io.bfpp
+
+; !#es — err_to_string: convert error code to printable string at ptr
+; Reads error register (E), prints "err:" followed by the code as a
+; decimal digit (0-9). Codes >= 10 are printed as raw byte (limitation).
+; Uses ptr..ptr+1 as workspace.
+!#es{
+    E                       ; read error code into tape[ptr]
+    $                       ; push error code (save for later)
+    [-]                     ; clear cell
+
+    ; Print "err:" prefix
+    "err:"
+    <<<<.>.>.>.             ; print e, r, r, :
+    [-][-][-][-]            ; clear the 4 string cells
+
+    ; Pop error code back
+    ~                       ; pop error code into ptr
+
+    ; Convert to ASCII digit: add 48 ('0')
+    ; Use multiplication loop: 10 * 5 = 50, then subtract 2 = 48
+    ++++++++++[>+++++<-]>--<  ; ptr+1 = 48
+    [->+<]                  ; add error code to 48 in ptr+1
+    >.[-]<[-]               ; print digit from ptr+1, clean up
+    ^
+}
+
+; !#ep — panic: print message to stderr and exit
+; If ptr points to a non-zero string, prints it to stderr (fd 2).
+; Then exits with code 1 via SYS_exit (60).
+; With default 1-byte cells: tape[ptr]=60, tape[ptr+8]=1.
+; The \ operator reads syscall args at byte offsets ptr+8, ptr+16, etc.
+; With 1-byte cells, ptr+8 bytes = 8 cells right (>>>>>>>>).
+!#ep{
+    [.{2}>]                 ; print message to stderr
+    [-]                     ; clear current cell
+    ++++++++++[>++++++<-]   ; tape[ptr+1] = 60 (10*6), ptr at ptr+0
+    >[-<+>]<                ; move 60 from ptr+1 to ptr+0
+    >>>>>>>>[-]+<<<<<<<<    ; tape[ptr+8] = 1 (exit code)
+    \                       ; SYS_exit(1) — process exits here
+    ^
+}
+
+; !#ea — assert: if tape[ptr] == 0, panic with "assertion failed"
+!#ea{
+    [                       ; if condition != 0 (truthy), skip
+        ^                   ; return (assertion passed)
+    ]
+    ; Assertion failed: condition was 0
+    "assertion failed\n\0"
+    ; Rewind ptr to start of message
+    <<<<<<<<<<<<<<<<<
+    !#ep                    ; panic with message
+    ^
+}

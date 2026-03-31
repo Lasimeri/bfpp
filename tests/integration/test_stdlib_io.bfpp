@@ -1,0 +1,7 @@
+; Test: stdlib I/O print_string
+; Uses !#.> to print a known string.
+!include "io.bfpp"
+
+"BFPP\n\0"
+<<<<<<
+!#.>

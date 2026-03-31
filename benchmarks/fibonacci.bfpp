@@ -1,0 +1,42 @@
+; Fibonacci benchmark — pure BF, no extensions.
+; Computes Fibonacci mod 256, exercises data-movement patterns.
+; 250 * 250 = 62,500 Fibonacci iterations.
+; Many copy/move loops that O2 MultiplyMove optimizes heavily.
+; tape[0]=a, tape[1]=b, tape[2..4]=temps, tape[5..6]=counters, tape[7]=scratch
+
+; Clear tape[0..7]
+[-]>[-]+>[-]>[-]>[-]>[-]>[-]>[-]
+; tape[0]=0, tape[1]=1, tape[2..7]=0, ptr at tape[7]
+
+; tape[5] = 250 (25*10)
+<<[-]+++++++++++++++++++++++++[>++++++++++<-]>[-<+>]<
+; tape[5]=250, tape[6]=0, ptr at tape[5]
+
+[
+    ; tape[6] = 250
+    >[-]+++++++++++++++++++++++++[>++++++++++<-]>[-<+>]<
+    ; tape[6]=250, ptr at tape[6]
+
+    [
+        <<<<<<                  ; tape[0]
+
+        ; Fibonacci step: a,b → b,a+b
+        ; Copy a→tape[2]+tape[3], restore from tape[3]
+        [>>+>+<<<-]>>>[-<<<+>>>]<<<
+        ; Copy b→tape[3]+tape[4], restore from tape[4]
+        >[>>+>+<<<-]>>>[-<<<+>>>]<<<<
+        ; Move tape[3] to tape[2] (add): tape[2]=a+b
+        >>>[-<+>]<<<
+        ; Shift: a=b, b=a+b
+        [-]>[-<+>]>[-<+>]<<
+
+        >>>>>>                  ; tape[6]
+        -
+    ]
+
+    <-                          ; tape[5]--
+]
+
+; Print result
+<<<<<.
+[-]++++++++++.[-]

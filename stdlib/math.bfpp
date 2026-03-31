@@ -1,0 +1,115 @@
+; BF++ Standard Library: math.bfpp
+; Arithmetic operations using loop-based algorithms.
+; Convention: args at tape[ptr] and tape[ptr+1]. Result in tape[ptr].
+
+; !#m* — unsigned multiply: tape[ptr] = tape[ptr] * tape[ptr+1]
+; Workspace: ptr+2, ptr+3 must be zero.
+!#m*{
+    >>[-]<<                 ; clear accumulator (ptr+2)
+    >                       ; go to multiplier (ptr+1)
+    [                       ; while multiplier > 0
+        -                   ; dec multiplier
+        <                   ; go to multiplicand (ptr)
+        [>>+>+<<<-]         ; move multiplicand to ptr+2 and ptr+3
+        >>>[-<<<+>>>]<<<    ; restore multiplicand from ptr+3
+        >                   ; back to multiplier (ptr+1)
+    ]
+    <[-]                    ; clear ptr (old multiplicand)
+    >>[-<<+>>]<<            ; move accumulator (ptr+2) to ptr
+    >[-]<                   ; clear ptr+1
+    ^
+}
+
+; !#m/ — unsigned divide: tape[ptr] = tape[ptr] / tape[ptr+1]
+; Uses esolangs divmod algorithm. Workspace: ptr+2..ptr+4 must be zero.
+; Error 6 if divisor == 0.
+!#m/{
+    >>[-]>[-]>[-]<<<<       ; clear ptr+2, ptr+3, ptr+4
+    >                       ; go to divisor (ptr+1)
+    [                       ; if divisor != 0
+        <                   ; back to dividend (ptr)
+        ; Divmod: input [n d 0 0 0], output [0 d-r r q 0]
+        [->-[>+>>]>[+[-<+>]>+>>]<<<<<]
+        ; Move quotient (ptr+3) to ptr
+        >>>[-<<<+>>>]<<<    ; move ptr+3 to ptr+0
+        >[-]>[-]<<          ; clear ptr+1, ptr+2
+        ^
+    ]
+    ; Divisor was 0: set error 6
+    <[-]++++++e[-]          ; set err=6, clear cell
+    ^
+}
+
+; !#m% — unsigned modulo: tape[ptr] = tape[ptr] % tape[ptr+1]
+; Uses esolangs divmod algorithm. Workspace: ptr+2..ptr+4 must be zero.
+; Error 6 if divisor == 0.
+!#m%{
+    >>[-]>[-]>[-]<<<<       ; clear ptr+2, ptr+3, ptr+4
+    >                       ; go to divisor (ptr+1)
+    [                       ; if divisor != 0
+        <                   ; back to dividend (ptr)
+        ; Divmod: input [n d 0 0 0], output [0 d-r r q 0]
+        [->-[>+>>]>[+[-<+>]>+>>]<<<<<]
+        ; Move remainder (ptr+2) to ptr
+        >>[-<<+>>]<<        ; move ptr+2 to ptr+0
+        >[-]>>[-]<<<        ; clear ptr+1, ptr+3
+        ^
+    ]
+    ; Divisor was 0: set error 6
+    <[-]++++++e[-]          ; set err=6, clear cell
+    ^
+}
+
+; !#mcaret — unsigned power: tape[ptr] = tape[ptr] ^ tape[ptr+1]
+; Uses repeated multiply. Workspace: ptr+2..ptr+8 must be zero.
+!#mcaret{
+    >                       ; go to ptr+1 (exp)
+    [                       ; if exp > 0
+        <                   ; back to ptr+0 (base)
+        ; Copy base to ptr+2 (preserved across iterations)
+        [>>+>+<<<-]         ; copy ptr+0 to ptr+2 and ptr+3
+        >>>[-<<<+>>>]<<<    ; restore ptr+0 from ptr+3
+        ; Move exp to ptr+4
+        >[->>>+<<<]         ; move ptr+1 to ptr+4
+        ; Set result (ptr+3) = 1
+        >>+                 ; ptr+3 = 1
+        ; Go to exp counter
+        >                   ; ptr+4
+        [                   ; while exp > 0
+            -               ; dec exp
+            ; Copy base (ptr+2) to ptr+6 using ptr+7 as temp
+            <<              ; ptr+2
+            [>>>>+>+<<<<<-] ; copy ptr+2 to ptr+6 and ptr+7
+            >>>>>[-<<<<<+>>>>>]<<<<< ; restore ptr+2 from ptr+7
+            ; Move result (ptr+3) to ptr+5
+            >               ; ptr+3
+            [->>+<<]        ; move ptr+3 to ptr+5
+            ; Inline multiply: ptr+5 * ptr+6 → ptr+5
+            >>              ; ptr+5
+            >>[-]<<         ; clear ptr+7
+            >               ; ptr+6 (multiplier)
+            [               ; while multiplier > 0
+                -
+                <           ; ptr+5 (multiplicand)
+                [>>+>+<<<-] ; copy to ptr+7 and ptr+8
+                >>>[-<<<+>>>]<<< ; restore from ptr+8
+                >           ; back to ptr+6
+            ]
+            <[-]            ; clear ptr+5
+            >>[-<<+>>]<<    ; move ptr+7 to ptr+5
+            >[-]<           ; clear ptr+6
+            ; Move product (ptr+5) to ptr+3
+            [-<<+>>]        ; move ptr+5 to ptr+3
+            ; Back to exp counter
+            <               ; ptr+4
+        ]
+        ; Move result (ptr+3) to ptr+0
+        <<<<[-]             ; go to ptr+0, clear
+        >>>[-<<<+>>>]<<<    ; move ptr+3 to ptr+0
+        >>[-]<<             ; clear ptr+2
+        ^
+    ]
+    ; exp was 0: return 1
+    <[-]+
+    ^
+}

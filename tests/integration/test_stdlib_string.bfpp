@@ -1,0 +1,7 @@
+; Test: stdlib string module loads without errors
+; Just includes string.bfpp and prints success
+!include "string.bfpp"
+
+"string ok\n\0"
+<<<<<<<<<<<
+[.>]

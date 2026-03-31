@@ -1,0 +1,25 @@
+; BF++ Error handling demo — R{...}K{...} and ? propagation
+
+; Subroutine that sets an error
+!#fail{
+  ++++++ e   ; set error register to 6 (ERR_INVALID_ARG)
+  ^
+}
+
+; Subroutine that chains and propagates
+!#chain{
+  !#fail ?   ; call fail, propagate error
+  ; unreachable if error
+  ^
+}
+
+; Top-level: catch the error
+R{
+  !#chain
+}K{
+  E          ; load error code into cell (should be 6)
+  ; Add 48 to convert to ASCII digit: 6 + 48 = 54 = '6'
+  ++++++++++++++++++++++++++++++++++++++++++++++++ .
+  ; Print newline
+  [-] ++++++++++ .
+}

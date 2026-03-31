@@ -1,0 +1,40 @@
+; BF++ Framebuffer Demo
+; Compile: bfpp framebuffer_demo.bfpp --framebuffer 320x200 -o fbdemo
+; Draws a red-green gradient and flushes to SDL window.
+;
+; Framebuffer region: tape[0xA000+], RGB888 format (3 bytes per pixel)
+; stride = width * 3 = 960 bytes per row
+
+; Set ptr to framebuffer start (0xA000 = 40960)
+; Use string literal hack: write 0xA000 as 16-bit value at ptr, then @ to jump
+%%                          ; cycle to 32-bit cell width
+"\x00\xa0\x00\x00"         ; write 0x0000A000 in little-endian at ptr
+<<<<                        ; back to start of value
+@                           ; ptr = 40960 (0xA000)
+
+; Fill pixels: gradient pattern
+; Row loop: 200 rows
+; For each pixel in a row (320 pixels = 960 bytes):
+;   R = (x % 256), G = (y % 256), B = 64
+
+; Simple fill: just write incrementing R values across the buffer
+; 320 * 200 = 64000 pixels = 192000 bytes (exceeds default tape but works for demo)
+; For demo: just fill first 100 pixels with gradient
+
+; Write 100 pixels of red gradient
+; Each pixel: R=i, G=0, B=128
+"
+\x00\x00\x80\x01\x00\x80\x02\x00\x80\x03\x00\x80\x04\x00\x80
+\x05\x00\x80\x06\x00\x80\x07\x00\x80\x08\x00\x80\x09\x00\x80
+\x0a\x00\x80\x0b\x00\x80\x0c\x00\x80\x0d\x00\x80\x0e\x00\x80
+\x0f\x00\x80\x10\x00\x80\x11\x00\x80\x12\x00\x80\x13\x00\x80
+\x14\x00\x80\x15\x00\x80\x16\x00\x80\x17\x00\x80\x18\x00\x80
+\x19\x00\x80\x1a\x00\x80\x1b\x00\x80\x1c\x00\x80\x1d\x00\x80
+\x1e\x00\x80\x1f\x00\x80\x20\x00\x80\x21\x00\x80\x22\x00\x80
+"
+
+; Flush framebuffer to display
+F
+
+; Wait a moment (read from stdin to pause)
+,

@@ -1,0 +1,54 @@
+; Hello Loop — I/O throughput test.
+; Prints "Hello, World!" 1000 times using nested loops.
+; Tests subroutine call overhead + I/O throughput.
+;
+; Layout: tape[0..2] = loop counters, tape[3] = scratch (clobbered by hello)
+;         tape[100..114] = "Hello, World!\n\0"
+
+; Subroutine: print string at tape[100..114]
+; Uses ptr+1 as scratch for @ jump, preserving the calling cell.
+; Returns with ptr at tape[0].
+!#hello{
+    >[-]                    ; scratch cell (ptr+1), clear
+    ++++++++++
+    ++++++++++
+    ++++++++++
+    ++++++++++
+    ++++++++++
+    ++++++++++
+    ++++++++++
+    ++++++++++
+    ++++++++++
+    ++++++++++              ; scratch = 100
+    @                       ; ptr = 100
+    [.>]                    ; print until null
+    [-]@                    ; clear, jump to tape[0]
+    ^
+}
+
+; Write string at tape[100] using 10*10 multiply
+[-]>[-]<                    ; clear tape[0] and tape[1]
+++++++++++[>++++++++++<-]>  ; tape[1] = 100, ptr at tape[1]
+@                           ; ptr = 100
+"Hello, World!\n\0"
+; Navigate back
+[-]@                        ; clear current cell, jump to tape[0]
+>[-]<                       ; clear tape[1] (still 100 from multiply)
+
+; Loop 1000 times: 10 * 10 * 10
+++++++++++                  ; tape[0] = 10
+[
+    >++++++++++             ; tape[1] = 10
+    [
+        >++++++++++         ; tape[2] = 10
+        [
+            -               ; dec tape[2]
+            !#hello         ; print hello — ptr ends at tape[0]
+            >>              ; back to tape[2]
+        ]
+        >[-]<               ; clear tape[3] (scratch), back to tape[2]
+        <-                  ; back to tape[1], dec
+    ]
+    >[-]<                   ; clear tape[2], back to tape[1]
+    <-                      ; back to tape[0], dec
+]

@@ -1,0 +1,16 @@
+; Test: T operator pushes tape address onto stack
+; Verify: push address, pop it, ensure we got a non-zero value
+; Output: "OK" if T operator works (address is non-zero)
+
+; Put a known value at tape[0]
+++++++++++                  ; tape[0] = 10
+T                           ; push &tape[ptr] (address of tape[0]) onto stack
+~                           ; pop address into tape[0]
+
+; If tape[0] is non-zero (which it should be since addresses are non-zero), print OK
+[                           ; if non-zero
+    [-]                     ; clear cell
+    "OK\n\0"
+    <<<<
+    [.>]
+]

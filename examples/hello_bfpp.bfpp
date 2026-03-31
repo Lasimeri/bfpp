@@ -1,0 +1,10 @@
+; BF++ Hello World using string literals and subroutines
+
+!#pr{
+  [.>]    ; print bytes until null
+  ^
+}
+
+"Hello, World!\n\0"
+<<<<<<<<<<<<<<<
+!#pr

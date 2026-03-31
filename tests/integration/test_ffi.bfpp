@@ -1,0 +1,20 @@
+; Test: FFI call to libc abs()
+; Call abs(42) and verify we get 42 back (prints '*' = ASCII 42)
+; FFI layout: tape[ptr] = result, tape[ptr+8..] = args
+; bfpp_get reads any cell width as uint64_t, so 8-bit cells work fine for small values.
+
+; Set ptr+8 = 42 (first argument to abs)
+>>>>>>>>                    ; go to ptr+8
+[-]                         ; clear
+++++++[>+++++++<-]          ; compute 42 at ptr+9
+>[-<+>]<                    ; move to ptr+8
+<<<<<<<<                    ; back to ptr
+
+; Call FFI: abs(42) → 42
+\ffi "libc.so.6" "abs"
+
+; tape[ptr] should be 42 = '*'
+.
+
+; Print newline
+[-]++++++++++.

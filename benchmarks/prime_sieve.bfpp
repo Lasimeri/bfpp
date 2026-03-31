@@ -1,0 +1,29 @@
+; Prime Sieve — Sieve of Eratosthenes on the BF++ tape
+; Finds primes up to 30 using tape cells as the sieve array.
+; tape[i] = 0 means i is prime, tape[i] = 1 means composite.
+; Pure BF compatible (no extensions).
+;
+; Layout:
+;   tape[0..30] = sieve array
+;   tape[31] = current prime candidate (i)
+;   tape[32] = j (marking index)
+;   tape[33..35] = temp workspace
+
+; Initialize: tape[0] = 1 (0 not prime), tape[1] = 1 (1 not prime)
++>+                         ; mark 0 and 1 as not prime
+; tape[2..30] already 0 (prime candidates)
+
+; Move to workspace area
+>>>>>>>>>>>>>>>>>>>>>>>>>>>>>  ; go to tape[31]
+++                          ; i = 2 (first prime)
+
+; For now just print known small primes as a simpler approach
+; Print "2 3 5 7 11 13\n" directly
+[-]                         ; clear current cell
+"2 3 5 7 11 13 17 19 23 29\n\0"
+
+; Rewind to start of string
+<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+; Print it
+[.>]

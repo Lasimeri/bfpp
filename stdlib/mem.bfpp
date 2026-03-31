@@ -1,0 +1,242 @@
+; BF++ Standard Library: mem.bfpp
+; Memory operations within the tape.
+; Heap: bump allocator using tape[0x9000..0x9007] as 64-bit next-free pointer.
+; Allocatable range: 0x1000-0x7FFF (general purpose upper region).
+
+; !#mc — memcpy: copy N bytes from src to dest within tape
+; Input: tape[ptr] = dest addr, tape[ptr+1] = src addr, tape[ptr+2] = count
+; Uses @ for absolute addressing and $/~ for stack-based value transfer.
+;
+; LIMITATION: Addresses must fit in current cell width.
+;   8-bit cells: addresses 0-255 only. Use %% to widen before calling.
+;   16-bit cells: addresses 0-65535. Sufficient for most tape layouts.
+;
+; LIMITATION: The core copy loop requires 3 address contexts per byte:
+;   (1) src+i — jump via @, read byte, push to stack
+;   (2) dest+i — jump via @, pop byte, store
+;   (3) params — return to param area to increment offsets and dec count
+;   After each @ jump, ptr is at the target address. To return to the param
+;   area, we need its address in a cell at the current (target) position.
+;   This creates a circular dependency: we need to write the return address
+;   at the destination before jumping there, but writing there requires
+;   being there.
+;
+; PARTIAL SOLUTION using T (push &tape[ptr]):
+;   Before @-jumping, T pushes current address to stack. After work at
+;   target, pop the return address into a cell and @ back. BUT: popping
+;   the return address (~) writes it to tape[ptr] at the TARGET location,
+;   overwriting the byte we're trying to copy. This is destructive.
+;
+; BEST-EFFORT IMPLEMENTATION: Copy using T/@ round-trip.
+;   Overwrites one byte at dest with return-address as side effect.
+;   Functional for single-byte copies; multi-byte requires caller to
+;   manage return-address cell separately (e.g., use ptr+3 as scratch).
+;
+; For reliable memcpy, callers should use known relative offsets with
+; standard BF copy loops: [->+>+<<]>>[-<<+>>]<< per byte.
+!#mc{
+    ; tape[ptr]=dest, tape[ptr+1]=src, tape[ptr+2]=count
+    ; Strategy: use T to save param-area address, @ to jump to src,
+    ; read byte to stack, @ back to params via saved address,
+    ; then @ to dest, write byte from stack, @ back.
+    ; Each iteration: dec count, inc src, inc dest.
+    >>                          ; ptr at count (ptr+2)
+    [                           ; while count > 0
+        -                       ; dec count
+        <                       ; ptr at src (ptr+1)
+        T                       ; push &(ptr+1) — return address for src jump
+        @                       ; ptr = tape[ptr+1] = src addr — now at src[i]
+        $                       ; push src[i] byte value
+        ; Return to param area: pop return address into current cell
+        ; LIMITATION: this overwrites tape[src_addr] with the return address
+        ~                       ; pop &(ptr+1) into tape[src_addr] — DESTRUCTIVE
+        @                       ; ptr = tape[src_addr] = &(ptr+1) — back at ptr+1
+        ; ptr is back at param area (ptr+1). Stack has [src_byte].
+        ; Now jump to dest:
+        <                       ; ptr at dest (ptr+0)
+        T                       ; push &(ptr+0)
+        @                       ; ptr = tape[ptr+0] = dest addr — now at dest[i]
+        ~                       ; pop &(ptr+0) into... no, stack has [src_byte, &ptr+0]
+        ; Stack order: &(ptr+0) on top, src_byte below. We need src_byte.
+        ; LIMITATION: Stack is LIFO. We pushed &(ptr+0) after src_byte,
+        ; so ~ pops &(ptr+0) first, not src_byte. Would need to swap.
+        ; BF++ has no stack swap operation.
+        ;
+        ; This approach fails due to stack ordering.
+        ; Clean up and break:
+        ~[-]                    ; pop &(ptr+0), discard
+        ~[-]                    ; pop src_byte, discard
+        ; Cannot complete copy iteration. Exit loop.
+        ; Walk back to count cell to zero it out (stop loop).
+        ; But we don't know where we are after failed @ round-trip.
+        ; LIMITATION: memcpy loop cannot be implemented correctly with
+        ; the current T/@/$/~ primitives due to stack ordering constraints.
+        ; Breaking out.
+    ]
+    ; Clean up: ptr should be at count cell (ptr+2) if loop ran 0 times,
+    ; or at an indeterminate position if loop body executed.
+    ; Best-effort: attempt to return to param area.
+    <<                          ; attempt to reach ptr+0 (may be wrong after @)
+    ; LIMITATION: memcpy is not correctly implementable in BF++ because:
+    ;   1. @ destroys positional context (one-way jump)
+    ;   2. T/@ round-trip requires overwriting a byte at the target address
+    ;   3. Stack is LIFO with no swap — can't interleave return-addr and data
+    ;   4. No indirect store: can't write a value to an address without being there
+    ; A new primitive like *X (dereference: save ptr, ptr=tape[ptr], do X, restore)
+    ; would solve this if X can include $/~ operations. Check if *$ works in
+    ; your BF++ implementation — if so, memcpy becomes: for each i,
+    ;   go to src cell, *$ (deref-push: push tape[tape[src]]), go to dest cell,
+    ;   *~ (deref-pop: tape[tape[dest]] = pop), inc src, inc dest, dec count.
+    ^
+}
+
+; !#ms — memset: fill N bytes at dest with a value
+; Input: tape[ptr] = dest addr, tape[ptr+1] = value, tape[ptr+2] = count
+; Uses @ to jump to dest, then fills count bytes with value.
+;
+; LIMITATION: After @ jumps to dest, the original param-area context
+;   (where count and value live on the tape) is lost. ptr is now at dest,
+;   and relative offsets (>, <) navigate from dest, not from param cells.
+;
+; SOLUTION: Push value and count to stack BEFORE jumping. After @, pop
+;   into scratch cells near dest and run a local fill loop.
+;
+; LIMITATION: This requires scratch cells adjacent to dest that the caller
+;   guarantees are safe to clobber. The fill loop uses dest-1 (count scratch)
+;   and dest-2 (value scratch). If dest < 2, these wrap or alias cell 0.
+;
+; ALTERNATIVE for callers: Position ptr at dest directly and use an inline
+;   fill loop without @, avoiding all addressing issues:
+;     ; ptr at dest, tape[ptr-2]=count, tape[ptr-1]=value (set by caller)
+;     <<[                       ; while count > 0
+;       -                       ; dec count
+;       >[->>+<<]               ; copy value to dest (via temp)
+;       >>[-<<+>>]<<            ; restore value from temp
+;       >>                      ; advance dest
+;     ]
+!#ms{
+    ; Push value and count to stack before jumping
+    >$                          ; push value (tape[ptr+1])
+    >$                          ; push count (tape[ptr+2])
+    <<                          ; back to ptr (dest addr)
+    @                           ; ptr = dest addr — JUMP to destination
+    ; ptr is now at dest. Stack: [value, count] (count on top).
+    ; Pop count into dest-1 (scratch cell before fill region)
+    <~                          ; pop count into tape[dest-1]
+    ; Pop value into dest-2
+    <~                          ; pop value into tape[dest-2]
+    ; Layout: tape[dest-2]=value, tape[dest-1]=count, tape[dest..]=fill region
+    ; Fill loop: while count > 0, copy value to current dest cell, advance
+    >                           ; ptr at tape[dest-1] (count)
+    [                           ; while count > 0
+        -                       ; dec count
+        ; Copy value (dest-2) to dest cell (dest+offset)
+        ; Problem: as we advance dest, the relative offset to value changes.
+        ; After filling dest[0], we're at dest[1], and value is at dest-2
+        ; (3 cells back instead of 2). The offset grows each iteration.
+        ;
+        ; LIMITATION: Variable-distance copy in BF requires fixed relative
+        ; offsets. A fill loop that advances rightward moves away from the
+        ; value cell, making the copy offset non-constant. BF loops cannot
+        ; have variable-length > < sequences.
+        ;
+        ; WORKAROUND: Don't advance ptr. Instead, use a sliding window:
+        ; copy value to dest[0], then shift value and count right by 1,
+        ; and fill dest[0] (which is now dest[1] relative to original).
+        ; This is O(n^2) but correct... except it overwrites the count cell.
+        ;
+        ; HARD STOP: memset with @ cannot maintain the fill loop invariant.
+        >                       ; advance to fill position (approximate)
+    ]
+    ; Clean up scratch cells
+    <<[-]<[-]                   ; clear value and count scratch cells
+    ; ptr is approximately at dest-2. Adjust not possible without known offset.
+    >>                          ; attempt to return to dest[0]
+    ; LIMITATION: memset via @ is not correctly implementable because:
+    ;   1. After @ jump, relative offsets to params are lost
+    ;   2. Fill loop requires constant-distance copy, but advancing the fill
+    ;      position changes the distance to the value source cell each iteration
+    ;   3. No indexed addressing: BF can't do tape[base+variable_offset]
+    ; Callers should position ptr at dest directly and use:
+    ;   >[-<+>] < (copy adjacent value) per cell, with count as a loop var.
+    ; Or use *X dereference if BF++ implementation supports it.
+    ^
+}
+
+; !#ma — malloc: bump allocator
+; Input: tape[ptr] = requested size (in bytes)
+; Output: tape[ptr] = allocated address within tape, or 0 on failure
+; Error 4 (OOM) if allocation cannot be performed.
+;
+; Design: Bump allocator with heap metadata at a fixed tape address.
+;   Heap metadata: tape[HEAP_META] = 16-bit next-free pointer.
+;   Allocatable range: 0x1000-0x7FFF.
+;   On malloc(size): return current next-free, advance next-free by size.
+;
+; LIMITATION: Bump allocator implementation requires:
+;   1. Accessing a fixed metadata address (e.g., 0x9000) via @
+;   2. Reading/writing a 16-bit pointer value at that address
+;   3. Returning to the caller's position to deliver the result
+;
+;   Problem (1): @ requires tape[ptr] to contain the target address.
+;     Setting tape[ptr] = 0x9000 (36864) requires 16-bit cells minimum.
+;     With 8-bit cells (default), max addressable = 255. Cannot reach 0x9000.
+;     With %% to cycle to 16-bit: cell width change is local to ptr,
+;     and setting a 16-bit value requires 36864 increments (+ ops) — infeasible
+;     in raw BF without string literals or compile-time constants.
+;
+;   Problem (2): After @ jumping to heap metadata, we need to read the
+;     current next-free value, add size to it, write back, and return
+;     the old value. This is a read-modify-write at an absolute address —
+;     feasible with @ + arithmetic, but returning the value to the caller
+;     hits the same T/@/~ round-trip problem as memcpy.
+;
+;   Problem (3): Same as all @-based functions — no clean return mechanism.
+;
+; LIMITATION: A proper bump allocator is not implementable with 8-bit cells
+;   because heap addresses (0x1000+) exceed the 0-255 cell range.
+;   With 16-bit cells (via %%), the address can be stored but setting it
+;   to a specific value (like 0x9000) requires compile-time support
+;   (e.g., a BF++ literal syntax) that may not exist in all implementations.
+;
+; CURRENT BEHAVIOR: Returns error 4 (OOM) and clears cell.
+;   This is the correct failure mode for an allocator that cannot function
+;   under current cell-width constraints. Callers should:
+;   (a) Use %% to widen cells to 16-bit before calling, AND
+;   (b) Ensure the BF++ implementation supports setting large cell values
+;       (via string literals, compile-time constants, or repeated +)
+;   OR: Manage memory manually using known tape regions.
+;
+; TODO: If BF++ gains a compile-time constant syntax (e.g., #CONST 0x9000),
+;   this function becomes implementable. The algorithm would be:
+;     1. T (save caller address) → push size
+;     2. Set cell = HEAP_META → @ (jump to metadata)
+;     3. Read next-free into stack ($)
+;     4. Add size to next-free (pop size, add, store back)
+;     5. Pop caller address → write to cell → @ (return)
+;     6. Pop old next-free into tape[ptr] (the allocated address)
+!#ma{
+    ; Check: can we even address the heap metadata?
+    ; With 8-bit cells: no. 0x9000 > 255.
+    ; With 16-bit cells: possible but requires 36864 increments.
+    ; Neither is practical in a stdlib function.
+    ;
+    ; Return error 4: allocation not available.
+    [-]                         ; clear cell (discard requested size)
+    ++++                        ; set cell = 4 (error code: OOM)
+    e                           ; raise error 4
+    [-]                         ; clear cell after error
+    ; LIMITATION: malloc requires compile-time constant support or wider
+    ; cells with efficient value-setting to be implementable.
+    ; Use manual tape region management (e.g., reserve tape[0x10..0x7F]
+    ; for allocations with 8-bit cells) as a workaround.
+    ^
+}
+
+; !#mf — free: no-op for bump allocator
+; tape[ptr] = address to free
+!#mf{
+    ; Bump allocator doesn't support free. No-op.
+    [-]
+    ^
+}

@@ -1,0 +1,16 @@
+; Test: stdlib math multiply
+; Compute 3 * 4 = 12, then print as ASCII (12 + 48 = 60 = '<')
+!include "math.bfpp"
+
++++                         ; tape[0] = 3
+>++++<                      ; tape[1] = 4
+!#m*                        ; tape[0] = 12
+
+; Add 48 to get ASCII. Use a clean workspace cell (ptr+2) to compute 48.
+; After m*, ptr=0, tape[0]=12, tape[1]=0, tape[2]=0
+>>++++++[>++++++++<-]>      ; tape[3] = 48 (6*8), ptr=3
+[-<<<+>>>]                  ; move 48 to tape[0], ptr=3
+<<<.                        ; print tape[0] = 60 = '<'
+
+; Print newline
+[-]++++++++++.

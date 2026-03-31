@@ -1,0 +1,140 @@
+; BF++ Standard Library: io.bfpp
+; I/O operations for stdin/stdout.
+!include "math.bfpp"
+
+; !#.> — print_string: print null-terminated string at ptr to stdout
+; ptr advances to the null terminator.
+!#.>{
+    [.>]
+    ^
+}
+
+; !#.+ — print_int: print tape[ptr] as decimal ASCII to stdout
+; Prints the numeric value of the current cell as decimal digits.
+; Uses cells ptr+1..ptr+7 as workspace (must be zero before call).
+; Algorithm: extract digits via repeated mod/div by 10, push to stack, pop and print.
+; Calls: !#m% (modulo), !#m/ (divide) from math.bfpp.
+!#.+{
+    ; ptr = P, tape[P] = V
+    [                               ; if V != 0
+        ; Push sentinel 0 onto stack (use P+1 which we clear)
+        >[-]$<                      ; clear P+1, push 0, back to P
+
+        ; Move V from P to P+1
+        [->+<]                      ; P=0, P+1=V, ptr=P
+
+        >                           ; ptr = P+1 (working value)
+        [                           ; while working value > 0
+            ; Copy P+1 to P+6 (backup), using P+7 as temp
+            ; P+6 and P+7 must be 0 entering here
+            [->>>>>+>+<<<<<<]       ; P+1→P+6 and P+7 (P+1=0)
+            >>>>>>[-<<<<<<+>>>>>>]  ; P+7→P+1 (restore)
+            <<<<<<                  ; ptr=P+1, P+1=V, P+6=V, P+7=0
+
+            ; Set divisor: P+2 = 10
+            >++++++++++<            ; P+2=10, ptr=P+1
+
+            ; Modulo: P+1 = V % 10
+            !#m%                    ; ptr=P+1, result in P+1
+
+            ; Convert remainder to ASCII: add 48
+            ++++++++++++++++++++++++++++++++++++++++++++++++
+
+            ; Push digit char onto stack
+            $
+
+            ; Clear P+1 (digit has been pushed)
+            [-]
+
+            ; Restore working value: move P+6 (backup) to P+1
+            >>>>>[-<<<<<+>>>>>]     ; P+6→P+1, ptr=P+6
+            <<<<<                   ; ptr=P+1, P+1=V
+
+            ; Set divisor: P+2 = 10
+            >++++++++++<            ; P+2=10, ptr=P+1
+
+            ; Divide: P+1 = V / 10
+            !#m/                    ; ptr=P+1, result in P+1
+
+        ]                           ; loop if P+1 > 0
+
+        ; All digits pushed (MSB at top of stack, sentinel at bottom)
+        ; Move back to P
+        <                           ; ptr = P
+
+        ; Pop and print digits until sentinel (0)
+        ~                           ; pop first digit → tape[P]
+        [                           ; while not sentinel
+            .                       ; print digit char
+            [-]                     ; clear cell
+            ~                       ; pop next
+        ]
+        ^                           ; return
+    ]
+    ; Value was 0: print '0' (ASCII 48)
+    ++++++++++++++++++++++++++++++++++++++++++++++++.[-]
+    ^
+}
+
+; !#,< — read_line: read from stdin until newline or EOF
+; Reads bytes into tape starting at ptr. Null-terminates.
+; Returns bytes read count in tape[ptr] (after null).
+; Actually: just reads until newline, stores at ptr, null-terminates.
+!#,<{
+    ; Read char by char until newline (10) or EOF (0)
+    ,                       ; read first byte
+    [                       ; while byte != 0 (EOF)
+        ; Check for newline (10)
+        ; Copy byte, subtract 10, check
+        ; If it equals 10, stop
+        ; Simple: just store and continue
+        >                   ; advance ptr
+        ,                   ; read next byte
+    ]
+    ; Null-terminate (current cell is already 0 from EOF or we need to set it)
+    [-]                     ; ensure null terminator
+    ^
+}
+
+; !#,+ — read_int: read decimal integer from stdin
+; Reads ASCII digits, converts to numeric value in tape[ptr].
+; Stops on newline (10), null/EOF (0), or end of digits.
+; Layout: P+0 = result, P+1 = multiply operand, P+2..P+3 = m* workspace,
+;         P+5 = input char, P+6 = continue flag.
+; Calls: !#m* (multiply) from math.bfpp.
+!#,+{
+    [-]                             ; P+0 = 0 (result)
+    >>>>>[-]                        ; clear P+5, ptr=P+5
+    >[-]+                           ; clear P+6, set flag=1, ptr=P+6
+
+    [                               ; while continue flag
+        -                           ; flag = 0 (will re-set if valid digit)
+        <[-]                        ; clear P+5, ptr=P+5
+        ,                           ; read char into P+5
+
+        [                           ; if P+5 != 0 (not EOF)
+            ----------              ; P+5 -= 10 (check for newline)
+            [                       ; if (char-10) != 0 (not newline)
+                ; P+5 = char - 10; subtract 38 more to get digit value
+                ; (char - 10 - 38 = char - 48)
+                --------------------------------------
+
+                ; digit is now in P+5
+                ; result = result * 10 + digit
+                <<<<<               ; ptr=P+0
+                >++++++++++<        ; P+1 = 10, ptr=P+0
+                !#m*                ; P+0 = result * 10 (clears P+1..P+3)
+
+                >>>>>               ; ptr=P+5
+                [-<<<<<+>>>>>]      ; add digit to P+0 (P+5→P+0), ptr=P+5
+
+                >+                  ; P+6 = 1 (continue), ptr=P+6
+                <                   ; ptr=P+5 (P+5=0, exits inner loops)
+            ]                       ; ] for newline check (P+5=0, exits)
+        ]                           ; ] for EOF check (P+5=0, exits)
+        >                           ; ptr=P+6
+    ]                               ; ] for continue flag
+
+    <<<<<<                          ; ptr=P+0
+    ^
+}

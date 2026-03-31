@@ -1,0 +1,8 @@
+[package]
+name = "bfpp"
+version = "0.1.0"
+edition = "2021"
+description = "BF++ transpiler — Brainfuck extended with system calls, subroutines, and error handling"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }

@@ -1,0 +1,7 @@
+; Test: !include directive
+; Includes io.bfpp and uses !#.> to print a string
+!include "io.bfpp"
+
+"Hello from include\n\0"
+<<<<<<<<<<<<<<<<<<<<
+!#.>

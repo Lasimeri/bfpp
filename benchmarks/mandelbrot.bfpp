@@ -1,0 +1,27 @@
+; Nested loop benchmark — pure BF, no extensions.
+; Tests loop overhead, cell arithmetic, multiply-move optimization.
+; 250 * 250 * 100 = 6.25M iterations.
+; Each iteration: multiply 8*8=64 then clear. Exercises O2 multiply-move.
+; tape[0..2] = counters, tape[3..4] = workspace
+
+; tape[0] = 250 (25 * 10)
++++++++++++++++++++++++++[>++++++++++<-]>[-<+>]<
+[
+    ; tape[1] = 250 (25 * 10)
+    >+++++++++++++++++++++++++[>++++++++++<-]>[-<+>]<
+    [
+        ; tape[2] = 100 (10 * 10)
+        >++++++++++[>++++++++++<-]>[-<+>]<
+        [
+            ; Work: set tape[3]=8, multiply tape[4]=64, clear both
+            >[-]++++++++[>++++++++<-]>[-]<<
+            -
+        ]
+        >[-]>[-]<<
+        <-
+    ]
+    >[-]<
+    <-
+]
+; Done — print newline
+++++++++++.[-]

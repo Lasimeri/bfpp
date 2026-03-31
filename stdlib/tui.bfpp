@@ -1,0 +1,310 @@
+; BF++ Standard Library: tui.bfpp
+; Terminal UI via ANSI escape sequences.
+; ESC = 27 = 0x1B
+
+; !#cm — cursor_move: move cursor to (row, col)
+; tape[ptr] = row (1-9), tape[ptr+1] = col (1-9)
+; Emits: ESC[{row};{col}H
+; Limitation: single-digit row/col only (1-9).
+; Uses ptr+2..ptr+3 as workspace.
+!#cm{
+    ; Save row and col to stack
+    $                       ; push row
+    >$<                     ; push col
+
+    ; Print ESC[
+    "\x1b["
+    <<.>.[-][-]             ; print ESC, print [, clear both
+
+    ; Pop col first (LIFO), save to ptr+1
+    ~                       ; pop col into ptr
+    >[-]<                   ; clear ptr+1
+    [->+<]                  ; move col to ptr+1
+    ; Pop row
+    ~                       ; pop row into ptr
+    ; Add 48 ('0') to convert to ASCII digit
+    ++++++++++++++++++++++++++++++++++++++++++++++++
+    .                       ; print row digit
+    [-]                     ; clear
+
+    ; Print semicolon (59)
+    +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    .[-]
+
+    ; Print col digit: move col from ptr+1 to ptr, add 48
+    >[-<+>]<                ; move col to ptr
+    ++++++++++++++++++++++++++++++++++++++++++++++++
+    .                       ; print col digit
+    [-]
+
+    ; Print 'H' (72)
+    ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    .[-]
+    ^
+}
+
+; !#cl — clear: clear screen
+; Emits: ESC[2J ESC[H
+!#cl{
+    "\x1b[2J\x1b[H\0"
+    <<<<<<<<<<
+    [.>]                    ; print until null
+    ^
+}
+
+; !#co — set_color: set terminal foreground/background color
+; tape[ptr] = color code (0-7 = foreground 30-37, 8-15 = background 40-47)
+; Emits: ESC[{30+code}m or ESC[{40+code-8}m
+; Uses ptr..ptr+2 as workspace. Uses bitwise AND (&) for bg detection.
+;
+; Algorithm:
+;   1. Compute ones_digit = (code & 7) + '0'   (via & with mask 7)
+;   2. Compute is_bg = code & 8                 (via & with mask 8)
+;   3. If is_bg: tens = '4', else tens = '3'
+;   4. Print ESC[ tens ones m
+!#co{
+    ; --- Step 1: Compute ones digit ---
+    ; ptr+0 = code
+    ; Copy code to ptr+1 for ones computation
+    $                       ; push code (save for step 2)
+    >[-]<                   ; clear ptr+1
+    [->+<]                  ; move code to ptr+1
+    ~                       ; pop code back to ptr+0 (restore)
+
+    ; ptr+0 = code, ptr+1 = code (copy)
+    ; Set ptr+2 = 7 (mask for low 3 bits)
+    >>[-]+++++++<<          ; ptr+2 = 7
+
+    ; ptr+1 &= ptr+2 → ones value (0-7)
+    >                       ; at ptr+1
+    &                       ; ptr+1 = code & 7
+    <                       ; back to ptr+0
+
+    ; Convert ptr+1 to ASCII: add 48
+    >++++++++++++++++++++++++++++++++++++++++++++++++<  ; ptr+1 += 48
+
+    ; --- Step 2: Compute is_bg flag ---
+    ; ptr+0 still has code. Need code & 8.
+    ; Copy code to ptr+2 for bg test
+    >>[-]<<                 ; clear ptr+2
+    [->+>+<<]              ; ptr+1 gets code added (BAD - ptr+1 has ones digit)
+    ; Oops, can't use standard copy since ptr+1 is occupied.
+    ; Use stack instead.
+    $                       ; push code
+    >>[-]<<                 ; clear ptr+2
+    ~                       ; pop code back to ptr+0
+    ; Copy to ptr+2 via ptr+3 as temp
+    >>>[-]<<<               ; clear ptr+3
+    [->>+>>>+<<<<<]         ; move code to ptr+2 and ptr+5... too far
+    ; This is getting complex. Use stack more.
+    $                       ; push code again
+    >>                      ; ptr+2
+    [-]                     ; clear
+    ~                       ; pop code into ptr+2
+    <<                      ; back to ptr+0
+    ~                       ; pop code into ptr+0 (restore)
+
+    ; ptr+0 = code, ptr+1 = ones ASCII, ptr+2 = code copy
+    ; Set ptr+3 = 8 for AND
+    >>>[-]++++++++<<<       ; ptr+3 = 8
+
+    ; ptr+2 &= ptr+3 → 0 if fg, 8 if bg
+    >>                      ; at ptr+2
+    &                       ; ptr+2 = code & 8
+    <<                      ; back to ptr+0
+
+    ; --- Step 3: Print ESC[ ---
+    ; Save ones digit and is_bg to stack
+    >$<                     ; push ones ASCII (ptr+1)
+    >>$<<                   ; push is_bg (ptr+2)
+    [-]                     ; clear ptr+0
+
+    ; Print ESC[
+    "\x1b["
+    <<.>.[-][-]             ; print ESC and [
+
+    ; --- Step 4: Print tens digit using if-else on is_bg ---
+    ; Pop is_bg
+    ~                       ; pop is_bg into ptr+0 (0 or 8)
+    >[-]+<                  ; ptr+1 = 1 (else flag)
+
+    ; True branch: is_bg != 0
+    [                       ; if ptr+0 != 0 (background)
+        [-]                 ; clear (run once)
+        >-<                 ; clear else flag
+
+        ; Print '4' (52)
+        ++++++++++++++++++++++++++++++++++++++++++++++++++++
+        .[-]
+    ]
+
+    ; False branch: is_bg == 0
+    >[                      ; if ptr+1 != 0 (else flag still set)
+        [-]                 ; clear (run once)
+
+        ; Print '3' (51)
+        <
+        +++++++++++++++++++++++++++++++++++++++++++++++++++
+        .[-]
+        >                   ; back to ptr+1
+    ]<                      ; back to ptr+0
+
+    ; --- Step 5: Print ones digit ---
+    ~                       ; pop ones ASCII into ptr+0
+    .[-]                    ; print ones digit
+
+    ; --- Step 6: Print 'm' (109) ---
+    +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    .[-]
+    ^
+}
+
+; !#db — draw_box: draw ASCII box at (row, col) with given width and height
+; tape[ptr]=row, [ptr+1]=col, [ptr+2]=width, [ptr+3]=height
+; Uses cursor_move and prints +, -, | characters.
+; Workspace: ptr+4 used as loop counter.
+;
+; Strategy: save width on stack before each print-loop that consumes a counter,
+; then pop it back afterward. Row/col/height live in tape cells and are
+; maintained across !#cm calls.
+!#db{
+    ; Save all params to stack: row, col, width, height
+    $>$>$>$                 ; push row, col, width, height
+    <<<                     ; back to ptr
+
+    ; === TOP BORDER ===
+    ; Move cursor to (row, col)
+    !#cm
+
+    ; Print '+' (43)
+    [-]
+    +++++++++++++++++++++++++++++++++++++++++++
+    .[-]
+
+    ; Restore params from stack
+    ; Stack order (top to bottom): height, width, col, row
+    >>>~<<<                 ; pop height → ptr+3
+    >>~<<                   ; pop width → ptr+2
+    >~<                     ; pop col → ptr+1
+    ~                       ; pop row → ptr+0
+
+    ; Print '-' (width-2) times using ptr+4 as counter
+    ; Copy width to ptr+4, then subtract 2
+    >>                      ; ptr+2 (width)
+    [->+>+<<]              ; move width to ptr+3... wait, ptr+3 has height
+    ; Can't use ptr+3. Use stack to copy width.
+    $                       ; push width (save original)
+    [->+>+<<]              ; ptr+3 += width, ptr+4 += width (WRONG: ptr+3 has height)
+    ; This overwrites height. Need different approach.
+    ; Pop width back:
+    >>[-<<+>>]<<            ; restore width from ptr+4... this is getting tangled.
+
+    ; Reset: simpler approach. Use stack exclusively for width preservation.
+    ; ptr+2 has width. Push it, use the cell as a counter, pop to restore.
+    ; Actually width is already pushed. Let me restart this section.
+    [-]                     ; clear ptr+2 (we still have width on stack from $)
+    ~                       ; pop width back to ptr+2
+    <<                      ; back to ptr+0
+
+    ; Use ptr+4 as the dash counter: copy width-2 there
+    >>                      ; ptr+2 (width)
+    $                       ; push width (preserve for later)
+    --                      ; width -= 2 (for two corners)
+    [->->+<<]              ; Hmm, this moves width-2 somewhere weird.
+    ; Simpler: just use ptr+2 as the counter directly, restore from stack after.
+    ; ptr+2 = width, already pushed to stack.
+    --                      ; width -= 2
+    [                       ; while counter > 0
+        -                   ; dec
+        <<[-]               ; go to ptr, clear
+        +++++++++++++++++++++++++++++++++++++++++++++
+        .[-]                ; print '-' (45)
+        >>                  ; back to counter (ptr+2)
+    ]
+    ; Restore width from stack
+    ~                       ; pop original width back to ptr+2
+    <<                      ; back to ptr
+
+    ; Print closing '+' (43)
+    [-]
+    +++++++++++++++++++++++++++++++++++++++++++
+    .[-]
+
+    ; === MIDDLE ROWS ===
+    ; ptr+0=row, ptr+1=col, ptr+2=width, ptr+3=height
+    >>>                     ; ptr+3 (height)
+    --                      ; height -= 2 (for top and bottom borders)
+    [                       ; for each middle row
+        -                   ; dec height counter
+
+        ; Save height to stack (loop counter preservation)
+        $
+
+        ; Increment row, move cursor
+        <<<                 ; ptr+0 (row)
+        +                   ; row++
+        !#cm                ; move cursor to (row, col)
+
+        ; Print '|' (124)
+        [-]
+        ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        .[-]
+
+        ; Print (width-2) spaces
+        ; Push width, use ptr+2 as counter, pop to restore
+        >>                  ; ptr+2 (width)
+        $                   ; push width
+        --                  ; width -= 2
+        [                   ; while counter > 0
+            -               ; dec
+            <<[-]           ; go to ptr, clear
+            ++++++++++++++++++++++++++++++++
+            .[-]            ; print ' ' (32)
+            >>              ; back to counter
+        ]
+        ~                   ; pop original width back to ptr+2
+        <<                  ; back to ptr
+
+        ; Print '|' (124)
+        [-]
+        ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        .[-]
+
+        ; Restore height from stack
+        >>>                 ; ptr+3
+        ~                   ; pop height counter back
+
+        ; Continue loop (ptr+3 is loop cell)
+    ]
+    <<<                     ; back to ptr
+
+    ; === BOTTOM BORDER ===
+    +                       ; row++
+    !#cm                    ; move cursor to (row, col)
+
+    ; Print '+' (43)
+    [-]
+    +++++++++++++++++++++++++++++++++++++++++++
+    .[-]
+
+    ; Print '-' (width-2) times
+    >>                      ; ptr+2 (width)
+    $                       ; push width
+    --                      ; width -= 2
+    [                       ; while counter > 0
+        -                   ; dec
+        <<[-]               ; go to ptr, clear
+        +++++++++++++++++++++++++++++++++++++++++++++
+        .[-]                ; print '-' (45)
+        >>                  ; back to counter
+    ]
+    ~                       ; pop original width back to ptr+2
+    <<                      ; back to ptr
+
+    ; Print closing '+' (43)
+    [-]
+    +++++++++++++++++++++++++++++++++++++++++++
+    .[-]
+
+    ^
+}
