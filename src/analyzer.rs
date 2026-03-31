@@ -49,9 +49,11 @@ pub fn analyze(nodes: &[AstNode]) -> Result<(), Vec<AnalysisError>> {
     // Pass 1: collect all subroutine definitions and call sites
     collect_subs(nodes, &mut defined_subs, &mut called_subs);
 
-    // Check for calls to undefined subroutines
+    // Check for calls to undefined subroutines.
+    // Names starting with "__" are compiler intrinsics — they're handled by
+    // codegen as inline C, not as BF++ subroutine definitions.
     for name in &called_subs {
-        if !defined_subs.contains(name) {
+        if !defined_subs.contains(name) && !name.starts_with("__") {
             errors.push(AnalysisError {
                 message: format!("Call to undefined subroutine '#{}'", name),
             });
