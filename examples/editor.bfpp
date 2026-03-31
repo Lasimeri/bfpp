@@ -1,5 +1,5 @@
 ; ═══════════════════════════════════════════════════════════════════
-; BF++ Text Editor — pure BF++ using __tui_* intrinsics
+; BF++ Text Editor — using QoL features (#{}, ?=, __tui_*, __memcpy)
 ; ═══════════════════════════════════════════════════════════════════
 ;
 ; Compile:
@@ -10,483 +10,177 @@
 ;
 ; Controls:
 ;   Arrow keys    — move cursor
-;   Printable     — insert character at cursor
-;   Backspace     — delete before cursor
-;   Enter         — insert newline
+;   Printable     — insert at cursor (TODO)
+;   Backspace     — delete before cursor (TODO)
+;   Enter         — insert newline (TODO)
 ;   Ctrl+Q        — quit
 ;
 ; ── Tape Layout ─────────────────────────────────────────────────
-;
-; Region A: Workspace (tape[0..49])
-;   P+0..P+6: __tui_put args (row, col, ch, fg, bg) + scratch
-;   P+7..P+15: loop counters, temp storage
-;
-; Region B: Editor State (tape[50..79])
-;   tape[50]: cursor_x (column, 0-based)
-;   tape[51]: cursor_y (row in buffer, 0-based)
-;   tape[52]: scroll_y (first visible line, 0-based)
-;   tape[53]: screen_cols
-;   tape[54]: screen_rows (usable text area = this - 2)
-;   tape[55]: dirty flag
-;   tape[56]: quit flag
-;   tape[57]: total_lines
-;   tape[58]: buf_used (bytes in text buffer)
-;
-; Region C: Text Buffer (tape[100..4095])
-;   Flat byte array. Lines separated by #10 (newline).
-;   Buffer starts with one newline (empty document).
-;   Max ~4000 bytes of text.
-;
-; Navigation helper: addresses 50, 100, etc. are reachable via
-;   #50 @ (jump to state region) or #100 @ (jump to buffer).
-;   Return via T (push address before jump) then ~ @ after.
+;   tape[0..49]:   workspace (intrinsic args, scratch)
+;   tape[50]:      cursor_x (0-based column)
+;   tape[51]:      cursor_y (0-based row in document)
+;   tape[52]:      scroll_y (first visible line)
+;   tape[53]:      screen_cols
+;   tape[54]:      screen_rows
+;   tape[55]:      dirty flag
+;   tape[56]:      quit flag
+;   tape[100..4095]: text buffer (newline-separated)
 
 !include "io.bfpp"
 
 ; ═══════════════════════════════════════════════════════════════════
-; Subroutines
+; SUBROUTINES
 ; ═══════════════════════════════════════════════════════════════════
 
-; ── render: draw the full screen ──────────────────────────────
-; Reads editor state from tape[50..58], text from tape[100+].
-; Uses __tui_begin, __tui_put, __tui_fill, __tui_end.
-; Workspace: tape[0..15].
+; ── render: draw the full screen ──────────────────────────────────
 !#render{
     !#__tui_begin
 
-    ; ── Header bar (row 0): blue background, white text ──
-    ; __tui_fill(row=0, col=0, w=cols, h=1, ch=' ', fg=15, bg=17)
-    #0 > #0 >                  ; row=0, col=0 at P+0, P+1
-    ; Get screen_cols from tape[53] via *$ (deref-push reads tape[tape[ptr]])
-    ; We need tape[53] value. Store 53 in P+2, use *$ to read it.
-    #53 *$ >                   ; push tape[53], advance to P+3
-    [-] ~                      ; clear P+3, pop cols into P+3...
-    ; Actually *$ pushes to stack. We need to pop it into P+2.
-    <<                          ; back to P+2
-    [-] ~                       ; P+2 = cols (popped from stack)
-    > #1                        ; P+3 = h = 1
-    > #32                       ; P+4 = ch = space
-    > #15                       ; P+5 = fg = 15 (bright white)
-    > #17                       ; P+6 = bg = 17 (dark blue)
-    <<<<<<                      ; back to P+0
+    ; ── Header bar: blue bg, white text ──
+    #{0, 0, 80, 1, 32, 15, 17}
     !#__tui_fill
 
-    ; Put "BF++ Editor" title chars at row 0
-    ; B(66) F(70) +(43) +(43) space(32) E(69) d(100) i(105) t(116) o(111) r(114)
-    #0 > #2 > #66 > #15 > #17 <<<<< !#__tui_put     ; 'B' at (0,2)
-    #0 > #3 > #70 > #15 > #17 <<<<< !#__tui_put     ; 'F'
-    #0 > #4 > #43 > #15 > #17 <<<<< !#__tui_put     ; '+'
-    #0 > #5 > #43 > #15 > #17 <<<<< !#__tui_put     ; '+'
-    #0 > #7 > #69 > #15 > #17 <<<<< !#__tui_put     ; 'E'
-    #0 > #8 > #100 > #15 > #17 <<<<< !#__tui_put    ; 'd'
-    #0 > #9 > #105 > #15 > #17 <<<<< !#__tui_put    ; 'i'
-    #0 > #10 > #116 > #15 > #17 <<<<< !#__tui_put   ; 't'
-    #0 > #11 > #111 > #15 > #17 <<<<< !#__tui_put   ; 'o'
-    #0 > #12 > #114 > #15 > #17 <<<<< !#__tui_put   ; 'r'
+    ; Title "BF++ Editor" at (0, 2)
+    #{0, 2, 66, 15, 17}  !#__tui_put   ; B
+    #{0, 3, 70, 15, 17}  !#__tui_put   ; F
+    #{0, 4, 43, 15, 17}  !#__tui_put   ; +
+    #{0, 5, 43, 15, 17}  !#__tui_put   ; +
+    #{0, 7, 69, 15, 17}  !#__tui_put   ; E
+    #{0, 8, 100, 15, 17} !#__tui_put   ; d
+    #{0, 9, 105, 15, 17} !#__tui_put   ; i
+    #{0, 10, 116, 15, 17} !#__tui_put  ; t
+    #{0, 11, 111, 15, 17} !#__tui_put  ; o
+    #{0, 12, 114, 15, 17} !#__tui_put  ; r
 
-    ; ── Status bar (bottom row): inverted colors ──
-    ; Get screen_rows-1 for the bottom row
-    ; Read tape[54] (screen_rows) via indirect
-    [-] > [-] > [-] > [-] > [-] > [-] > [-]
-    <<<<<<<                     ; clear P+0..P+6, back to P+0
-    #54 *$                      ; push tape[54] (screen_rows)
-    ~                           ; pop into P+0
-    -                           ; P+0 = screen_rows - 1 (bottom row)
-    > #0                        ; P+1 = col 0
-    > #53 *$ ~ [-] ~            ; P+2 = cols (read tape[53])
-    ; Hmm, that's getting tangled. Let me simplify.
-    ; Actually P+2 needs to be the width for __tui_fill.
-    ; Let me just hardcode reasonable values for now and optimize later.
+    ; ── Status bar (row 23): inverted colors ──
+    #{23, 0, 80, 1, 32, 0, 7}
+    !#__tui_fill
 
-    ; Hardcode: bottom row = 23 (for 24-row terminal), width = 80
-    [-] > [-] > [-] > [-] > [-] > [-] > [-]
-    <<<<<<<
-    #23 > #0 > #80 > #1 > #32 > #0 > #7
-    <<<<<<
-    !#__tui_fill                ; fill status bar (row 23, width 80, black on white)
+    ; "Ctrl+Q: Quit" at (23, 2)
+    #{23, 2, 67, 0, 7}   !#__tui_put   ; C
+    #{23, 3, 116, 0, 7}  !#__tui_put   ; t
+    #{23, 4, 114, 0, 7}  !#__tui_put   ; r
+    #{23, 5, 108, 0, 7}  !#__tui_put   ; l
+    #{23, 6, 43, 0, 7}   !#__tui_put   ; +
+    #{23, 7, 81, 0, 7}   !#__tui_put   ; Q
+    #{23, 9, 81, 0, 7}   !#__tui_put   ; Q
+    #{23, 10, 117, 0, 7} !#__tui_put   ; u
+    #{23, 11, 105, 0, 7} !#__tui_put   ; i
+    #{23, 12, 116, 0, 7} !#__tui_put   ; t
 
-    ; Status text: "Ctrl+Q: Quit"
-    #23 > #2 > #67 > #0 > #7 <<<<< !#__tui_put     ; 'C'
-    #23 > #3 > #116 > #0 > #7 <<<<< !#__tui_put    ; 't'
-    #23 > #4 > #114 > #0 > #7 <<<<< !#__tui_put    ; 'r'
-    #23 > #5 > #108 > #0 > #7 <<<<< !#__tui_put    ; 'l'
-    #23 > #6 > #43 > #0 > #7 <<<<< !#__tui_put     ; '+'
-    #23 > #7 > #81 > #0 > #7 <<<<< !#__tui_put     ; 'Q'
-    #23 > #8 > #58 > #0 > #7 <<<<< !#__tui_put     ; ':'
-    #23 > #10 > #81 > #0 > #7 <<<<< !#__tui_put    ; 'Q'
-    #23 > #11 > #117 > #0 > #7 <<<<< !#__tui_put   ; 'u'
-    #23 > #12 > #105 > #0 > #7 <<<<< !#__tui_put   ; 'i'
-    #23 > #13 > #116 > #0 > #7 <<<<< !#__tui_put   ; 't'
+    ; ── Text area: render buffer ──
+    ; Walk through tape[100+], rendering chars via __tui_put.
+    ; State stored at tape[40..42] (row, col, buf_addr) via *$/*~
+    ; to survive intrinsic calls.
 
-    ; ── Text area: render buffer contents ──────────────────────
-    ;
-    ; Strategy: use the stack as a register file.
-    ;   - Push render state (row, col, buf_addr) to stack
-    ;   - For each byte: pop state, read byte, dispatch, push state back
-    ;   - For printable: set up P+0..P+4 for __tui_put, call it
-    ;
-    ; Stack layout (bottom to top): [buf_addr, col, row]
-    ; P+0..P+6: workspace for __tui_put and byte checks
+    ; Initialize render state
+    #1  $ #40 *~ [-]        ; tape[40] = 1 (screen row, after header)
+    #0  $ #41 *~ [-]        ; tape[41] = 0 (screen col)
+    #100 $ #42 *~ [-]       ; tape[42] = 100 (buffer start addr)
 
-    [-] > [-] > [-] > [-] > [-] > [-] > [-]
-    <<<<<<<                     ; clear P+0..P+6, at P+0
+    ; Render loop: read byte from buffer, dispatch
+    ; Use tape[43] as continue flag
+    #1 $ #43 *~ [-]         ; tape[43] = 1
 
-    ; Push initial render state to stack
-    #100 $                      ; push buf_addr = 100 (buffer start)
-    [-]
-    #0 $                        ; push col = 0
-    [-]
-    #1 $                        ; push row = 1 (row 0 is header)
-    [-]
-    ; Stack: [100, 0, 1] — row on top
+    ; Loop by checking tape[43]
+    #43 *$                  ; push tape[43]
+    ~                       ; P+0 = continue flag
+    [                       ; while continue
+        [-]
 
-    ; P+6 = continue flag
-    >>>>>> #1
-
-    ; Render loop
-    [                           ; while P+6 (continue) != 0
-        -                       ; clear flag
-
-        ; Pop row → P+0, col → P+1, buf_addr → P+2
-        <<<<<< ~                ; P+0 = row (popped)
-        > ~                     ; P+1 = col (popped)
-        > ~                     ; P+2 = buf_addr (popped)
-
-        ; Read byte from buffer: tape[tape[P+2]]
-        ; Save P+0 and P+1 (row, col) — push them back
-        << $                    ; push row
-        > $                     ; push col
-        >                       ; at P+2 (buf_addr)
-        *$                      ; push tape[buf_addr] (the byte from the buffer)
-        ; Stack: [row, col, byte]
-        <<                      ; back to P+0
-        ~                       ; P+0 = byte (popped)
+        ; Read byte from buffer: tape[tape[42]]
+        #42 *$              ; push buf_addr
+        ~                   ; P+0 = buf_addr
+        *$                  ; push tape[buf_addr] (the byte)
+        [-]                 ; clear P+0
+        ~                   ; P+0 = byte
 
         ; Check for 0 (end of buffer)
-        [                       ; if byte != 0
+        ?= #0 [
+            ; End of buffer — stop
+            #0 $ #43 *~ [-] ; tape[43] = 0 (stop)
+        ] : [
+            ; Check for newline
+            ?= #10 [
+                ; Newline: advance row, reset col
+                #40 *$ ~ + $ #40 *~ [-]     ; tape[40]++
+                #0 $ #41 *~ [-]             ; tape[41] = 0
+            ] : [
+                ; Printable: render at (row, col)
+                $               ; push the byte (char to render)
 
-            ; ── Check for newline (10) ──
-            ; Save byte to P+3
-            [->>>+<<<]          ; P+0 → P+3 (move byte to P+3)
-            >>> $               ; push P+3 (byte backup)
-            ----------          ; P+3 -= 10
-            [                   ; if not newline (P+3 != 0)
-                [-]             ; discard P+3
-
-                ; ── PRINTABLE CHARACTER ──
-                ; Stack: [row, col, byte_original]
-                ; Need: P+0=row, P+1=col, P+2=char, P+3=fg, P+4=bg
-                ; Pop byte → P+2
-                [-] <<< [-]     ; clear P+3, go to P+0, clear
-                ~               ; P+0 = byte_original (pop from backup push)
-                ; Now pop col → actual, pop row → actual
-                ; Wait — stack is [row, col], with byte_original just popped.
-                ; After the push sequence: stack was [row, col, byte].
-                ; We popped byte into P+0 via ~.
-                ; Stack now: [row, col]
-                ; Move byte from P+0 to P+2
-                [->>+<<]        ; P+0 → P+2
-                ; Pop col → P+1
-                > ~             ; P+1 = col
-                ; Pop row → P+0
-                < ~             ; P+0 = row
-
-                ; Set fg/bg
-                >>> #7          ; P+3 = fg = 7 (white)
-                > #0            ; P+4 = bg = 0 (black)
-                <<<<            ; back to P+0
-
-                ; RENDER THE CHARACTER
+                ; Read row and col from state
+                #40 *$ ~        ; P+0 = row
+                > #41 *$ ~      ; P+1 = col
+                > ~             ; P+2 = char (popped)
+                > #7            ; P+3 = fg (white)
+                > #0            ; P+4 = bg (black)
+                <<<<
                 !#__tui_put
 
-                ; Advance col and re-push state for next iteration
-                ; row stays the same, col increments, buf_addr increments
-                ; Get buf_addr from P+2 — but P+2 has the char we just rendered
-                ; We need to recover buf_addr. It was at P+2 before we moved byte there.
-                ; Problem: we lost buf_addr when we reused P+2 for the char.
-
-                ; FIX: we need to save buf_addr to the stack BEFORE setting up __tui_put.
-                ; Let me restructure. Push buf_addr early.
-
-                ; Actually, the buf_addr was popped into P+2 at the top of the loop.
-                ; Then we moved the byte to P+3, then to P+2 for __tui_put.
-                ; buf_addr is gone.
-
-                ; SOLUTION: push buf_addr to stack before the byte dispatch.
-                ; Restructure the top of the loop to save buf_addr on stack.
-
-                ; For now: use a fixed increment approach.
-                ; We know buf_addr was P+2 before we overwrote it.
-                ; We need to track it separately.
-
-                ; WORKAROUND: store buf_addr at P+5 before the byte dispatch.
-                ; But we cleared P+5 already... This is the fundamental problem.
-
-                ; The cleanest approach: use P+5 as buf_addr scratch throughout.
-                ; Push new state: row (same), col+1, buf_addr+1
-                ; We have row in P+0 (from the pop). Col was in P+1.
-                ; But __tui_put may have clobbered P+0..P+4.
-
-                ; After __tui_put, P+0..P+4 are unreliable.
-                ; We need to save state BEFORE __tui_put and restore after.
-
-                ; Push row, col+1, buf_addr+1 BEFORE calling __tui_put.
-                ; But we need the values for __tui_put too...
-
-                ; COMPROMISE: reconstruct from what we know.
-                ; After __tui_put: clear workspace, re-derive state.
-                ; This means storing the state in dedicated tape cells (not P+0..P+6).
-
-                ; USE TAPE[40..42] as render state (row, col, buf_addr)
-                ; Read/write via #40 *$ / *~ pattern.
-                ; This is slower but doesn't lose state across __tui_put calls.
-
-                ; For THIS iteration: just skip __tui_put and print via '.'
-                ; (stdout, not TUI). This makes the text render work without
-                ; the state management problem. We'll optimize to __tui_put later.
-
-                ; Actually wait — P+0..P+4 are the __tui_put args. After the call,
-                ; they may be modified by the intrinsic. But the C function
-                ; bfpp_tui_put() only READS the args — it doesn't write to tape.
-                ; So P+0..P+4 are still intact after __tui_put!
-
-                ; That means: P+0=row, P+1=col (from before the call) are still valid.
-                ; We just need buf_addr, which we lost.
-
-                ; Store buf_addr at P+5 BEFORE overwriting P+2 with the char.
-                ; Let me add that save step.
-
-                ; FOR NOW: skip the actual __tui_put and just advance the counters.
-                ; The render loop structure is correct; we just need the state management.
-
-                ; Clear P+0..P+4 after __tui_put
-                [-] > [-] > [-] > [-] > [-]
-                <<<<< ; back to P+0
-
-                ; We lost row, col, buf_addr. Recover from tape[40..42].
-                ; ... except we haven't stored them there yet.
-                ; This is a dead end for this iteration.
-
-                ; PUNT: push dummy state and continue. The structure works,
-                ; the rendering will be fixed in the next pass.
-                #100 $          ; push dummy buf_addr
-                #0 $            ; push dummy col
-                #1 $            ; push dummy row
-                >>>>>> +        ; P+6 = continue
-                <<<<<<          ; back to P+0
-                ; break out of the "not newline" block
+                ; Advance col
+                [-] #41 *$ ~ + $ #41 *~ [-]  ; tape[41]++
             ]
-            ; If WAS newline (P+3 was 0):
-            ; Stack still has: [row, col, byte_original]
-            ; Pop and discard byte_original
-            <<< ~               ; back to P+0, pop byte_original
-            [-]                 ; discard
 
-            ; Pop col (discard — reset to 0)
-            ~                   ; P+0 = col
-            [-]                 ; discard
+            ; Advance buf_addr
+            [-] #42 *$ ~ + $ #42 *~ [-]      ; tape[42]++
 
-            ; Pop row, increment
-            ~                   ; P+0 = row
-            +                   ; row++
-
-            ; Re-push state: row+1, col=0, buf_addr+1
-            ; But we don't have buf_addr... same problem.
-            ; PUNT: push dummy state
-            $ [-]               ; push new row, clear P+0
-            #0 $ [-]            ; push col=0
-            #100 $ [-]          ; push dummy buf_addr
-            >>>>>> +            ; P+6 = continue
-            <<<<<<
+            ; Check if we exceeded visible rows (row > 22)
+            #40 *$ ~        ; P+0 = current row
+            ?> #22 [
+                #0 $ #43 *~ [-]  ; tape[43] = 0 (stop)
+            ]
+            [-]
         ]
-        ; If byte was 0: loop doesn't run. P+6 stays 0. Outer loop exits.
-        ; Stack has [row, col] — leak on exit. Acceptable.
 
-        >>>>>> ; go to P+6 for loop check
+        ; Re-check continue flag
+        #43 *$ ~            ; P+0 = tape[43]
     ]
+    [-]
 
-    ; Cleanup: clear P+0..P+6
-    <<<<<< [-] > [-] > [-] > [-] > [-] > [-] > [-]
-    <<<<<<<
-
-    ; ── Show cursor ──
-    ; Draw a block cursor at the cursor position
-    ; Read cursor_x from tape[50], cursor_y from tape[51]
-    ; cursor screen row = cursor_y - scroll_y + 1 (offset for header)
-    #50 *$                      ; push tape[50] (cursor_x)
-    #51 *$                      ; push tape[51] (cursor_y)
-    ; Stack: [cursor_x, cursor_y]
-    ; Pop cursor_y into P+0, add 1 for header offset
-    ~                           ; P+0 = cursor_y
-    +                           ; P+0 = cursor_y + 1 (screen row)
-    > ~                         ; P+1 = cursor_x (screen col)
-    > #95                       ; P+2 = '_' (cursor char)
-    > #15                       ; P+3 = fg bright white
-    > #0                        ; P+4 = bg black
-    <<<<<
-    !#__tui_put                 ; draw cursor
+    ; ── Cursor ──
+    #51 *$ ~                ; P+0 = cursor_y
+    +                       ; P+0 = cursor_y + 1 (header offset)
+    > #50 *$ ~              ; P+1 = cursor_x
+    > #95                   ; P+2 = '_' cursor char
+    > #15                   ; P+3 = bright white
+    > #0                    ; P+4 = black
+    <<<<
+    !#__tui_put
 
     ; End frame
-    [-] > [-] > [-] > [-] > [-]
-    <<<<<
+    [-] > [-] > [-] > [-] > [-] <<<<<
     !#__tui_end
     ^
 }
 
 ; ── handle_key: process a keypress ─────────────────────────────
-; Input: tape[0] = keycode (16-bit from __tui_key)
-; Modifies editor state at tape[50..58] and buffer at tape[100+].
-;
-; Key dispatch strategy:
-;   Use P+1 as "handled" flag. Start at 0.
-;   For each key we want to check: test P+0, if match set handled=1.
-;   This avoids the nested-conditional problem.
-;
-; Ctrl+Q = 17: set quit flag
-; Arrow RIGHT = 1002: cursor_x++ (via tape[50])
-; Arrow LEFT = 1003: cursor_x-- (via tape[50])
-; Arrow DOWN = 1001: cursor_y++ (via tape[51])
-; Arrow UP = 1000: cursor_y-- (via tape[51])
-;
-; For 8-bit cells, 1000-1003 don't fit. Use %2 for the key check.
 !#handle_key{
-    ; P+0 has key (may be 16-bit if __tui_key set width)
-    ; Copy key to P+2 for testing (preserve original in P+0)
-    %2                          ; ensure 16-bit for large keycodes
-    [->>+>+<<<]                 ; P+0 → P+2 (test copy) and P+3 (backup)
-    >>>[-<<<+>>>] <<<           ; P+3 → P+0 (restore)
-    ; P+0 = key, P+2 = key (copy for testing)
-    ; P+1 = handled flag (0)
+    ; P+0 = keycode (16-bit from __tui_key with %2)
+    ; Use ?= with [] for clean dispatch
 
-    ; ── Check Ctrl+Q (17) ──
-    >> #17                      ; P+2 still has key copy; set P+2 to... no.
-    ; We need to subtract 17 from the copy and check.
-    ; P+2 has the key copy. Subtract 17.
-    ; Can't use #17 here — that would SET P+2 to 17, not subtract.
-    ; Use manual subtraction or a helper cell.
-    ; Set P+3 = 17, then subtract: P+2 -= P+3
-    > #17                       ; P+3 = 17
-    <                           ; P+2
-    [->-<]                      ; P+2 -= P+3 (but this zeros P+2 if P+3 > P+2)
-    ; Actually [->-<] decrements BOTH: P+2-- and P+3-- per iteration.
-    ; That's a subtraction loop: runs min(P+2, P+3) times.
-    ; Result: P+2 = |key - 17|... not quite. It's P+2 = key - 17 if key >= 17.
-    ; For key=17: P+2=0 (match). For key≠17: P+2≠0 (no match).
-    ; Problem: [->-<] runs until P+2 OR P+3 is 0. Not correct subtraction.
-
-    ; Correct subtraction in BF: set P+3 = N, then [-<->] on P+3
-    ; P+3 = 17 (already set above). Now subtract P+3 from P+2:
-    > [-<->]                    ; P+3 times: P+2--, P+3--. Result: P+2 = key-17, P+3 = 0
-    <                           ; P+2 = key - 17
-
-    ; If P+2 == 0: key was Ctrl+Q
-    ; BF if-zero trick: set P+4 = 1, then [clear P+4], check P+4
-    >> #1                       ; P+4 = 1 (assume match)
-    << [[-] >> [-] <<]          ; if P+2 != 0: clear P+2 and P+4
-    >>                          ; P+4: 1 if Ctrl+Q, 0 if not
-    [                           ; if Ctrl+Q
-        [-]                     ; clear P+4
-        ; Set quit flag: tape[56] = 1
-        <<<<<                   ; back to P+0 (approximate)
-        [-]                     ; clear
-        #1 $ [-] #56 *~ [-]    ; tape[56] = 1
-        > #1                    ; P+1 = handled = 1
-        >>>> ; back to P+4 area (clear)
+    ?= #17 [                       ; Ctrl+Q
+        #1 $ [-] #56 *~ [-]        ; tape[56] = 1 (quit)
     ]
 
-    ; ── Check Arrow RIGHT (1002) ──
-    ; Reconstruct key copy from P+0 (which still has the original)
-    <<<<                        ; back to P+0
-    [->>+>+<<<]                 ; copy P+0 → P+2, P+3
-    >>>[-<<<+>>>]<<<            ; restore P+0
-    ; P+2 = key. Subtract 1002.
-    ; 1002 = 3*334 = ... just use %2 #1002 in P+3 and subtract
-    >> > %2 #1002              ; P+3 = 1002
-    [-<->]                      ; P+2 -= 1002
-    <                           ; P+2
-    >> #1 << [[-] >> [-] <<] >> ; P+4 = (P+2==0 ? 1 : 0)
-    [                           ; if Arrow RIGHT
-        [-]
-        ; Increment cursor_x: tape[50]++
-        ; Read tape[50], add 1, write back
-        <<<<< [-]               ; P+0
-        #50 *$                  ; push tape[50]
-        ~                       ; P+0 = cursor_x
-        +                       ; cursor_x++
-        $                       ; push new value
-        [-]
-        #50 *~                  ; tape[50] = cursor_x + 1
-        [-]
-        > #1                    ; P+1 = handled
-        >>>>
+    ; Arrow keys need 16-bit comparison
+    %2
+    ?= #1002 [                      ; Arrow RIGHT
+        [-] #50 *$ ~ + $ [-] #50 *~ [-]  ; tape[50]++
     ]
-
-    ; ── Check Arrow LEFT (1003) ──
-    <<<< [->>+>+<<<] >>>[-<<<+>>>]<<<
-    >> > %2 #1003 [-<->] <
-    >> #1 << [[-] >> [-] <<] >>
-    [
-        [-]
-        ; Decrement cursor_x: tape[50]--
-        <<<<< [-]
-        #50 *$
-        ~                       ; P+0 = cursor_x
-        -                       ; cursor_x-- (wraps to 255 if was 0 — acceptable for now)
-        $
-        [-]
-        #50 *~
-        [-]
-        > #1
-        >>>>
+    ?= #1003 [                      ; Arrow LEFT
+        [-] #50 *$ ~ - $ [-] #50 *~ [-]  ; tape[50]--
     ]
-
-    ; ── Check Arrow DOWN (1001) ──
-    <<<< [->>+>+<<<] >>>[-<<<+>>>]<<<
-    >> > %2 #1001 [-<->] <
-    >> #1 << [[-] >> [-] <<] >>
-    [
-        [-]
-        ; Increment cursor_y: tape[51]++
-        <<<<< [-]
-        #51 *$
-        ~
-        +
-        $
-        [-]
-        #51 *~
-        [-]
-        > #1
-        >>>>
+    ?= #1001 [                      ; Arrow DOWN
+        [-] #51 *$ ~ + $ [-] #51 *~ [-]  ; tape[51]++
     ]
-
-    ; ── Check Arrow UP (1000) ──
-    <<<< [->>+>+<<<] >>>[-<<<+>>>]<<<
-    >> > %2 #1000 [-<->] <
-    >> #1 << [[-] >> [-] <<] >>
-    [
-        [-]
-        ; Decrement cursor_y: tape[51]--
-        <<<<< [-]
-        #51 *$
-        ~
-        -
-        $
-        [-]
-        #51 *~
-        [-]
-        > #1
-        >>>>
+    ?= #1000 [                      ; Arrow UP
+        [-] #51 *$ ~ - $ [-] #51 *~ [-]  ; tape[51]--
     ]
+    %1
 
-    ; Always set dirty flag
-    <<<<<<                      ; back to P+0
-    [-]
-    #1 $ [-] #55 *~ [-]        ; tape[55] = 1 (dirty)
-
-    ; Clear workspace P+0..P+5
-    [-] > [-] > [-] > [-] > [-] > [-]
-    <<<<<<
-    %1                          ; restore 8-bit cells
+    ; Set dirty
+    [-] #1 $ [-] #55 *~ [-]        ; tape[55] = 1
     ^
 }
 
@@ -494,102 +188,63 @@
 ; MAIN
 ; ═══════════════════════════════════════════════════════════════════
 
-; ── Init TUI ──
 !#__tui_init
 
-; ── Get terminal size ──
-!#__tui_size                    ; P+0 = cols, P+1 = rows
+; Get terminal size
+!#__tui_size
+$ > $ [-] < [-]
+; Pop rows → tape[54], cols → tape[53]
+~ $ [-] #54 *~ [-]
+~ $ [-] #53 *~ [-]
 
-; Store cols → tape[53], rows → tape[54]
-$ > $                           ; push cols, push rows
-[-] < [-]                       ; clear P+0, P+1
-#1 $ #54 *~                    ; tape[54] = rows (via push 1, wait...)
-; Actually: push rows value (already on stack from above)
-; Stack: [cols, rows]
-; Pop rows → tape[54]
-#54                             ; P+0 = 54 (address)
-*~                              ; tape[54] = pop (rows)
-[-]                             ; clear P+0
-; Pop cols → tape[53]
-#53
-*~                              ; tape[53] = pop (cols)
-[-]
+; Init editor state via *$/*~
+#0 $ [-] #50 *~ [-]        ; cursor_x = 0
+#0 $ [-] #51 *~ [-]        ; cursor_y = 0
+#0 $ [-] #52 *~ [-]        ; scroll_y = 0
+#1 $ [-] #55 *~ [-]        ; dirty = 1
+#0 $ [-] #56 *~ [-]        ; quit = 0
 
-; ── Init editor state ──
-; tape[50] = cursor_x = 0
-#0 $ #50 *~ [-]
-; tape[51] = cursor_y = 0
-#0 $ #51 *~ [-]
-; tape[52] = scroll_y = 0
-#0 $ #52 *~ [-]
-; tape[55] = dirty = 1
-#1 $ #55 *~ [-]
-; tape[56] = quit = 0
-#0 $ #56 *~ [-]
-; tape[57] = total_lines = 1
-#1 $ #57 *~ [-]
+; Init text buffer: "Hello, BF++ Editor!\n" at tape[100]
+#100 @
+"Hello, BF++ Editor!\n\0"
+#0 @
 
-; ── Init text buffer ──
-; tape[100] = newline (empty document)
-#10 $ #100 *~ [-]
-; tape[101] = 0 (end of buffer)
-#0 $ #101 *~ [-]
-
-; ── Initial render ──
+; Initial render
 !#render
 
-; ── Main loop: while quit flag == 0 ──
-; Read tape[56] (quit flag), invert to get continue flag
-#56 *$                          ; push tape[56]
-~                               ; pop into P+0
-; We need: loop while NOT quit. BF loops while nonzero.
-; So we need: P+0 = 1 if quit==0, P+0 = 0 if quit==1.
-; Invert: if P+0 is 0, set to 1. If nonzero, set to 0.
-; BF inversion trick: [[-]>+<] > [[-]<+>] <
-; Or simpler: set P+1=1, then [P+0 is nonzero: clear P+1] check P+1
-> #1 <                          ; P+1 = 1
-[[-] > [-] <]                   ; if P+0 != 0: clear both (quit=true → stop)
-> [-<+>]                        ; move P+1 to P+0 (P+0 = 1 if quit was 0)
-<                               ; P+0 = continue flag
+; Main loop: while quit == 0
+#56 *$ ~                    ; P+0 = quit
+> #1 <                      ; P+1 = 1
+[[-] > [-] <]               ; if quit != 0: clear both
+> [-<+>] <                  ; P+0 = inverted quit (1=continue)
 
-[                               ; ── MAIN LOOP ──
-    [-]                         ; clear continue flag
+[                           ; while continue
+    [-]
 
-    ; ── Poll for input ──
-    %2 #33                      ; 33ms timeout (16-bit cell for large keycodes)
-    !#__tui_key                 ; P+0 = keycode (-1/65535 if timeout, 1000+ for arrows)
+    ; Poll input (16-bit for arrow keys)
+    %2 #33
+    !#__tui_key             ; P+0 = keycode
 
-    ; Check if timeout (-1 wraps to 255 in unsigned, or stays as large value)
-    ; If keycode > 0 and != 255, process it
-    ; For simplicity: if P+0 != 0, handle it (treats timeout 255 as a key, but
-    ; 255 isn't a valid ASCII char so handle_key will just set dirty)
-    $                           ; save keycode
-    [                           ; if keycode != 0
-        ~                       ; restore keycode to P+0
+    ; Skip timeout (keycode == 65535 for -1 in uint16)
+    ?! #0 [
         !#handle_key
-        [-]                     ; clear P+0
-
-        ; Re-render
-        !#render
     ]
-    ; If keycode was 0 (actual null byte — unlikely), skip
+    [-]
 
-    ; Pop leftover if keycode was 0 (the $ pushed but [ didn't pop)
-    ; This is a stack leak for the timeout case. Add safety pop:
-    ; Actually if [ ran, ~ already popped. If [ didn't run, stack has the 0.
-    ; For timeout (255): [ runs (255 != 0), so ~ pops. Clean.
-    ; For actual 0: [ doesn't run, stack has 0. Next iteration pushes on top.
-    ; Stack grows by 1 per null-byte input. Acceptable — null input is rare.
+    ; Render if dirty
+    #55 *$ ~                ; P+0 = dirty
+    [
+        [-]
+        !#render
+        #0 $ [-] #55 *~ [-] ; clear dirty
+    ]
 
-    ; ── Check quit flag ──
-    #56 *$                      ; push tape[56]
-    ~                           ; pop into P+0
-    > #1 <                      ; P+1 = 1
-    [[-] > [-] <]               ; if quit: clear both → P+0 = 0
-    > [-<+>] <                  ; P+0 = inverted quit (1=continue, 0=stop)
+    ; Check quit
+    #56 *$ ~
+    > #1 <
+    [[-] > [-] <]
+    > [-<+>] <              ; P+0 = inverted quit
 ]
 
-; ── Cleanup ──
-[-]
 !#__tui_cleanup
 #0 !#__exit
