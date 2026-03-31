@@ -231,4 +231,34 @@ mod tests {
         let errors = result.unwrap_err();
         assert!(errors[0].message.contains("Duplicate"));
     }
+
+    #[test]
+    fn test_intrinsic_not_flagged_as_undefined() {
+        // Calls to __* names should NOT trigger "undefined sub" errors
+        let nodes = vec![AstNode::SubCall("__term_size".into())];
+        assert!(analyze(&nodes).is_ok());
+    }
+
+    #[test]
+    fn test_intrinsic_still_allows_normal_undefined() {
+        // Non-__ names should still be flagged
+        let nodes = vec![AstNode::SubCall("nonexistent".into())];
+        assert!(analyze(&nodes).is_err());
+    }
+
+    #[test]
+    fn test_empty_ffi_lib_name() {
+        let nodes = vec![AstNode::FfiCall("".into(), "func".into())];
+        let result = analyze(&nodes);
+        assert!(result.is_err());
+        assert!(result.unwrap_err()[0].message.contains("empty library"));
+    }
+
+    #[test]
+    fn test_empty_ffi_func_name() {
+        let nodes = vec![AstNode::FfiCall("lib".into(), "".into())];
+        let result = analyze(&nodes);
+        assert!(result.is_err());
+        assert!(result.unwrap_err()[0].message.contains("empty function"));
+    }
 }

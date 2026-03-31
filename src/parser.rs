@@ -386,4 +386,22 @@ mod tests {
         assert_eq!(program.nodes.len(), 1);
         assert!(matches!(&program.nodes[0], AstNode::FfiCall(lib, func) if lib == "libm.so.6" && func == "ceil"));
     }
+
+    #[test]
+    fn test_numeric_literal() {
+        let tokens = lex("#42 .").unwrap();
+        let program = parse(&tokens).unwrap();
+        assert_eq!(program.nodes.len(), 2);
+        assert_eq!(program.nodes[0], AstNode::SetValue(42));
+        assert_eq!(program.nodes[1], AstNode::Output);
+    }
+
+    #[test]
+    fn test_direct_cell_width() {
+        let tokens = lex("%8 #100").unwrap();
+        let program = parse(&tokens).unwrap();
+        assert_eq!(program.nodes.len(), 2);
+        assert_eq!(program.nodes[0], AstNode::SetCellWidth(8));
+        assert_eq!(program.nodes[1], AstNode::SetValue(100));
+    }
 }

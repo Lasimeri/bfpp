@@ -33,13 +33,17 @@ impl Default for CodegenOptions {
 pub struct CodegenResult {
     pub c_source: String,
     pub uses_ffi: bool,
+    pub uses_tui_runtime: bool,
 }
 
 pub fn generate(program: &Program, opts: &CodegenOptions) -> CodegenResult {
     // Pre-scan for FFI usage so we know whether to #include <dlfcn.h>
     let uses_ffi = program_uses_ffi(&program.nodes);
-    let c_source = generate_c(program, opts, uses_ffi);
-    CodegenResult { c_source, uses_ffi }
+    // Pre-scan for intrinsic usage (headers, TUI runtime, etc.)
+    let intrinsics = detect_intrinsics(&program.nodes);
+    let uses_tui_runtime = intrinsics.tui;
+    let c_source = generate_c(program, opts, uses_ffi, &intrinsics);
+    CodegenResult { c_source, uses_ffi, uses_tui_runtime }
 }
 
 // Recursively checks whether any node in the AST uses \ffi calls.
@@ -65,7 +69,7 @@ fn program_uses_ffi(nodes: &[AstNode]) -> bool {
 }
 
 // Main C generation pipeline: header → forward decls → subroutine bodies → main().
-fn generate_c(program: &Program, opts: &CodegenOptions, uses_ffi: bool) -> String {
+fn generate_c(program: &Program, opts: &CodegenOptions, uses_ffi: bool, intrinsics: &IntrinsicUsage) -> String {
     let mut out = String::new();
     let mut ctx = GenCtx {
         indent: 1,
@@ -79,13 +83,10 @@ fn generate_c(program: &Program, opts: &CodegenOptions, uses_ffi: bool) -> Strin
     // Only scans top-level nodes — BF++ subroutine defs are always top-level.
     collect_subroutines(&program.nodes, &mut ctx.subroutines);
 
-    // Detect compiler intrinsic usage to know which C headers/state to emit.
-    let intrinsics = detect_intrinsics(&program.nodes);
-
     // Emit the C runtime header: includes, #defines, static globals,
     // helper functions (bfpp_get/set/push/pop/cycle_width, errno mapping,
     // syscall wrapper, constructor, and optional SDL framebuffer).
-    out.push_str(&emit_header(opts, uses_ffi, &intrinsics));
+    out.push_str(&emit_header(opts, uses_ffi, intrinsics));
 
     // Forward-declare all subroutines so they can call each other
     // regardless of definition order (mutual recursion).
@@ -213,6 +214,9 @@ fn emit_header(opts: &CodegenOptions, uses_ffi: bool, intrinsics: &IntrinsicUsag
     }
     if intrinsics.poll {
         h.push_str("#include <poll.h>\n");
+    }
+    if intrinsics.tui {
+        h.push_str("#include \"bfpp_rt.h\"\n");
     }
     h.push('\n');
 
@@ -1053,6 +1057,56 @@ fn emit_intrinsic(out: &mut String, name: &str, ctx: &mut GenCtx) {
             out.push_str("{ struct pollfd pfd = {0, POLLIN, 0}; int r = poll(&pfd, 1, (int)bfpp_get(ptr)); bfpp_set(ptr, r > 0 ? 1 : 0); }\n");
         }
 
+        // ── TUI Runtime ──────────────────────────────────────────
+        "__tui_init" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_tui_init();\n");
+        }
+        "__tui_cleanup" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_tui_cleanup();\n");
+        }
+        "__tui_size" => {
+            // Output: tape[ptr]=cols, tape[ptr+1]=rows
+            indent(out, ctx.indent);
+            out.push_str("{ int c,r; bfpp_tui_get_size(&c,&r); bfpp_set(ptr,c); bfpp_set((ptr+1)&TAPE_MASK,r); }\n");
+        }
+        "__tui_begin" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_tui_begin_frame();\n");
+        }
+        "__tui_end" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_tui_end_frame();\n");
+        }
+        "__tui_put" => {
+            // Input: tape[ptr]=row, [ptr+1]=col, [ptr+2]=char, [ptr+3]=fg, [ptr+4]=bg
+            indent(out, ctx.indent);
+            out.push_str("bfpp_tui_put((int)bfpp_get(ptr), (int)bfpp_get((ptr+1)&TAPE_MASK), (uint8_t)bfpp_get((ptr+2)&TAPE_MASK), (int)(int8_t)bfpp_get((ptr+3)&TAPE_MASK), (int)(int8_t)bfpp_get((ptr+4)&TAPE_MASK));\n");
+        }
+        "__tui_puts" => {
+            // Input: tape[ptr]=row, [ptr+1]=col, null-terminated string at ptr+2
+            // fg at first byte after null, bg at byte after that
+            indent(out, ctx.indent);
+            out.push_str("{ int r=(int)bfpp_get(ptr), c=(int)bfpp_get((ptr+1)&TAPE_MASK); char *s=(char*)&tape[(ptr+2)&TAPE_MASK]; int sl=strlen(s); int fg=(int)(int8_t)tape[(ptr+2+sl+1)&TAPE_MASK]; int bg=(int)(int8_t)tape[(ptr+2+sl+2)&TAPE_MASK]; bfpp_tui_puts(r,c,s,fg,bg); }\n");
+        }
+        "__tui_fill" => {
+            // Input: tape[ptr]=row,[ptr+1]=col,[ptr+2]=w,[ptr+3]=h,[ptr+4]=ch,[ptr+5]=fg,[ptr+6]=bg
+            indent(out, ctx.indent);
+            out.push_str("bfpp_tui_fill((int)bfpp_get(ptr), (int)bfpp_get((ptr+1)&TAPE_MASK), (int)bfpp_get((ptr+2)&TAPE_MASK), (int)bfpp_get((ptr+3)&TAPE_MASK), (uint8_t)bfpp_get((ptr+4)&TAPE_MASK), (int)(int8_t)bfpp_get((ptr+5)&TAPE_MASK), (int)(int8_t)bfpp_get((ptr+6)&TAPE_MASK));\n");
+        }
+        "__tui_box" => {
+            // Input: tape[ptr]=row,[ptr+1]=col,[ptr+2]=w,[ptr+3]=h,[ptr+4]=style
+            indent(out, ctx.indent);
+            out.push_str("bfpp_tui_box((int)bfpp_get(ptr), (int)bfpp_get((ptr+1)&TAPE_MASK), (int)bfpp_get((ptr+2)&TAPE_MASK), (int)bfpp_get((ptr+3)&TAPE_MASK), (int)bfpp_get((ptr+4)&TAPE_MASK));\n");
+        }
+        "__tui_key" => {
+            // Input: tape[ptr]=timeout_ms
+            // Output: tape[ptr]=keycode (-1 for timeout)
+            indent(out, ctx.indent);
+            out.push_str("bfpp_set(ptr, (uint64_t)(int64_t)bfpp_tui_poll_key((int)bfpp_get(ptr)));\n");
+        }
+
         // ── Unrecognized intrinsic ───────────────────────────
         _ => {
             indent(out, ctx.indent);
@@ -1070,6 +1124,7 @@ struct IntrinsicUsage {
     env: bool,       // __getenv
     process: bool,   // __exit, __getpid
     poll: bool,      // __poll_stdin
+    tui: bool,       // __tui_* intrinsics (requires bfpp_rt runtime)
 }
 
 fn detect_intrinsics(nodes: &[AstNode]) -> IntrinsicUsage {
@@ -1090,6 +1145,10 @@ fn scan_intrinsics(nodes: &[AstNode], usage: &mut IntrinsicUsage) {
                     "__getenv" => usage.env = true,
                     "__exit" | "__getpid" => usage.process = true,
                     "__poll_stdin" => usage.poll = true,
+                    "__tui_init" | "__tui_cleanup" | "__tui_size" |
+                    "__tui_begin" | "__tui_end" | "__tui_put" |
+                    "__tui_puts" | "__tui_fill" | "__tui_box" |
+                    "__tui_key" => usage.tui = true,
                     _ => {}
                 }
             }

@@ -723,4 +723,77 @@ mod tests {
             Token::FfiCall("libm.so.6".into(), "ceil".into()),
         ]);
     }
+
+    #[test]
+    fn test_numeric_literal_decimal() {
+        let tokens = lex("#72").unwrap();
+        assert_eq!(tokens, vec![Token::NumericLit(72)]);
+    }
+
+    #[test]
+    fn test_numeric_literal_hex() {
+        let tokens = lex("#0xFF").unwrap();
+        assert_eq!(tokens, vec![Token::NumericLit(255)]);
+    }
+
+    #[test]
+    fn test_numeric_literal_zero() {
+        let tokens = lex("#0").unwrap();
+        assert_eq!(tokens, vec![Token::NumericLit(0)]);
+    }
+
+    #[test]
+    fn test_numeric_literal_large() {
+        let tokens = lex("#36864").unwrap();
+        assert_eq!(tokens, vec![Token::NumericLit(36864)]);
+    }
+
+    #[test]
+    fn test_numeric_literal_error_empty() {
+        assert!(lex("#abc").is_err());
+    }
+
+    #[test]
+    fn test_direct_cell_width() {
+        let tokens = lex("%8 %4 %2 %1").unwrap();
+        assert_eq!(tokens, vec![
+            Token::SetCellWidth(8),
+            Token::SetCellWidth(4),
+            Token::SetCellWidth(2),
+            Token::SetCellWidth(1),
+        ]);
+    }
+
+    #[test]
+    fn test_bare_percent_still_cycles() {
+        let tokens = lex("% %").unwrap();
+        assert_eq!(tokens, vec![Token::CellWidthCycle, Token::CellWidthCycle]);
+    }
+
+    #[test]
+    fn test_block_comment() {
+        let tokens = lex("+ /* comment */ -").unwrap();
+        assert_eq!(tokens, vec![Token::Increment, Token::Decrement]);
+    }
+
+    #[test]
+    fn test_nested_block_comment() {
+        let tokens = lex("+ /* outer /* inner */ still comment */ -").unwrap();
+        assert_eq!(tokens, vec![Token::Increment, Token::Decrement]);
+    }
+
+    #[test]
+    fn test_unterminated_block_comment() {
+        assert!(lex("+ /* never closed").is_err());
+    }
+
+    #[test]
+    fn test_standalone_r_error() {
+        assert!(lex("R +").is_err());
+    }
+
+    #[test]
+    fn test_standalone_k_error() {
+        assert!(lex("K +").is_err());
+    }
 }

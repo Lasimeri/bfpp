@@ -242,6 +242,25 @@ fn main() {
         cc_cmd.args(["-ldl"]);
     }
 
+    // TUI runtime: compile bfpp_rt.c alongside the generated C and add its
+    // include path. Searches CWD/runtime first, then alongside the executable.
+    if codegen_result.uses_tui_runtime {
+        let runtime_paths = [
+            PathBuf::from("runtime"),
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("runtime")))
+                .unwrap_or_default(),
+        ];
+        for rt_dir in &runtime_paths {
+            if rt_dir.join("bfpp_rt.c").exists() {
+                cc_cmd.arg(format!("-I{}", rt_dir.display()));
+                cc_cmd.arg(rt_dir.join("bfpp_rt.c").to_str().unwrap());
+                break;
+            }
+        }
+    }
+
     let status = match cc_cmd.status() {
         Ok(s) => s,
         Err(e) => {
