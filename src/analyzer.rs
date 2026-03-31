@@ -1,4 +1,4 @@
-/// BF++ Semantic Analyzer — validates AST before codegen.
+// BF++ Semantic Analyzer — validates AST before codegen.
 
 use crate::ast::AstNode;
 use std::collections::HashSet;
@@ -36,7 +36,7 @@ pub fn analyze(nodes: &[AstNode]) -> Result<(), Vec<AnalysisError>> {
     check_duplicate_defs(nodes, &mut seen, &mut errors);
 
     // Check for return (^) outside subroutine body
-    check_return_context(nodes, false, &mut errors);
+    check_return_context(nodes, false);
 
     // Check for empty FFI names
     check_ffi_names(nodes, &mut errors);
@@ -87,25 +87,25 @@ fn check_duplicate_defs(nodes: &[AstNode], seen: &mut HashSet<String>, errors: &
     }
 }
 
-fn check_return_context(nodes: &[AstNode], in_sub: bool, errors: &mut Vec<AnalysisError>) {
+fn check_return_context(nodes: &[AstNode], in_sub: bool) {
     for node in nodes {
         match node {
             AstNode::Return => {
                 if !in_sub {
                     // Top-level ^ transpiles to `return 0;` from main.
-                    // Emit warning but not error — this is valid but unusual.
+                    // Valid but unusual — emit as a diagnostic warning.
                     eprintln!("warning: top-level '^' will return from main");
                 }
             }
             AstNode::SubDef(_, body) => {
-                check_return_context(body, true, errors);
+                check_return_context(body, true);
             }
             AstNode::Loop(body) => {
-                check_return_context(body, in_sub, errors);
+                check_return_context(body, in_sub);
             }
             AstNode::ResultBlock(r, k) => {
-                check_return_context(r, in_sub, errors);
-                check_return_context(k, in_sub, errors);
+                check_return_context(r, in_sub);
+                check_return_context(k, in_sub);
             }
             _ => {}
         }

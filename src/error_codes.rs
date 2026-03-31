@@ -1,4 +1,4 @@
-/// BF++ error code constants and errno mapping.
+// BF++ error code constants and errno mapping.
 
 pub const OK: u64 = 0;
 pub const ERR_GENERIC: u64 = 1;

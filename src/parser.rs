@@ -1,4 +1,4 @@
-/// BF++ Parser — transforms token stream into AST.
+// BF++ Parser — transforms token stream into AST.
 
 use crate::ast::{AstNode, FdSpec, Program};
 use crate::lexer::Token;

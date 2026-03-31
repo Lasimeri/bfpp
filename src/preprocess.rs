@@ -1,7 +1,7 @@
-/// BF++ Preprocessor — handles `!include "filename"` directives.
-///
-/// Runs as a text-level expansion pass before lexing.
-/// Resolves includes relative to: source dir → --include paths → ./stdlib/ → exe-relative stdlib.
+// BF++ Preprocessor — handles `!include "filename"` directives.
+//
+// Runs as a text-level expansion pass before lexing.
+// Resolves includes relative to: source dir → --include paths → ./stdlib/ → exe-relative stdlib.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

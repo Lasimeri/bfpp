@@ -195,7 +195,7 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
                             chars.next(); col += 1; // f
                             chars.next(); col += 1; // i
                             // Skip whitespace
-                            while chars.peek().map_or(false, |c| c.is_whitespace() && *c != '\n') {
+                            while chars.peek().is_some_and(|c| c.is_whitespace() && *c != '\n') {
                                 chars.next(); col += 1;
                             }
                             // Parse first string literal (lib name)
@@ -211,7 +211,7 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
                                 line, col,
                             })?;
                             // Skip whitespace
-                            while chars.peek().map_or(false, |c| c.is_whitespace() && *c != '\n') {
+                            while chars.peek().is_some_and(|c| c.is_whitespace() && *c != '\n') {
                                 chars.next(); col += 1;
                             }
                             // Parse second string literal (func name)

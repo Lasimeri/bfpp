@@ -1,4 +1,4 @@
-/// BF++ Optimizer — peephole optimization passes on AST.
+// BF++ Optimizer — peephole optimization passes on AST.
 
 use crate::ast::AstNode;
 

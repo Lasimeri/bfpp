@@ -11,9 +11,10 @@
 
 ; !#.+ — print_int: print tape[ptr] as decimal ASCII to stdout
 ; Prints the numeric value of the current cell as decimal digits.
-; Uses cells ptr+1..ptr+7 as workspace (must be zero before call).
+; Uses cells ptr+1..ptr+8 as workspace (must be zero before call).
 ; Algorithm: extract digits via repeated mod/div by 10, push to stack, pop and print.
 ; Calls: !#m% (modulo), !#m/ (divide) from math.bfpp.
+; Note: divmod touches 6 cells (ptr through ptr+5), so backup is at ptr+7.
 !#.+{
     ; ptr = P, tape[P] = V
     [                               ; if V != 0
@@ -25,11 +26,11 @@
 
         >                           ; ptr = P+1 (working value)
         [                           ; while working value > 0
-            ; Copy P+1 to P+6 (backup), using P+7 as temp
-            ; P+6 and P+7 must be 0 entering here
-            [->>>>>+>+<<<<<<]       ; P+1→P+6 and P+7 (P+1=0)
-            >>>>>>[-<<<<<<+>>>>>>]  ; P+7→P+1 (restore)
-            <<<<<<                  ; ptr=P+1, P+1=V, P+6=V, P+7=0
+            ; Copy P+1 to P+7 (backup), using P+8 as temp
+            ; P+7 and P+8 must be 0 entering here
+            [->>>>>>+>+<<<<<<<]     ; P+1→P+7 and P+8 (P+1=0)
+            >>>>>>>[-<<<<<<<+>>>>>>>] ; P+8→P+1 (restore)
+            <<<<<<<                 ; ptr=P+1, P+1=V, P+7=V, P+8=0
 
             ; Set divisor: P+2 = 10
             >++++++++++<            ; P+2=10, ptr=P+1
@@ -46,9 +47,9 @@
             ; Clear P+1 (digit has been pushed)
             [-]
 
-            ; Restore working value: move P+6 (backup) to P+1
-            >>>>>[-<<<<<+>>>>>]     ; P+6→P+1, ptr=P+6
-            <<<<<                   ; ptr=P+1, P+1=V
+            ; Restore working value: move P+7 (backup) to P+1
+            >>>>>>[-<<<<<<+>>>>>>]  ; P+7→P+1, ptr=P+7
+            <<<<<<                  ; ptr=P+1, P+1=V
 
             ; Set divisor: P+2 = 10
             >++++++++++<            ; P+2=10, ptr=P+1

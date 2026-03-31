@@ -1,4 +1,4 @@
-/// BF++ Code Generator — AST → C source.
+// BF++ Code Generator — AST → C source.
 
 use crate::ast::{AstNode, FdSpec, Program};
 
@@ -160,7 +160,7 @@ fn emit_header(opts: &CodegenOptions, uses_ffi: bool) -> String {
     if uses_ffi {
         h.push_str("#include <dlfcn.h>\n");
     }
-    h.push_str("\n");
+    h.push('\n');
 
     if let Some((w, h_)) = opts.framebuffer {
         h.push_str("#include <SDL2/SDL.h>\n");
@@ -174,7 +174,28 @@ fn emit_header(opts: &CodegenOptions, uses_ffi: bool) -> String {
     h.push_str("#define TAPE_MASK (TAPE_SIZE - 1)\n");
     h.push_str(&format!("#define STACK_SIZE {}\n", opts.stack_size));
     h.push_str(&format!("#define CALL_DEPTH {}\n", opts.call_depth));
-    h.push_str("\n");
+    h.push('\n');
+
+    // Error code defines — single source of truth from error_codes.rs constants
+    h.push_str(&format!("#define BFPP_OK {}\n", crate::error_codes::OK));
+    h.push_str(&format!("#define BFPP_ERR_GENERIC {}\n", crate::error_codes::ERR_GENERIC));
+    h.push_str(&format!("#define BFPP_ERR_NOT_FOUND {}\n", crate::error_codes::ERR_NOT_FOUND));
+    h.push_str(&format!("#define BFPP_ERR_PERMISSION {}\n", crate::error_codes::ERR_PERMISSION));
+    h.push_str(&format!("#define BFPP_ERR_OOM {}\n", crate::error_codes::ERR_OOM));
+    h.push_str(&format!("#define BFPP_ERR_CONN_REFUSED {}\n", crate::error_codes::ERR_CONN_REFUSED));
+    h.push_str(&format!("#define BFPP_ERR_INVALID_ARG {}\n", crate::error_codes::ERR_INVALID_ARG));
+    h.push_str(&format!("#define BFPP_ERR_TIMEOUT {}\n", crate::error_codes::ERR_TIMEOUT));
+    h.push_str(&format!("#define BFPP_ERR_EXISTS {}\n", crate::error_codes::ERR_EXISTS));
+    h.push_str(&format!("#define BFPP_ERR_BUSY {}\n", crate::error_codes::ERR_BUSY));
+    h.push_str(&format!("#define BFPP_ERR_PIPE {}\n", crate::error_codes::ERR_PIPE));
+    h.push_str(&format!("#define BFPP_ERR_CONN_RESET {}\n", crate::error_codes::ERR_CONN_RESET));
+    h.push_str(&format!("#define BFPP_ERR_ADDR_IN_USE {}\n", crate::error_codes::ERR_ADDR_IN_USE));
+    h.push_str(&format!("#define BFPP_ERR_NOT_CONNECTED {}\n", crate::error_codes::ERR_NOT_CONNECTED));
+    h.push_str(&format!("#define BFPP_ERR_INTERRUPTED {}\n", crate::error_codes::ERR_INTERRUPTED));
+    h.push_str(&format!("#define BFPP_ERR_IO {}\n", crate::error_codes::ERR_IO));
+    h.push_str(&format!("#define BFPP_ERR_NOLIB {}\n", crate::error_codes::ERR_NOLIB));
+    h.push_str(&format!("#define BFPP_ERR_NOSYM {}\n", crate::error_codes::ERR_NOSYM));
+    h.push('\n');
 
     // Core state
     h.push_str("static uint8_t tape[TAPE_SIZE];\n");
@@ -184,12 +205,12 @@ fn emit_header(opts: &CodegenOptions, uses_ffi: bool) -> String {
     h.push_str("static int sp = 0;\n");
     h.push_str("static int bfpp_call_depth = 0;\n");
     h.push_str("static uint8_t cell_width[TAPE_SIZE]; /* 0=continuation, 1,2,4,8 */\n");
-    h.push_str("\n");
+    h.push('\n');
 
     // Helper: get cell value respecting width
     h.push_str(r#"static uint64_t bfpp_get(int p) {
     p &= TAPE_MASK;
-    if (cell_width[p] == 0) { bfpp_err = 6; return 0; } /* continuation byte */
+    if (cell_width[p] == 0) { bfpp_err = BFPP_ERR_INVALID_ARG; return 0; } /* continuation byte */
     switch (cell_width[p]) {
         case 2: { uint16_t v; memcpy(&v, &tape[p], 2); return v; }
         case 4: { uint32_t v; memcpy(&v, &tape[p], 4); return v; }
@@ -200,7 +221,7 @@ fn emit_header(opts: &CodegenOptions, uses_ffi: bool) -> String {
 
 static void bfpp_set(int p, uint64_t v) {
     p &= TAPE_MASK;
-    if (cell_width[p] == 0) { bfpp_err = 6; return; } /* continuation byte */
+    if (cell_width[p] == 0) { bfpp_err = BFPP_ERR_INVALID_ARG; return; } /* continuation byte */
     switch (cell_width[p]) {
         case 2: { uint16_t t = (uint16_t)v; memcpy(&tape[p], &t, 2); break; }
         case 4: { uint32_t t = (uint32_t)v; memcpy(&tape[p], &t, 4); break; }
@@ -210,12 +231,12 @@ static void bfpp_set(int p, uint64_t v) {
 }
 
 static void bfpp_push(uint64_t val) {
-    if (sp >= STACK_SIZE) { bfpp_err = 4; return; }
+    if (sp >= STACK_SIZE) { bfpp_err = BFPP_ERR_OOM; return; }
     stack[sp++] = val;
 }
 
 static uint64_t bfpp_pop(void) {
-    if (sp <= 0) { bfpp_err = 6; return 0; }
+    if (sp <= 0) { bfpp_err = BFPP_ERR_INVALID_ARG; return 0; }
     return stack[--sp];
 }
 
@@ -234,7 +255,7 @@ static void bfpp_cycle_width(int p) {
     /* Check sub-cells are available */
     for (i = 1; i < new_w; i++) {
         if (cell_width[p + i] != 1) {
-            bfpp_err = 6;
+            bfpp_err = BFPP_ERR_INVALID_ARG;
             cell_width[p] = 1; /* revert to 1-byte */
             return;
         }
@@ -248,7 +269,7 @@ static void bfpp_cycle_width(int p) {
 
     // errno mapping
     h.push_str(crate::error_codes::errno_mapping_c_source());
-    h.push_str("\n");
+    h.push('\n');
 
     // Syscall wrapper
     h.push_str(r#"static void bfpp_syscall_exec(void) {
@@ -264,7 +285,7 @@ static void bfpp_cycle_width(int p) {
         bfpp_err = bfpp_errno_to_code(errno);
         bfpp_set(ptr, (uint64_t)(-1));
     } else {
-        bfpp_err = 0;
+        bfpp_err = BFPP_OK;
         bfpp_set(ptr, (uint64_t)result);
     }
 }
@@ -431,7 +452,7 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
             out.push_str("{\n");
             ctx.indent += 1;
             indent(out, ctx.indent);
-            out.push_str(&format!("static const uint8_t str_data[] = {{"));
+            out.push_str("static const uint8_t str_data[] = {");
             for (i, b) in bytes.iter().enumerate() {
                 if i > 0 { out.push_str(", "); }
                 out.push_str(&format!("{}", b));
@@ -563,7 +584,7 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
             indent(out, ctx.indent);
             out.push_str("int saved_err = bfpp_err;\n");
             indent(out, ctx.indent);
-            out.push_str("bfpp_err = 0;\n");
+            out.push_str("bfpp_err = BFPP_OK;\n");
             // Wrap R block in do/while(0) so ? (Propagate) can break to K block
             indent(out, ctx.indent);
             out.push_str("do {\n");
@@ -613,7 +634,7 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
             indent(out, ctx.indent);
             out.push_str(&format!("void *ffi_handle = dlopen(\"{}\", RTLD_LAZY);\n", lib));
             indent(out, ctx.indent);
-            out.push_str("if (!ffi_handle) { bfpp_err = 16; }\n");
+            out.push_str("if (!ffi_handle) { bfpp_err = BFPP_ERR_NOLIB; }\n");
             indent(out, ctx.indent);
             out.push_str("else {\n");
             ctx.indent += 1;
@@ -623,7 +644,7 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
                 func
             ));
             indent(out, ctx.indent);
-            out.push_str("if (!ffi_fn) { bfpp_err = 17; dlclose(ffi_handle); }\n");
+            out.push_str("if (!ffi_fn) { bfpp_err = BFPP_ERR_NOSYM; dlclose(ffi_handle); }\n");
             indent(out, ctx.indent);
             out.push_str("else {\n");
             ctx.indent += 1;
@@ -644,7 +665,7 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
             indent(out, ctx.indent);
             out.push_str("bfpp_set(ptr, (uint64_t)ffi_result);\n");
             indent(out, ctx.indent);
-            out.push_str("bfpp_err = 0;\n");
+            out.push_str("bfpp_err = BFPP_OK;\n");
             indent(out, ctx.indent);
             out.push_str("dlclose(ffi_handle);\n");
             ctx.indent -= 1;
