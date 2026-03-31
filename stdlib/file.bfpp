@@ -1,89 +1,297 @@
 ; BF++ Standard Library: file.bfpp
-; File operations using raw syscalls.
+; File operations using raw syscalls with #N and %N operators.
 ;
 ; Linux x86_64 syscall numbers:
 ;   SYS_read  = 0,  SYS_write = 1,  SYS_open  = 2,  SYS_close = 3
 ;
 ; The \ operator reads syscall params from tape[ptr]:
-;   tape[ptr]    = syscall number
-;   tape[ptr+8]  = arg1
-;   tape[ptr+16] = arg2
-;   tape[ptr+24] = arg3
-;   ... (6 args max, 8 bytes apart)
+;   tape[ptr]    = syscall number  (64-bit, via bfpp_get)
+;   tape[ptr+8]  = arg1            (64-bit)
+;   tape[ptr+16] = arg2            (64-bit)
+;   tape[ptr+24] = arg3            (64-bit)
+;   Each slot must have cell_width=8 for \ to read the full 64-bit value.
 ;
-; For file_close: works with 8-bit cells (fd and syscall num are small).
-; For file_open/read/write: caller must set up 64-bit cells at ptr
-; and provide pointer arguments (via T) since buffer addresses are large.
+; Key operators used:
+;   #N   — set current cell to immediate value N
+;   %8   — set cell width to 8 bytes (64-bit)
+;   %1   — set cell width back to 1 byte
+;   $    — push bfpp_get(ptr) to stack
+;   ~    — pop stack to cell via bfpp_set(ptr, val)
+;   T    — push &tape[ptr] (raw C address) onto stack
+;   \    — execute syscall from tape[ptr..ptr+48]
+;   E    — read error register into cell
+;   ?    — propagate (return) if error register is set
 
+; ═══════════════════════════════════════════════════════════════════
 ; !#fc — file_close: close a file descriptor
-; Input: tape[ptr] = fd
+; ═══════════════════════════════════════════════════════════════════
+; Input:  tape[ptr] = fd (1-byte cell)
 ; Output: error register set on failure
-; Workspace: ptr+8 must be zero.
+;
+; Usage:
+;   #5          ; fd = 5
+;   !#fc        ; close fd 5
+;   E?          ; check/propagate error
+;
+; Tape layout at syscall time (S = P+1, the clean region):
+;   S+0..S+7   = 3 (SYS_close)   [%8]
+;   S+8..S+15  = fd               [%8]
+;   S+16..S+23 = 0 (unused)       [%8]
+;   S+24..S+31 = 0 (unused)       [%8]
 !#fc{
-    ; Save fd, set up syscall at ptr
-    $                       ; push fd
-    [-]+++                  ; tape[ptr] = 3 (SYS_close)
-    >>>>>>>>[-]~<<<<<<<<    ; tape[ptr+8] = fd (arg1)
-    \                       ; execute syscall
-    [-]                     ; clear result
-    >>>>>>>>[-]<<<<<<<<     ; clear arg1
+    ; ptr=P, tape[P]=fd
+    $                           ; push fd
+    >                           ; ptr=P+1=S
+
+    ; Syscall slot 0: SYS_close=3
+    %8 #3                       ; tape[S]=3, width=8
+
+    ; Syscall slot 1: fd
+    >>>>>>>>                    ; ptr=S+8
+    %8 ~                        ; tape[S+8]=fd (popped)
+
+    ; Syscall slots 2-3: zeros (tape already 0, just set width)
+    >>>>>>>>                    ; ptr=S+16
+    %8 #0
+    >>>>>>>>                    ; ptr=S+24
+    %8 #0
+
+    ; Execute: move back to S, call syscall
+    <<<<<<<<<<<<<<<<<<<<<<<<    ; ptr=S (24 left from S+24)
+    \                           ; SYS_close, result in tape[S]
+
+    ; Clean up: restore all slots to 1-byte width, clear values
+    %1 #0                       ; S
+    >>>>>>>> %1 #0              ; S+8
+    >>>>>>>> %1 #0              ; S+16
+    >>>>>>>> %1 #0              ; S+24
+
+    ; Return to P
+    <<<<<<<<<<<<<<<<<<<<<<<<    ; ptr=S
+    <                           ; ptr=P
     ^
 }
 
+; ═══════════════════════════════════════════════════════════════════
 ; !#fo — file_open: open a file
-; This is a thin wrapper around the \ syscall operator.
-; Caller must set up syscall area with 64-bit cells:
-;   tape[ptr] = 2 (SYS_open), width 64
-;   tape[ptr+8] = absolute address of path (from T at path location)
-;   tape[ptr+16] = open flags (O_RDONLY=0, O_WRONLY|O_CREAT|O_TRUNC=577, etc.)
-;   tape[ptr+24] = mode (0644=420 for create, 0 otherwise)
-; After calling: tape[ptr] = fd (or error in error register).
+; ═══════════════════════════════════════════════════════════════════
+; Input:
+;   tape[ptr..] = null-terminated path string
+;   After the null terminator: 1 byte flags, 1 byte mode
+;   Flags: 0=O_RDONLY, 1=O_WRONLY, 2=O_RDWR
+;     For O_WRONLY|O_CREAT|O_TRUNC (577=0x241), widen the flags cell
+;     to at least 2 bytes: %2 #0x241
+;   Mode: 0 for no-create opens. For 0644=420, widen to 2 bytes.
 ;
-; Complete usage example (open "hi.txt" read-only):
-;   "hi.txt\0"              ; write path to tape starting at ptr
-;   <<<<<<                   ; back to start of path (6 chars + null = 7 bytes)
-;   T                        ; push &tape[ptr] onto stack (path address)
-;   >>>>>>>                  ; move past path to clean area
-;   %%%                      ; cycle width to 8-byte (1→2→4→8) for 64-bit syscall
-;   [-]++                    ; tape[ptr] = 2 (SYS_open)
-;   >>>>>>>>                 ; move to arg1 slot (ptr+8)
-;   %%%                      ; 8-byte width for address
-;   [-]~                     ; pop path address from stack into arg1
-;   >>>>>>>>[-]<<<<<<<<      ; arg2 (flags) = 0 (O_RDONLY)
-;   <<<<<<<<                 ; back to syscall number
-;   \                        ; execute syscall — tape[ptr] now has fd
-;   E                        ; check error register after call
+; Output: tape[ptr] = fd on success (error register set on failure)
 ;
-; NOTE: After the syscall, tape[ptr] contains the file descriptor
-; as a 64-bit value. Use E to check if bfpp_err was set.
-; To use the fd with !#fr/!#fw, copy it to the arg1 slot.
+; Usage (open "hi.txt" read-only):
+;   "hi.txt"                    ; write path at ptr (6 chars + null = 7 bytes)
+;   >#0 >#0                     ; flags=0 (RDONLY), mode=0
+;   <<<<<<<<<                   ; back to start of path (9 left)
+;   !#fo                        ; open — tape[ptr] = fd
+;   E?                          ; check error
+;
+; Stack protocol: uses 3 stack slots internally.
+;
+; Tape layout during syscall (S = first clean byte after mode):
+;   S+0..S+7   = 2 (SYS_open)    [%8]
+;   S+8..S+15  = &path            [%8]  (raw C pointer)
+;   S+16..S+23 = flags            [%8]
+;   S+24..S+31 = mode             [%8]
+;
+; Navigation back: after cleanup, scan left through non-zero path
+; bytes to return to the start. Requires tape cell before path = 0.
 !#fo{
-    ; Expects caller to set up syscall params at ptr.
-    ; Just execute the syscall.
-    \
+    ; ptr=P (first byte of path)
+    T                           ; push &tape[P] (path address) onto stack
+    [>]                         ; scan right to null terminator, ptr=null_pos
+    >                           ; ptr=null_pos+1=flags_pos
+    $                           ; push flags
+    >                           ; ptr=null_pos+2=mode_pos
+    $                           ; push mode
+    ; Stack (top→bottom): mode, flags, path_addr
+
+    >                           ; ptr=mode_pos+1=S (clean region)
+
+    ; Slot 0: SYS_open=2
+    %8 #2                       ; tape[S]=2
+
+    ; Slot 3 (arg3=mode): pop first (mode is on top)
+    >>>>>>>>>>>>>>>>>>>>>>>>    ; ptr=S+24 (24 right from S)
+    %8 ~                        ; tape[S+24]=mode
+
+    ; Slot 2 (arg2=flags): pop second
+    <<<<<<<<                    ; ptr=S+16 (8 left from S+24)
+    %8 ~                        ; tape[S+16]=flags
+
+    ; Slot 1 (arg1=path_addr): pop third
+    <<<<<<<<                    ; ptr=S+8 (8 left from S+16)
+    %8 ~                        ; tape[S+8]=path_addr
+
+    ; Execute syscall
+    <<<<<<<<                    ; ptr=S (8 left from S+8)
+    \                           ; SYS_open, result (fd) in tape[S]
+    $                           ; push fd
+
+    ; Clean up syscall frame
+    %1 #0                       ; S
+    >>>>>>>> %1 #0              ; S+8
+    >>>>>>>> %1 #0              ; S+16
+    >>>>>>>> %1 #0              ; S+24
+
+    ; Navigate back to P:
+    ; Currently at S+24. S = mode_pos+1 = null_pos+3.
+    ; S+24 - 24 = S, then -1=mode, -1=flags, -1=null_pos
+    <<<<<<<<<<<<<<<<<<<<<<<<    ; ptr=S
+    <<<                         ; ptr=null_pos (S - 3)
+    ; null_pos has value 0. Path bytes before it are non-zero.
+    ; Go one left into the path, then scan left to first 0 (before path).
+    <                           ; ptr=last char of path (non-zero)
+    [<]                         ; scan left to cell before path (value 0)
+    >                           ; ptr=P (first byte of path)
+
+    ; Write fd
+    ~                           ; tape[P]=fd (popped from stack)
     ^
 }
 
-; !#fr — file_read: read from file descriptor
-; Caller sets up syscall area:
-;   tape[ptr] = 0 (SYS_read)
-;   tape[ptr+8] = fd
-;   tape[ptr+16] = buffer address (from T)
-;   tape[ptr+24] = count
-; After: tape[ptr] = bytes read (or -1, error in register).
+; ═══════════════════════════════════════════════════════════════════
+; !#fr — file_read: read bytes from a file descriptor
+; ═══════════════════════════════════════════════════════════════════
+; Input:
+;   tape[ptr]   = fd (1-byte)
+;   tape[ptr+1] = count (1-byte, max 255)
+;   Stack: caller must push buffer address (via T) before calling
+;
+; Output: tape[ptr] = bytes_read (error register set on failure)
+;
+; Usage (read 64 bytes from fd 3 into buffer at position B):
+;   [navigate to B]
+;   T                           ; push &tape[B]
+;   [navigate to input area]
+;   #3 > #64 <                  ; tape[ptr]=3, tape[ptr+1]=64
+;   !#fr                        ; read — tape[ptr] = bytes_read
+;   E?                          ; check error
+;
+; Syscall: read(fd, buf, count) → arg1=fd, arg2=buf, arg3=count
+;
+; Tape layout during syscall (S = P+2):
+;   S+0..S+7   = 0 (SYS_read)    [%8]
+;   S+8..S+15  = fd               [%8]
+;   S+16..S+23 = buf_addr         [%8]
+;   S+24..S+31 = count            [%8]
 !#fr{
-    \
+    ; ptr=P, tape[P]=fd, tape[P+1]=count
+    ; Stack: buf_addr (from caller)
+    $                           ; push fd
+    > $                         ; push count, ptr=P+1
+    ; Stack (top→bottom): count, fd, buf_addr
+
+    >                           ; ptr=P+2=S
+
+    ; Slot 0: SYS_read=0
+    %8 #0                       ; tape[S]=0
+
+    ; Slot 3 (arg3=count): pop first
+    >>>>>>>>>>>>>>>>>>>>>>>>    ; ptr=S+24
+    %8 ~                        ; tape[S+24]=count
+
+    ; Slot 2 (arg2=buf_addr): fd is next on stack, but we need buf_addr
+    ; Stack now: fd, buf_addr
+    ; We need arg1=fd (S+8) and arg2=buf_addr (S+16)
+    ; Pop fd next → put in S+8, then pop buf_addr → S+16
+    ; Go to S+8 first
+    <<<<<<<<<<<<<<<<            ; ptr=S+8 (16 left from S+24)
+    %8 ~                        ; tape[S+8]=fd
+
+    ; Slot 2 (arg2=buf_addr): pop third
+    >>>>>>>>                    ; ptr=S+16
+    %8 ~                        ; tape[S+16]=buf_addr
+
+    ; Execute syscall
+    <<<<<<<<<<<<<<<<            ; ptr=S (16 left from S+16)
+    \                           ; SYS_read, result in tape[S]
+    $                           ; push bytes_read
+
+    ; Clean up
+    %1 #0                       ; S
+    >>>>>>>> %1 #0              ; S+8
+    >>>>>>>> %1 #0              ; S+16
+    >>>>>>>> %1 #0              ; S+24
+
+    ; Return to P
+    <<<<<<<<<<<<<<<<<<<<<<<<    ; ptr=S
+    < #0                        ; P+1: clear count residue
+    <                           ; ptr=P
+    ~                           ; tape[P]=bytes_read
     ^
 }
 
-; !#fw — file_write: write to file descriptor
-; Caller sets up syscall area:
-;   tape[ptr] = 1 (SYS_write)
-;   tape[ptr+8] = fd
-;   tape[ptr+16] = buffer address (from T)
-;   tape[ptr+24] = count
-; After: tape[ptr] = bytes written (or -1, error in register).
+; ═══════════════════════════════════════════════════════════════════
+; !#fw — file_write: write bytes to a file descriptor
+; ═══════════════════════════════════════════════════════════════════
+; Input:
+;   tape[ptr]   = fd (1-byte)
+;   tape[ptr+1] = count (1-byte, max 255)
+;   Stack: caller must push buffer address (via T) before calling
+;
+; Output: tape[ptr] = bytes_written (error register set on failure)
+;
+; Usage (write 5 bytes from buffer at B to fd 3):
+;   [navigate to B with data written]
+;   T                           ; push &tape[B]
+;   [navigate to input area]
+;   #3 > #5 <                  ; tape[ptr]=3, tape[ptr+1]=5
+;   !#fw                        ; write — tape[ptr] = bytes_written
+;   E?                          ; check error
+;
+; Syscall: write(fd, buf, count) → arg1=fd, arg2=buf, arg3=count
+;
+; Tape layout during syscall (S = P+2):
+;   S+0..S+7   = 1 (SYS_write)   [%8]
+;   S+8..S+15  = fd               [%8]
+;   S+16..S+23 = buf_addr         [%8]
+;   S+24..S+31 = count            [%8]
 !#fw{
-    \
+    ; ptr=P, tape[P]=fd, tape[P+1]=count
+    ; Stack: buf_addr (from caller)
+    $                           ; push fd
+    > $                         ; push count, ptr=P+1
+    ; Stack (top→bottom): count, fd, buf_addr
+
+    >                           ; ptr=P+2=S
+
+    ; Slot 0: SYS_write=1
+    %8 #1                       ; tape[S]=1
+
+    ; Slot 3 (arg3=count): pop first
+    >>>>>>>>>>>>>>>>>>>>>>>>    ; ptr=S+24
+    %8 ~                        ; tape[S+24]=count
+
+    ; Slot 1 (arg1=fd): pop second
+    <<<<<<<<<<<<<<<<            ; ptr=S+8 (16 left from S+24)
+    %8 ~                        ; tape[S+8]=fd
+
+    ; Slot 2 (arg2=buf_addr): pop third
+    >>>>>>>>                    ; ptr=S+16
+    %8 ~                        ; tape[S+16]=buf_addr
+
+    ; Execute syscall
+    <<<<<<<<<<<<<<<<            ; ptr=S (16 left from S+16)
+    \                           ; SYS_write, result in tape[S]
+    $                           ; push bytes_written
+
+    ; Clean up
+    %1 #0                       ; S
+    >>>>>>>> %1 #0              ; S+8
+    >>>>>>>> %1 #0              ; S+16
+    >>>>>>>> %1 #0              ; S+24
+
+    ; Return to P
+    <<<<<<<<<<<<<<<<<<<<<<<<    ; ptr=S
+    < #0                        ; P+1: clear count residue
+    <                           ; ptr=P
+    ~                           ; tape[P]=bytes_written
     ^
 }

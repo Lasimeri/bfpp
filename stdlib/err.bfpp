@@ -1,57 +1,55 @@
 ; BF++ Standard Library: err.bfpp
-; Error handling utilities.
-; Depends on: io.bfpp
+; Error handling utilities using #N and %N operators.
+!include "io.bfpp"
 
-; !#es — err_to_string: convert error code to printable string at ptr
-; Reads error register (E), prints "err:" followed by the code as a
-; decimal digit (0-9). Codes >= 10 are printed as raw byte (limitation).
-; Uses ptr..ptr+1 as workspace.
+; !#ep — panic(message_at_ptr): print message to stderr and exit
+; If ptr points to a non-zero string, prints each byte to fd 2 (stderr).
+; Then issues SYS_exit(1) via the \ syscall operator.
+; Syscall layout: tape[ptr]=syscall_nr (8-byte), tape[ptr+8]=arg1 (8-byte).
+!#ep{
+    [.{2}>]                     ; print message bytes to stderr (fd 2)
+    ; Set up SYS_exit(1) syscall
+    %8 #60                      ; tape[ptr] = 60 (SYS_exit), 8-byte cell
+    >>>>>>>>%8 #1               ; tape[ptr+8] = 1 (exit code), 8-byte cell
+    <<<<<<<<                    ; back to syscall number cell
+    \                           ; SYS_exit(1) — process terminates here
+    ^
+}
+
+; !#es — err_to_string: read error register, print "err:" prefix + code
+; Reads the error register (E), prints "err:" followed by the numeric
+; error code as decimal digit(s). Uses !#.+ (print_int) from io.bfpp.
+; Clobbers: ptr+0..ptr+8 (workspace for print_int).
 !#es{
-    E                       ; read error code into tape[ptr]
-    $                       ; push error code (save for later)
-    [-]                     ; clear cell
+    E                           ; read error code into tape[ptr]
+    $                           ; push error code to stack
+    [-]                         ; clear cell
 
     ; Print "err:" prefix
     "err:"
-    <<<<.>.>.>.             ; print e, r, r, :
-    [-][-][-][-]            ; clear the 4 string cells
+    <<<<.>.>.>.                 ; print e, r, r, :
+    [-]<[-]<[-]<[-]             ; clear the 4 string cells (walk left clearing)
 
-    ; Pop error code back
-    ~                       ; pop error code into ptr
-
-    ; Convert to ASCII digit: add 48 ('0')
-    ; Use multiplication loop: 10 * 5 = 50, then subtract 2 = 48
-    ++++++++++[>+++++<-]>--<  ; ptr+1 = 48
-    [->+<]                  ; add error code to 48 in ptr+1
-    >.[-]<[-]               ; print digit from ptr+1, clean up
+    ; Pop error code back and print as decimal
+    ~                           ; pop error code into ptr
+    !#.+                        ; print_int: decimal ASCII output
     ^
 }
 
-; !#ep — panic: print message to stderr and exit
-; If ptr points to a non-zero string, prints it to stderr (fd 2).
-; Then exits with code 1 via SYS_exit (60).
-; With default 1-byte cells: tape[ptr]=60, tape[ptr+8]=1.
-; The \ operator reads syscall args at byte offsets ptr+8, ptr+16, etc.
-; With 1-byte cells, ptr+8 bytes = 8 cells right (>>>>>>>>).
-!#ep{
-    [.{2}>]                 ; print message to stderr
-    [-]                     ; clear current cell
-    ++++++++++[>++++++<-]   ; tape[ptr+1] = 60 (10*6), ptr at ptr+0
-    >[-<+>]<                ; move 60 from ptr+1 to ptr+0
-    >>>>>>>>[-]+<<<<<<<<    ; tape[ptr+8] = 1 (exit code)
-    \                       ; SYS_exit(1) — process exits here
-    ^
-}
-
-; !#ea — assert: if tape[ptr] == 0, panic with "assertion failed"
+; !#ea — assert(condition): if tape[ptr]==0, panic with "assertion failed"
+; If tape[ptr] != 0, returns immediately (assertion passed).
+; If tape[ptr] == 0, prints "assertion failed" to stderr and exits.
 !#ea{
-    [                       ; if condition != 0 (truthy), skip
-        ^                   ; return (assertion passed)
+    [                           ; if condition != 0 (truthy)
+        [-]                     ; clear (consume condition)
+        ^                       ; return — assertion passed
     ]
-    ; Assertion failed: condition was 0
+    ; Condition was 0 — assertion failed.
     "assertion failed\n\0"
-    ; Rewind ptr to start of message
-    <<<<<<<<<<<<<<<<<
-    !#ep                    ; panic with message
+    ; String is written forward from ptr. Rewind to start of message.
+    ; "assertion failed\n\0" = 18 bytes (17 chars + null)
+    ; ptr is now past the null. Rewind 18 cells.
+    <<<<<<<<<<<<<<<<<<
+    !#ep                        ; panic — prints message and exits
     ^
 }

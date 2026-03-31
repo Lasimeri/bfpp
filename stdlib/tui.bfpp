@@ -1,238 +1,405 @@
 ; BF++ Standard Library: tui.bfpp
-; Terminal UI via ANSI escape sequences.
-; ESC = 27 = 0x1B
+; Terminal UI via ANSI escape sequences using #N numeric literals.
+;
+; Dependencies: io.bfpp (for !#.+ print_int — multi-digit number output)
+;
+; #N sets the current cell to value N. Combined with . (print),
+; ANSI escape sequences become trivial: #27 . #91 . emits ESC[
+;
+; Usage:
+;   !include "tui.bfpp"
+;   !#cl                          ; clear screen
+;   !#ch                          ; hide cursor
+;   #5 > #10 < !#cm              ; move cursor to row 5, col 10
+;   #196 > #21 < !#co            ; set fg=196 (bright red), bg=21 (blue)
+;   #1 > #1 > #40 > #10 <<< !#db ; draw 40x10 box at row 1, col 1
+;   #5 > #1 > #40 > #45 <<< !#dl ; draw 40-char line of '-' at row 5, col 1
+;   #1 > #5 > #10 > #124 <<< !#dv; draw 10-char vertical line of '|'
+;   !#cr                          ; reset colors
+;   !#cs                          ; show cursor
+;   !#kb                          ; read a keypress → tape[ptr]
 
-; !#cm — cursor_move: move cursor to (row, col)
-; tape[ptr] = row (1-9), tape[ptr+1] = col (1-9)
+!include "io.bfpp"
+
+; ==========================================================================
+; !#cm — cursor_move(row, col)
+; Input: tape[ptr]=row (1-999), tape[ptr+1]=col (1-999)
 ; Emits: ESC[{row};{col}H
-; Limitation: single-digit row/col only (1-9).
-; Uses ptr+2..ptr+3 as workspace.
+; Workspace: P+0..P+9 (print_int uses P+1..P+8 internally)
+; After: P+0 = 0
+; ==========================================================================
 !#cm{
-    ; Save row and col to stack
     $                       ; push row
     >$<                     ; push col
 
-    ; Print ESC[
-    "\x1b["
-    <<.>.[-][-]             ; print ESC, print [, clear both
+    #27 . #91 .             ; print ESC [
+    [-]                     ; clear P
 
-    ; Pop col first (LIFO), save to ptr+1
-    ~                       ; pop col into ptr
-    >[-]<                   ; clear ptr+1
-    [->+<]                  ; move col to ptr+1
-    ; Pop row
-    ~                       ; pop row into ptr
-    ; Add 48 ('0') to convert to ASCII digit
-    ++++++++++++++++++++++++++++++++++++++++++++++++
-    .                       ; print row digit
-    [-]                     ; clear
+    ; Pop col → P+9 (safe from print_int)
+    ~                       ; pop col → P
+    [->>>>>>>>>+<<<<<<<<<]  ; move P → P+9
 
-    ; Print semicolon (59)
-    +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-    .[-]
+    ; Pop row → P, print as decimal
+    ~
+    !#.+
 
-    ; Print col digit: move col from ptr+1 to ptr, add 48
-    >[-<+>]<                ; move col to ptr
-    ++++++++++++++++++++++++++++++++++++++++++++++++
-    .                       ; print col digit
-    [-]
+    ; Print ';'
+    #59 . [-]
 
-    ; Print 'H' (72)
-    ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-    .[-]
+    ; Move col from P+9 → P, print as decimal
+    >>>>>>>>>[-<<<<<<<<<+>>>>>>>>>]<<<<<<<<<
+    !#.+
+
+    ; Print 'H'
+    #72 . [-]
+
     ^
 }
 
-; !#cl — clear: clear screen
-; Emits: ESC[2J ESC[H
-!#cl{
-    "\x1b[2J\x1b[H\0"
-    <<<<<<<<<<
-    [.>]                    ; print until null
-    ^
-}
-
-; !#co — set_color: set terminal foreground/background color
-; tape[ptr] = color code (0-7 = foreground 30-37, 8-15 = background 40-47)
-; Emits: ESC[{30+code}m or ESC[{40+code-8}m
-; Uses ptr+0..ptr+1 as workspace. Uses bitwise AND (&) for bg detection.
-; Stack used to preserve code across print operations.
+; ==========================================================================
+; !#co — set_color(fg, bg) — 256-color mode
+; Input: tape[ptr]=fg (0-255), tape[ptr+1]=bg (0-255)
+; Emits: ESC[38;5;{fg}m ESC[48;5;{bg}m
+; Workspace: P+0..P+9
+; After: P+0 = 0
+; ==========================================================================
 !#co{
-    ; Push code twice (need one for tens check, one for ones digit)
-    $$                      ; stack: [code, code]. tape[ptr] still = code.
+    $                       ; push fg
+    >$<                     ; push bg
 
-    ; Print ESC[
-    [-]                     ; clear ptr+0
-    "\x1b["                 ; tape[ptr] = 0x1B, tape[ptr+1] = 0x5B. ptr now at ptr+2.
-    <<.>.[-]<[-]            ; print ESC, print [, clear ptr+1, clear ptr+0
-    ; Now at ptr+0 = 0, ptr+1 = 0.
+    ; Foreground: ESC[38;5;{fg}m
+    #27 . #91 .             ; ESC [
+    #51 . #56 .             ; 3 8
+    #59 . #53 .             ; ; 5
+    #59 . [-]               ; ;
 
-    ; --- Tens digit: '3' (fg) or '4' (bg) ---
-    ; Pop code, AND with 8 to test bit 3
-    ~                       ; pop code → tape[ptr+0]. stack: [code].
-    >[-]++++++++<           ; tape[ptr+1] = 8
-    &                       ; tape[ptr+0] = code & 8 (0 if fg, 8 if bg)
-    ; Set else-flag at ptr+1
-    >[-]+<                  ; tape[ptr+1] = 1 (else flag)
+    ~                       ; pop bg → P
+    [->>>>>>>>>+<<<<<<<<<]  ; stash bg at P+9
 
-    ; True branch: background (tape[ptr+0] = 8)
-    [                       ; if tape[ptr+0] != 0
-        [-]                 ; clear (run once)
-        >-<                 ; clear else flag (tape[ptr+1] = 0)
-        ; Print '4' (52)
-        ++++++++++++++++++++++++++++++++++++++++++++++++++++
-        .[-]
-    ]
+    ~                       ; pop fg → P
+    !#.+                    ; print fg
 
-    ; False branch: foreground (tape[ptr+0] was 0)
-    >[                      ; if tape[ptr+1] != 0 (else flag set)
-        [-]                 ; clear (run once)
-        ; Print '3' (51) from ptr+1
-        +++++++++++++++++++++++++++++++++++++++++++++++++++
-        .[-]
-    ]<                      ; back to ptr+0
+    #109 . [-]              ; print 'm'
 
-    ; --- Ones digit: (code & 7) + '0' ---
-    ; Pop code from stack
-    ~                       ; pop code → tape[ptr+0]. stack: [].
-    >[-]+++++++<            ; tape[ptr+1] = 7
-    &                       ; tape[ptr+0] = code & 7 (0-7)
-    ; Add 48 ('0') to get ASCII digit
-    ++++++++++++++++++++++++++++++++++++++++++++++++
-    .[-]                    ; print ones digit, clear
+    ; Background: ESC[48;5;{bg}m
+    #27 . #91 .             ; ESC [
+    #52 . #56 .             ; 4 8
+    #59 . #53 .             ; ; 5
+    #59 . [-]               ; ;
 
-    ; --- Print 'm' (109) ---
-    +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-    .[-]
+    >>>>>>>>>[-<<<<<<<<<+>>>>>>>>>]<<<<<<<<<  ; bg: P+9 → P
 
-    ; Clean up ptr+1
-    >[-]<
+    !#.+                    ; print bg
+
+    #109 . [-]              ; print 'm'
+
     ^
 }
 
-; !#db — draw_box: draw ASCII box at (row, col) with given width and height
-; tape[ptr]=row, [ptr+1]=col, [ptr+2]=width, [ptr+3]=height
-; Uses cursor_move and prints +, -, | characters.
+; ==========================================================================
+; !#cl — clear_screen
+; Emits: ESC[2J ESC[H
+; ==========================================================================
+!#cl{
+    #27 . #91 . #50 . #74 .    ; ESC [ 2 J
+    #27 . #91 . #72 .          ; ESC [ H
+    [-]
+    ^
+}
+
+; ==========================================================================
+; !#ch — cursor_hide
+; Emits: ESC[?25l
+; ==========================================================================
+!#ch{
+    #27 . #91 . #63 . #50 . #53 . #108 .
+    [-]
+    ^
+}
+
+; ==========================================================================
+; !#cs — cursor_show
+; Emits: ESC[?25h
+; ==========================================================================
+!#cs{
+    #27 . #91 . #63 . #50 . #53 . #104 .
+    [-]
+    ^
+}
+
+; ==========================================================================
+; !#cr — color_reset
+; Emits: ESC[0m
+; ==========================================================================
+!#cr{
+    #27 . #91 . #48 . #109 .
+    [-]
+    ^
+}
+
+; ==========================================================================
+; !#db — draw_box(row, col, w, h)
+; Input: tape[ptr]=row, [ptr+1]=col, [ptr+2]=w, [ptr+3]=h
+; Draws: + corners, - horizontal edges, | vertical edges, space interior.
+; Minimum: w=2, h=2.
 ;
-; Strategy: push width to stack before each counting loop, use the cell
-; as a decrement counter, then pop to restore. Same for height in the
-; middle-row loop. Row and col are maintained in ptr+0/ptr+1.
-; Note: !#cm uses ptr+2..ptr+3 as workspace, so params must be restored
-; from stack after each !#cm call.
+; Persistent state at P+10..P+13 (beyond !#cm/!#.+ workspace P+0..P+9):
+;   P+10 = cur_row, P+11 = col, P+12 = w, P+13 = remaining middle rows
+;
+; Non-destructive copy via double-push pattern:
+;   Go to P+N, push twice, clear, pop once to restore → second copy on stack.
+;   Navigate to target cell, pop → target gets the copy, P+N is intact.
+; ==========================================================================
 !#db{
-    ; Save all params to stack: row, col, width, height
-    $>$>$>$                 ; push row, col, width, height
-    <<<                     ; back to ptr
+    ; --- Setup: move inputs to persistent cells P+10..P+13 ---
+    ; P=row, P+1=col, P+2=w, P+3=h
 
-    ; === TOP BORDER ===
-    !#cm                    ; move cursor to (row, col)
+    ; Move row → P+10
+    [->>>>>>>>>>+<<<<<<<<<<]
+    ; Move col → P+11
+    >[->>>>>>>>>>+<<<<<<<<<<]
+    ; Move w → P+12
+    >[->>>>>>>>>>+<<<<<<<<<<]
+    ; Move h → P+13, but first subtract 2 for middle row count
+    >--[->>>>>>>>>>+<<<<<<<<<<]
+    <<<                     ; back to P
 
-    ; Print '+' (43)
-    [-]
-    +++++++++++++++++++++++++++++++++++++++++++
-    .[-]
+    ; P+10=row, P+11=col, P+12=w, P+13=h-2
 
-    ; Restore all params from stack after !#cm
-    ; Stack (top→bottom): height, width, col, row
-    >>>~<<<                 ; pop height → ptr+3
-    >>~<<                   ; pop width → ptr+2
-    >~<                     ; pop col → ptr+1
-    ~                       ; pop row → ptr+0
+    ; ================== TOP BORDER ==================
+    ; Copy P+10 (cur_row) → P via double-push
+    >>>>>>>>>>$$[-]~            ; at P+10: push twice, clear, restore
+    <<<<<<<<<<~                 ; back to P, pop → P
 
-    ; Print '-' (width-2) times
-    ; Push width to preserve it, use ptr+2 as counter
-    >>$                     ; at ptr+2, push width
-    --                      ; counter = width - 2
-    [                       ; while counter > 0
-        -
-        <<[-]               ; go to ptr, clear
-        +++++++++++++++++++++++++++++++++++++++++++++
-        .[-]                ; print '-' (45)
-        >>                  ; back to counter
+    ; Copy P+11 (col) → P+1 via double-push
+    >>>>>>>>>>>$$[-]~           ; at P+11: push twice, clear, restore
+    <<<<<<<<<<<>~<              ; back to P, pop → P+1
+    !#cm
+
+    ; Print '+' (top-left corner)
+    #43 . [-]
+
+    ; Print '-' repeated (w-2) times
+    ; Copy w from P+12 to P+1 (counter), subtract 2
+    >>>>>>>>>>>>                ; at P+12
+    $$[-]~                      ; push twice, clear, restore
+    <<<<<<<<<<<<                ; back to P
+    >~                          ; pop → P+1
+    --                          ; P+1 = w-2
+    ; Loop at P+1: print '-' from P each iteration
+    [                           ; while P+1 > 0
+        -                       ; dec counter
+        <#45 . [-]>             ; print '-' from P, back to P+1
     ]
-    ~                       ; pop original width back to ptr+2
-    <<                      ; back to ptr
+    <                           ; back to P
 
-    ; Print closing '+' (43)
-    [-]
-    +++++++++++++++++++++++++++++++++++++++++++
-    .[-]
+    ; Print '+' (top-right corner)
+    #43 . [-]
 
-    ; === MIDDLE ROWS ===
-    ; ptr+0=row, ptr+1=col, ptr+2=width, ptr+3=height
-    >>>                     ; ptr+3 (height)
-    --                      ; height -= 2 (exclude top/bottom borders)
-    [                       ; for each middle row
-        -                   ; dec height counter
-        $                   ; push remaining height
+    ; ================== MIDDLE ROWS (h-2 times) ==================
+    ; P+13 = middle row count. Loop on it.
+    ; Each iteration: increment P+10 (cur_row), position cursor, draw | spaces |
+    >>>>>>>>>>>>>               ; at P+13
+    [                           ; while middle rows remaining > 0
+        -                       ; dec counter
 
-        ; Increment row, move cursor
-        <<<                 ; ptr+0 (row)
-        +                   ; row++
-        ; !#cm trashes ptr+2, ptr+3. Save col before call, restore after.
-        ; Actually, !#cm reads ptr+0=row, ptr+1=col and uses ptr+2/3 as workspace.
-        ; We need to preserve width. Push it.
-        >>$<<               ; push width (ptr+2)
-        !#cm                ; move cursor to (row, col)
-        ; Restore width from stack
-        >>~<<               ; pop width back to ptr+2
+        ; Increment P+10 (cur_row)
+        <<<+                    ; P+10 += 1
 
-        ; Print '|' (124)
-        [-]
-        ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-        .[-]
+        ; Copy P+10 → P for !#cm (via stack)
+        $$[-]~                  ; push P+10 twice, clear, restore
+        <<<<<<<<<<              ; back to P
+        ~                       ; pop → P
 
-        ; Print (width-2) spaces
-        >>$                 ; at ptr+2, push width
-        --                  ; counter = width - 2
-        [                   ; while counter > 0
+        ; Copy P+11 → P+1 for !#cm (via stack)
+        >>>>>>>>>>>$$[-]~       ; at P+11: push twice, clear, restore
+        <<<<<<<<<<<             ; back to P
+        >~<                     ; pop → P+1
+
+        ; Call !#cm
+        !#cm
+
+        ; Print '|' (left side)
+        #124 . [-]
+
+        ; Print (w-2) spaces
+        >>>>>>>>>>>>            ; at P+12
+        $$[-]~                  ; copy w via stack
+        <<<<<<<<<<<<            ; back to P
+        >~                      ; pop w → P+1
+        --                      ; P+1 = w-2
+        [                       ; while counter > 0
             -
-            <<[-]           ; go to ptr, clear
-            ++++++++++++++++++++++++++++++++
-            .[-]            ; print ' ' (32)
-            >>              ; back to counter
+            <#32 . [-]>         ; print space from P, back to counter
         ]
-        ~                   ; pop original width back to ptr+2
-        <<                  ; back to ptr
+        <                       ; back to P
 
-        ; Print '|' (124)
-        [-]
-        ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-        .[-]
+        ; Print '|' (right side)
+        #124 . [-]
 
-        ; Restore height counter from stack
-        >>>~                ; at ptr+3, pop height counter
+        ; Go back to P+13 (loop counter)
+        >>>>>>>>>>>>>
     ]
-    <<<                     ; back to ptr
+    <<<<<<<<<<<<<               ; back to P
 
-    ; === BOTTOM BORDER ===
-    +                       ; row++
-    >>$<<                   ; push width (preserve across !#cm)
-    !#cm                    ; move cursor to (row, col)
-    >>~<<                   ; pop width back to ptr+2
+    ; ================== BOTTOM BORDER ==================
+    ; Increment P+10 (cur_row) for bottom row
+    >>>>>>>>>>+                 ; P+10 += 1
 
-    ; Print '+' (43)
-    [-]
-    +++++++++++++++++++++++++++++++++++++++++++
-    .[-]
+    ; Copy P+10 → P
+    $$[-]~                      ; push twice, clear, restore
+    <<<<<<<<<<                  ; back to P
+    ~                           ; pop → P
 
-    ; Print '-' (width-2) times
-    >>$                     ; at ptr+2, push width
-    --                      ; counter = width - 2
-    [                       ; while counter > 0
+    ; Copy P+11 → P+1
+    >>>>>>>>>>>$$[-]~           ; at P+11: push twice, clear, restore
+    <<<<<<<<<<<                 ; back to P
+    >~<                         ; pop → P+1
+
+    !#cm
+
+    ; Print '+' (bottom-left corner)
+    #43 . [-]
+
+    ; Print '-' repeated (w-2) times
+    >>>>>>>>>>>>                ; at P+12
+    $$[-]~                      ; copy w via stack
+    <<<<<<<<<<<<                ; back to P
+    >~                          ; pop → P+1
+    --                          ; P+1 = w-2
+    [
         -
-        <<[-]               ; go to ptr, clear
-        +++++++++++++++++++++++++++++++++++++++++++++
-        .[-]                ; print '-' (45)
-        >>                  ; back to counter
+        <#45 . [-]>            ; print '-'
     ]
-    ~                       ; pop original width back to ptr+2
-    <<                      ; back to ptr
+    <                           ; back to P
 
-    ; Print closing '+' (43)
-    [-]
-    +++++++++++++++++++++++++++++++++++++++++++
-    .[-]
+    ; Print '+' (bottom-right corner)
+    #43 . [-]
 
+    ; Cleanup: clear P+10..P+13
+    >>>>>>>>>>[-]>[-]>[-]>[-]<<<<<<<<<<<<<
+
+    ^
+}
+
+; ==========================================================================
+; !#dl — draw_hline(row, col, len, char)
+; Input: tape[ptr]=row, [ptr+1]=col, [ptr+2]=len, [ptr+3]=char
+; Draws a horizontal line of `char` repeated `len` times at (row, col).
+; Saves len and char to stack before !#cm call, pops after.
+; ==========================================================================
+!#dl{
+    ; Save len and char to stack (survive !#cm clobber)
+    >>$                     ; push len (P+2)
+    >$                      ; push char (P+3)
+    <<<                     ; back to P
+
+    ; P=row, P+1=col. Call !#cm.
+    !#cm                    ; clobbers P+0..P+9
+
+    ; Pop char → P+1 (we'll use it as the print value)
+    ; Pop len → P+2 (counter)
+    ~                       ; pop char → P
+    [->+<]                  ; move char → P+1
+    ~                       ; pop len → P
+    [->>+<<]                ; move len → P+2
+
+    ; Loop: print char, len times
+    ; Counter at P+2, char template at P+1
+    >>                      ; at P+2 (counter)
+    [                       ; while counter > 0
+        -                   ; dec counter
+        ; Copy P+1 to P (via stack since P+1 must be preserved)
+        <$$[-]~             ; at P+1: push twice, clear, restore
+        <~.[-]              ; at P: pop char copy, print, clear
+        >>                  ; back to P+2
+    ]
+    ; Clean up P+1
+    <[-]<                   ; clear P+1, back to P
+
+    ^
+}
+
+; ==========================================================================
+; !#dv — draw_vline(row, col, len, char)
+; Input: tape[ptr]=row, [ptr+1]=col, [ptr+2]=len, [ptr+3]=char
+; Draws a vertical line: at each row from row to row+len-1, positions
+; cursor at (r, col) and prints char.
+;
+; Persistent state at P+10..P+13 (safe from !#cm):
+;   P+10 = cur_row, P+11 = col, P+12 = char, P+13 = remaining count
+; ==========================================================================
+!#dv{
+    ; Move inputs to persistent cells
+    [->>>>>>>>>>+<<<<<<<<<<]        ; row → P+10
+    >[->>>>>>>>>>+<<<<<<<<<<]       ; col → P+11
+    >[->>>>>>>>>>+<<<<<<<<<<]       ; len → P+12
+    >[->>>>>>>>>>+<<<<<<<<<<]       ; char → P+13
+    <<<                             ; back to P
+
+    ; Swap: we want P+10=cur_row, P+11=col, P+12=char, P+13=remaining
+    ; Currently: P+10=row, P+11=col, P+12=len, P+13=char
+    ; Need to swap P+12 and P+13:
+    >>>>>>>>>>>>                    ; at P+12
+    [->>+<<]                        ; P+12 → P+14 (temp)
+    >[-<+>]                         ; P+13 → P+12
+    >[-<<+>>]                       ; P+14 → P+13
+    <<<<<<<<<<<<<<                  ; back to P
+
+    ; Now: P+10=cur_row, P+11=col, P+12=char, P+13=remaining
+
+    ; Loop: while remaining > 0
+    >>>>>>>>>>>>>                   ; at P+13
+    [
+        -                           ; dec remaining
+
+        ; Copy cur_row (P+10) → P via stack
+        <<<$$[-]~                   ; at P+10: push twice, clear, restore
+        <<<<<<<<<<~                 ; back to P, pop → P
+
+        ; Copy col (P+11) → P+1 via stack
+        >>>>>>>>>>>$$[-]~           ; at P+11: push twice, clear, restore
+        <<<<<<<<<<<>~<              ; back to P, pop → P+1
+
+        ; Call !#cm
+        !#cm
+
+        ; Print char: copy P+12 → P via stack
+        >>>>>>>>>>>>$$[-]~          ; at P+12: push twice, clear, restore
+        <<<<<<<<<<<<~               ; back to P, pop → P
+        .[-]                        ; print char, clear
+
+        ; Increment cur_row
+        >>>>>>>>>>+                 ; P+10 += 1
+
+        ; Go to loop counter (P+13)
+        >>>
+    ]
+    <<<<<<<<<<<<<                   ; back to P
+
+    ; Cleanup P+10..P+14
+    >>>>>>>>>>[-]>[-]>[-]>[-]>[-]<<<<<<<<<<<<<<<
+
+    ^
+}
+
+; ==========================================================================
+; !#kb — read_key: read a single keypress
+; Input: none
+; Output: tape[ptr] = character code of key pressed
+;
+; LIMITATION: This performs a simple stdin read via BF's , operator.
+; The terminal must be in raw/cbreak mode for single-keypress behavior.
+; In cooked mode (default), input is line-buffered — the user must press
+; Enter. True raw mode requires tcgetattr/tcsetattr syscalls or
+; `stty raw -echo` before execution.
+;
+; For arrow keys and special keys, the terminal sends multi-byte escape
+; sequences (ESC [ A/B/C/D etc). This function reads only the first byte.
+; A full key decoder would need to detect ESC and read subsequent bytes.
+; ==========================================================================
+!#kb{
+    [-]                     ; clear current cell
+    ,                       ; read one byte from stdin
     ^
 }

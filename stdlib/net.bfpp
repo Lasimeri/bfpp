@@ -1,80 +1,458 @@
 ; BF++ Standard Library: net.bfpp
-; TCP networking using raw syscalls.
+; TCP networking via raw Linux x86_64 syscalls.
 ;
-; Linux x86_64 syscall numbers:
-;   SYS_socket  = 41,  SYS_connect = 42,  SYS_accept  = 43
-;   SYS_bind    = 49,  SYS_listen  = 50
-;   SYS_read    = 0,   SYS_write   = 1,   SYS_close   = 3
+; ── Operator Reference ─────────────────────────────────────────
+;   #N  set current cell to value N
+;   %8  set cell width to 64-bit at current ptr
+;   %1  set cell width to 8-bit at current ptr
+;   $   push tape[ptr] to stack
+;   ~   pop stack into tape[ptr]
+;   T   push &tape[ptr] (C pointer) to stack
+;   \   execute syscall from tape layout
+;   E   read bfpp_err register into tape[ptr]
+;   ?   propagate error (early return)
+;   ^   return from macro
 ;
-; Constants:
-;   AF_INET = 2,  SOCK_STREAM = 1
+; ── Syscall ABI ────────────────────────────────────────────────
+;   The \ operator reads 64-bit values at byte offsets:
+;     tape[ptr+0]  = syscall number
+;     tape[ptr+8]  = arg1
+;     tape[ptr+16] = arg2
+;     tape[ptr+24] = arg3
+;   Result written to tape[ptr]. Errno mapped to bfpp_err.
 ;
-; All network ops require the caller to set up 64-bit syscall params
-; at ptr (or the syscall region at 0x8000). The \ operator reads:
-;   tape[ptr] = syscall_num, tape[ptr+8] = arg1, etc.
+;   Navigation: > moves ptr by 1 byte always.
+;   With %8 cells, next 64-bit slot = 8 >s (>>>>>>>>).
 ;
-; Addresses (sockaddr_in) require 16 bytes:
-;   [family:2, port:2(BE), addr:4, zero:8]
-; Caller must construct sockaddr_in in the I/O buffer region (0x8100+)
-; and pass its address (via T) as the sockaddr argument.
+; ── Linux x86_64 Constants ─────────────────────────────────────
+;   SYS_read=0  SYS_write=1  SYS_close=3
+;   SYS_socket=41  SYS_connect=42  SYS_accept=43
+;   SYS_bind=49  SYS_listen=50
+;   AF_INET=2  SOCK_STREAM=1
+;
+; ── sockaddr_in (16 bytes) ─────────────────────────────────────
+;   [0-1]  sin_family: 0x02, 0x00  (AF_INET=2, little-endian)
+;   [2-3]  sin_port:   port_hi, port_lo  (big-endian)
+;   [4-7]  sin_addr:   A, B, C, D  (network byte order)
+;   [8-15] sin_zero:   all zeros
+;
+; ═══════════════════════════════════════════════════════════════
+; USAGE EXAMPLE — HTTP GET to 93.184.216.34:80
+; ═══════════════════════════════════════════════════════════════
+;
+;   !include "net.bfpp"
+;
+;   ; 1) Create socket (ptr at clean 32-byte region)
+;   !#tcp                     ; tape[ptr] = fd (%8 cell)
+;   $                         ; push fd to stack
+;
+;   ; 2) Set up connect input at a clean area (+32 bytes)
+;   >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+;   %1                        ; byte cells for tc input
+;   ~                         ; pop fd → P+0
+;   > #93 > #184 > #216 > #34  ; IP octets P+1..P+4
+;   > #0 > #80                ; port 80 = (0 << 8) | 80
+;   <<<<<<                    ; back to P+0
+;   $                         ; save fd copy before connect clobbers it
+;   !#tc                      ; connect(fd, 93.184.216.34:80)
+;   ?                         ; propagate error if failed
+;
+;   ; 3) Send request — move to buffer area, write string, get addr
+;   >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+;   "GET / HTTP/1.0\r\nHost: example.com\r\n\r\n"
+;   ; (38 bytes written, ptr now past string)
+;   ; Back up to start of string:
+;   <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+;   T                         ; push &buffer to stack
+;   ; Move to clean area for !#ts input
+;   >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+;   %8 ~                      ; P+0 = fd (pop saved copy)
+;   >>>>>>>> %8 #38           ; P+8 = byte count
+;   <<<<<<<<                  ; back to P+0
+;   !#ts                      ; write(fd, &buffer, 38)
+;   ?                         ; check error
+;
+;   ; 4) Receive response
+;   >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>  ; clean area for recv buffer
+;   T                         ; push &recv_buffer
+;   >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> ; another clean area for !#tr input
+;   %8 ~                      ; P+0 = fd (need fd on stack again beforehand)
+;   >>>>>>>> %8 #1024         ; P+8 = max bytes to read
+;   <<<<<<<<
+;   !#tr                      ; read(fd, &recv_buffer, 1024)
+;
+; ═══════════════════════════════════════════════════════════════
 
-; !#tcp — tcp_connect: create TCP socket
-; This is a thin wrapper — just executes the socket() syscall.
-; Caller must set up the syscall area at ptr before calling:
-;   tape[ptr]    = 41 (SYS_socket)
-;   tape[ptr+8]  = 2  (AF_INET)
-;   tape[ptr+16] = 1  (SOCK_STREAM)
-;   tape[ptr+24] = 0  (protocol)
-; After: tape[ptr] = socket fd (or -1, error in register)
+
+; ───────────────────────────────────────────────────────────────
+; !#tcp — tcp_socket() → fd
+; ───────────────────────────────────────────────────────────────
+; Input:  none. ptr at clean 32-byte area.
+; Output: tape[ptr] = fd (%8 cell). bfpp_err on failure.
+; Clobbers: P+0..P+31.
 ;
-; Complete TCP client example (two-step):
-;   ; Step 1: Create socket
-;   %%%                     ; 8-byte cells for 64-bit syscall args
-;   [-]++++++++++[>++++<-]>+  ; tape[ptr] = 41 (SYS_socket)
-;   >>>>>>>>[-]++<<<<<<<<   ; tape[ptr+8] = 2 (AF_INET)
-;   >>>>>>>>>>>>>>>>[-]+<<<<<<<<<<<<<<<<  ; tape[ptr+16] = 1 (SOCK_STREAM)
-;   \                       ; syscall → fd in tape[ptr]
-;   ; Step 2: Connect (set up new syscall with fd, sockaddr, etc.)
-;   ; ... caller manages the connect syscall setup
-;
-; NOTE: For connect(), caller must construct a sockaddr_in struct
-; (16 bytes: family=2, port in big-endian, addr, zeros) at a known
-; tape address and pass its pointer via T.
+; Tape (P = ptr at entry):
+;   P+0:  41 → fd      P+8:  2 → 0
+;   P+16: 1  → 0       P+24: 0 → 0
 !#tcp{
-    \                       ; execute pre-configured socket syscall
+    %8 #41                          ; P+0  = SYS_socket
+    >>>>>>>> %8 #2                  ; P+8  = AF_INET
+    >>>>>>>> %8 #1                  ; P+16 = SOCK_STREAM
+    >>>>>>>> %8 #0                  ; P+24 = protocol
+    <<<<<<<<<<<<<<<<<<<<<<<<        ; ptr = P+0
+    \                               ; syscall → fd at tape[P]
+    >>>>>>>> %8 #0                  ; clear P+8
+    >>>>>>>> %8 #0                  ; clear P+16
+    >>>>>>>> %8 #0                  ; clear P+24
+    <<<<<<<<<<<<<<<<<<<<<<<<        ; ptr = P+0, tape[P] = fd
     ^
 }
 
-; !#tl — tcp_listen: create server socket (socket + bind + listen)
-; Caller sets up three syscalls in sequence.
-; This is a convenience wrapper for the socket creation step.
+
+; ───────────────────────────────────────────────────────────────
+; !#tc — tcp_connect(fd, IP, port)
+; ───────────────────────────────────────────────────────────────
+; Input (%1 cells):
+;   P+0: fd       P+1: IP_A    P+2: IP_B    P+3: IP_C
+;   P+4: IP_D     P+5: port_hi P+6: port_lo
+; Output: bfpp_err = 0 on success. Clobbers P+0..P+55.
+;
+; Internal tape map:
+;   P+0..6:   input (destroyed by moves)
+;   P+7:      scratch
+;   P+8..23:  sockaddr_in (16 bytes)
+;   P+24..55: syscall area (4 x 64-bit)
+;
+; Stack plan:
+;   Push fd ($) at entry.
+;   Push &sockaddr (T at P+8) after constructing it.
+;   Stack = [fd, &sa] (top = &sa).
+;   Pop order for syscall: &sa first → P+40 (arg2), fd second → P+32 (arg1).
+;   Fill: P+24=#42, P+40=pop(&sa), P+32=pop(fd), P+48=#16.
+;   Navigate: P+24 →(+16)→ P+40 →(-8)→ P+32 →(+16)→ P+48 →(-24)→ P+24.
+!#tc{
+    ; --- Save fd ---
+    $                                       ; push fd. Stack: [fd]
+
+    ; --- Move input bytes into sockaddr_in ---
+    ; port_hi: P+5 → P+10 (delta +5)
+    >>>>> [->>>>>+<<<<<] <<<<<              ; ptr = P+0
+
+    ; port_lo: P+6 → P+11 (delta +5)
+    >>>>>> [->>>>>+<<<<<] <<<<<<            ; ptr = P+0
+
+    ; IP_A: P+1 → P+12 (delta +11)
+    > [->>>>>>>>>>>+<<<<<<<<<<<] <          ; ptr = P+0
+
+    ; IP_B: P+2 → P+13 (delta +11)
+    >> [->>>>>>>>>>>+<<<<<<<<<<<] <<        ; ptr = P+0
+
+    ; IP_C: P+3 → P+14 (delta +11)
+    >>> [->>>>>>>>>>>+<<<<<<<<<<<] <<<      ; ptr = P+0
+
+    ; IP_D: P+4 → P+15 (delta +11)
+    >>>> [->>>>>>>>>>>+<<<<<<<<<<<] <<<<    ; ptr = P+0
+
+    ; --- Set sockaddr_in header ---
+    >>>>>>>> %1 #2                          ; P+8 = AF_INET (0x02)
+    ; P+9 = 0x00 (already zero, high byte of AF_INET)
+    ; P+10 = port_hi, P+11 = port_lo  (moved above)
+    ; P+12..15 = IP_A..D              (moved above)
+    ; P+16..23 = 0                    (zero padding, clean area)
+
+    ; --- Push sockaddr address ---
+    T                                       ; push &tape[P+8]. Stack: [fd, &sa]
+    <<<<<<<<                                ; ptr = P+0
+
+    ; --- Build syscall at P+24..P+55 ---
+    ; Navigate to P+24 (24 bytes from P+0)
+    >>>>>>>>>>>>>>>>>>>>>>>> %8 #42         ; P+24 = SYS_connect (42)
+
+    ; P+24 → P+40 (+16 bytes)
+    >>>>>>>>>>>>>>>> %8 ~                   ; P+40 = pop &sa
+
+    ; P+40 → P+32 (-8 bytes)
+    <<<<<<<< %8 ~                           ; P+32 = pop fd
+
+    ; P+32 → P+48 (+16 bytes)
+    >>>>>>>>>>>>>>>> %8 #16                 ; P+48 = addrlen (16)
+
+    ; P+48 → P+24 (-24 bytes)
+    <<<<<<<<<<<<<<<<<<<<<<<<                ; ptr = P+24
+
+    ; --- Execute ---
+    \                                       ; connect(fd, &sa, 16)
+
+    ; --- Cleanup ---
+    %8 #0                                   ; clear P+24
+    >>>>>>>> %8 #0                          ; clear P+32
+    >>>>>>>> %8 #0                          ; clear P+40
+    >>>>>>>> %8 #0                          ; clear P+48
+    <<<<<<<<<<<<<<<<<<<<<<<<                ; ptr = P+24
+    <<<<<<<<<<<<<<<<<<<<<<<<                ; ptr = P+0
+    %1                                      ; restore byte-width cells
+    ^
+}
+
+
+; ───────────────────────────────────────────────────────────────
+; !#tl — tcp_listen(port) → server_fd
+; ───────────────────────────────────────────────────────────────
+; Input (%1 cells):
+;   P+0: port_hi    P+1: port_lo
+; Output: tape[P+0] = server_fd (%8 cell). bfpp_err on failure.
+; Clobbers: P+0..P+55.
+;
+; Executes 3 syscalls:
+;   1. socket(AF_INET, SOCK_STREAM, 0) → fd
+;   2. bind(fd, &sockaddr_in{0.0.0.0:port}, 16)
+;   3. listen(fd, 5)
+;
+; Internal tape map:
+;   P+0..1:   input port (saved to stack, then cleared)
+;   P+2..7:   scratch
+;   P+8..23:  sockaddr_in (for bind)
+;   P+24..55: syscall area (reused 3 times)
+;
+; Stack sequence:
+;   1. Push port_hi, port_lo from input.
+;   2. socket() at P+24 → push fd.
+;      Stack: [port_hi, port_lo, fd]
+;   3. Pop fd → P+7 (scratch). Pop port_lo → P+11. Pop port_hi → P+10.
+;      Build sockaddr at P+8. T at P+8 → push &sa.
+;      Push fd from P+7. Stack: [&sa, fd]
+;   4. bind(): P+24=#49, P+32=pop(fd), P+40=pop(&sa), P+48=#16. \
+;      fd preserved at P+32 after syscall.
+;   5. listen(): P+24=#50, P+32=fd (kept), P+40=#5, P+48=#0. \
+;   6. Return: push fd from P+32, navigate to P+0, %8, pop fd.
 !#tl{
-    ; Create socket
-    \                       ; syscall(41, AF_INET, SOCK_STREAM, 0) → fd
+    ; --- Save input to stack ---
+    $                                       ; push port_hi. Stack: [ph]
+    > $                                     ; push port_lo. Stack: [ph, pl]
+    <                                       ; ptr = P+0
+
+    ; ═══ SYSCALL 1: socket() ═══
+    >>>>>>>>>>>>>>>>>>>>>>>> %8 #41         ; P+24 = SYS_socket
+    >>>>>>>> %8 #2                          ; P+32 = AF_INET
+    >>>>>>>> %8 #1                          ; P+40 = SOCK_STREAM
+    >>>>>>>> %8 #0                          ; P+48 = 0
+    <<<<<<<<<<<<<<<<<<<<<<<<                ; ptr = P+24
+    \                                       ; → fd at P+24
+    ?                                       ; bail on error
+    $                                       ; push fd. Stack: [ph, pl, fd]
+    ; Clear args (fd saved on stack)
+    %8 #0                                   ; clear P+24
+    >>>>>>>> %8 #0                          ; clear P+32
+    >>>>>>>> %8 #0                          ; clear P+40
+    >>>>>>>> %8 #0                          ; clear P+48
+    <<<<<<<<<<<<<<<<<<<<<<<<                ; ptr = P+24
+    <<<<<<<<<<<<<<<<<<<<<<<<                ; ptr = P+0
+
+    ; ═══ Build sockaddr_in at P+8 ═══
+    ; Pop stack: [ph, pl, fd]. Pop order: fd, pl, ph.
+    ; Pop fd → scratch at P+7
+    >>>>>>> %1 ~                            ; P+7 = fd. Stack: [ph, pl]
+    ; Pop port_lo → P+11
+    >>>> ~                                  ; P+11 = port_lo. Stack: [ph]
+    ; Pop port_hi → P+10
+    < ~                                     ; P+10 = port_hi. Stack: []
+    ; Set AF_INET at P+8
+    << %1 #2                                ; P+8 = 0x02
+    ; P+9 = 0 (zero, high byte AF_INET)
+    ; P+10 = port_hi, P+11 = port_lo (just popped)
+    ; P+12..P+15 = 0 (0.0.0.0 — bind to all interfaces)
+    ; P+16..P+23 = 0 (sin_zero padding)
+    ; sockaddr complete.
+
+    ; Push &sockaddr
+    T                                       ; push &tape[P+8]. Stack: [&sa]
+
+    ; Push fd from P+7 scratch
+    < %1 $                                  ; ptr = P+7, push fd. Stack: [&sa, fd]
+
+    ; Go back to P+0
+    <<<<<<<                                 ; ptr = P+0
+
+    ; ═══ SYSCALL 2: bind(fd, &sa, 16) ═══
+    >>>>>>>>>>>>>>>>>>>>>>>> %8 #49         ; P+24 = SYS_bind
+    >>>>>>>> %8 ~                           ; P+32 = pop fd. Stack: [&sa]
+    >>>>>>>> %8 ~                           ; P+40 = pop &sa. Stack: []
+    >>>>>>>> %8 #16                         ; P+48 = addrlen
+    <<<<<<<<<<<<<<<<<<<<<<<<                ; ptr = P+24
+    \                                       ; bind(fd, &sa, 16)
+    ?                                       ; bail on error
+
+    ; fd is still at P+32 (syscall doesn't clobber arg cells)
+
+    ; ═══ SYSCALL 3: listen(fd, 5) ═══
+    ; P+32 still has fd. Set other slots.
+    %8 #50                                  ; P+24 = SYS_listen
+    >>>>>>>>>>>>>>>> %8 #5                  ; P+40 = backlog (5)
+    >>>>>>>> %8 #0                          ; P+48 = 0 (unused)
+    <<<<<<<<<<<<<<<<<<<<<<<<                ; ptr = P+24
+    \                                       ; listen(fd, 5)
+    ?                                       ; bail on error
+
+    ; --- Return fd ---
+    ; fd is at P+32. Push it, go to P+0, pop.
+    >>>>>>>> $                              ; push fd from P+32. Stack: [fd]
+    <<<<<<<<                                ; ptr = P+24
+
+    ; Clean up syscall area
+    %8 #0                                   ; clear P+24
+    >>>>>>>> %8 #0                          ; clear P+32
+    >>>>>>>> %8 #0                          ; clear P+40
+    >>>>>>>> %8 #0                          ; clear P+48
+    <<<<<<<<<<<<<<<<<<<<<<<<                ; ptr = P+24
+    <<<<<<<<<<<<<<<<<<<<<<<<                ; ptr = P+0
+
+    ; Pop fd into P+0 as 64-bit cell
+    %8 ~                                    ; tape[P+0] = fd (64-bit)
     ^
 }
 
-; !#ta — tcp_accept: accept incoming connection
-; Caller sets up: tape[ptr]=43(SYS_accept), tape[ptr+8]=server_fd,
-;                 tape[ptr+16]=0(NULL), tape[ptr+24]=0(NULL)
-; Returns: tape[ptr] = client fd
+
+; ───────────────────────────────────────────────────────────────
+; !#ta — tcp_accept(server_fd) → client_fd
+; ───────────────────────────────────────────────────────────────
+; Input:  tape[ptr] = server_fd (%8 cell, 64-bit)
+; Output: tape[ptr] = client_fd (%8 cell). bfpp_err on failure.
+; Clobbers: P+0..P+31.
+;
+; Syscall: accept(server_fd, NULL, NULL)
+;   P+0:  43 → client_fd
+;   P+8:  server_fd → 0
+;   P+16: 0 (NULL)   → 0
+;   P+24: 0 (NULL)   → 0
+;
+; Stack plan:
+;   Push server_fd, set P+0=#43, pop fd→P+8, set P+16=#0, P+24=#0.
 !#ta{
-    \
+    $                                       ; push server_fd. Stack: [fd]
+    %8 #43                                  ; P+0 = SYS_accept
+    >>>>>>>> %8 ~                           ; P+8 = pop server_fd
+    >>>>>>>> %8 #0                          ; P+16 = NULL
+    >>>>>>>> %8 #0                          ; P+24 = NULL
+    <<<<<<<<<<<<<<<<<<<<<<<<                ; ptr = P+0
+    \                                       ; accept() → client_fd at P+0
+    >>>>>>>> %8 #0                          ; clear P+8
+    >>>>>>>> %8 #0                          ; clear P+16
+    >>>>>>>> %8 #0                          ; clear P+24
+    <<<<<<<<<<<<<<<<<<<<<<<<                ; ptr = P+0
+    ; tape[P+0] = client_fd
     ^
 }
 
-; !#ts — tcp_send: send data on socket (uses SYS_write=1)
-; Caller sets up: tape[ptr]=1, tape[ptr+8]=fd, tape[ptr+16]=buf_addr, tape[ptr+24]=count
-; Returns: tape[ptr] = bytes sent
+
+; ───────────────────────────────────────────────────────────────
+; !#ts — tcp_send(fd, count) with buffer address on stack
+; ───────────────────────────────────────────────────────────────
+; Input (%8 cells):
+;   tape[ptr+0] = fd       (socket file descriptor)
+;   tape[ptr+8] = count    (bytes to send)
+;   Stack: caller must push buffer address via T before calling.
+;
+; Output: tape[ptr] = bytes written. bfpp_err on failure.
+; Clobbers: P+0..P+31.
+;
+; Caller pattern:
+;   ; ... ptr at start of data buffer ...
+;   T                         ; push &buffer to stack
+;   ; ... navigate to clean %8 area ...
+;   %8 #<fd_value>            ; P+0 = fd  (or pop from stack)
+;   >>>>>>>> %8 #<count>      ; P+8 = byte count
+;   <<<<<<<<                  ; ptr = P+0
+;   !#ts                      ; send data
+;
+; Syscall: write(fd, buf_addr, count)
+;   P+0:  1 → bytes_written
+;   P+8:  fd
+;   P+16: buf_addr
+;   P+24: count
+;
+; Stack at entry: [..., buf_addr] (buf_addr on top)
+; Push plan: push fd($), push count(go P+8, $).
+;   Stack: [buf_addr, fd, count] (top = count)
+;   Pop order: count→P+24, fd→P+8, buf_addr→P+16.
+;   Fill: P+0=#1, →P+24 pop, →P+8 pop, →P+16 pop, →P+0, \.
 !#ts{
-    \
+    ; ptr = P+0 (%8 cells)
+    $                                       ; push fd. Stack: [&buf, fd]
+    >>>>>>>> $                              ; push count from P+8. Stack: [&buf, fd, count]
+    <<<<<<<<                                ; ptr = P+0
+
+    %8 #1                                   ; P+0 = SYS_write
+    ; → P+24 (+24 bytes from P+0)
+    >>>>>>>>>>>>>>>>>>>>>>>> %8 ~           ; P+24 = pop count
+    ; P+24 → P+8 = back 16 bytes
+    <<<<<<<<<<<<<<<< %8 ~                   ; P+8 = pop fd
+    ; P+8 → P+16 = forward 8 bytes
+    >>>>>>>> %8 ~                           ; P+16 = pop &buf
+    ; P+16 → P+0 = back 16 bytes
+    <<<<<<<<<<<<<<<<                        ; ptr = P+0
+
+    \                                       ; write(fd, &buf, count)
+    ; tape[P] = bytes written (or -1)
+
+    >>>>>>>> %8 #0                          ; clear P+8
+    >>>>>>>> %8 #0                          ; clear P+16
+    >>>>>>>> %8 #0                          ; clear P+24
+    <<<<<<<<<<<<<<<<<<<<<<<<                ; ptr = P+0
     ^
 }
 
-; !#tr — tcp_recv: receive data from socket (uses SYS_read=0)
-; Caller sets up: tape[ptr]=0, tape[ptr+8]=fd, tape[ptr+16]=buf_addr, tape[ptr+24]=max_count
-; Returns: tape[ptr] = bytes received
+
+; ───────────────────────────────────────────────────────────────
+; !#tr — tcp_recv(fd, count) with buffer address on stack
+; ───────────────────────────────────────────────────────────────
+; Input (%8 cells):
+;   tape[ptr+0] = fd       (socket file descriptor)
+;   tape[ptr+8] = count    (max bytes to read)
+;   Stack: caller must push buffer address via T before calling.
+;
+; Output: tape[ptr] = bytes read. bfpp_err on failure.
+; Clobbers: P+0..P+31.
+;
+; Caller pattern:
+;   ; ... ptr at recv buffer area ...
+;   T                         ; push &recv_buffer
+;   ; ... navigate to clean %8 area ...
+;   %8 #<fd_value>            ; P+0 = fd
+;   >>>>>>>> %8 #<max_count>  ; P+8 = max bytes
+;   <<<<<<<<                  ; ptr = P+0
+;   !#tr                      ; recv data
+;
+; Syscall: read(fd, buf_addr, count)
+;   P+0:  0 → bytes_read
+;   P+8:  fd
+;   P+16: buf_addr
+;   P+24: count
+;
+; Identical to !#ts except P+0 = SYS_read (0) instead of SYS_write (1).
+; Stack: [&buf, fd, count] after internal pushes.
+; Pop: count→P+24, fd→P+8, &buf→P+16.
 !#tr{
-    \
+    ; ptr = P+0 (%8 cells)
+    $                                       ; push fd. Stack: [&buf, fd]
+    >>>>>>>> $                              ; push count from P+8. Stack: [&buf, fd, count]
+    <<<<<<<<                                ; ptr = P+0
+
+    %8 #0                                   ; P+0 = SYS_read
+    ; → P+24 (+24 bytes)
+    >>>>>>>>>>>>>>>>>>>>>>>> %8 ~           ; P+24 = pop count
+    ; → P+8 (-16 bytes)
+    <<<<<<<<<<<<<<<< %8 ~                   ; P+8 = pop fd
+    ; → P+16 (+8 bytes)
+    >>>>>>>> %8 ~                           ; P+16 = pop &buf
+    ; → P+0 (-16 bytes)
+    <<<<<<<<<<<<<<<<                        ; ptr = P+0
+
+    \                                       ; read(fd, &buf, count)
+    ; tape[P] = bytes read (or -1)
+
+    >>>>>>>> %8 #0                          ; clear P+8
+    >>>>>>>> %8 #0                          ; clear P+16
+    >>>>>>>> %8 #0                          ; clear P+24
+    <<<<<<<<<<<<<<<<<<<<<<<<                ; ptr = P+0
     ^
 }
