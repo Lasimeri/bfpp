@@ -238,6 +238,14 @@ fn parse_single(tokens: &[Token], pos: &mut usize) -> Result<AstNode, ParseError
         Token::TapeAddr => Ok(AstNode::TapeAddr),
         Token::FramebufferFlush => Ok(AstNode::FramebufferFlush),
 
+        // ── Dual-tape (multicore) ───────────────────────────────────
+        Token::ReadTape => Ok(AstNode::ReadTape),
+        Token::ReadPtrRight => Ok(AstNode::ReadPtrRight),
+        Token::ReadPtrLeft => Ok(AstNode::ReadPtrLeft),
+        Token::Transfer => Ok(AstNode::Transfer),
+        Token::SwapTapes => Ok(AstNode::SwapTapes),
+        Token::SyncPtrs => Ok(AstNode::SyncPtrs),
+
         // ── Immediate value & direct width ─────────────────────────
         Token::NumericLit(val) => Ok(AstNode::SetValue(*val)),
         Token::MultiCell(values) => Ok(AstNode::SetMulti(values.clone())),
@@ -303,12 +311,10 @@ fn parse_single(tokens: &[Token], pos: &mut usize) -> Result<AstNode, ParseError
             })
         }
 
-        Token::BraceClose => {
-            Err(ParseError {
-                message: "Unexpected '}'".into(),
-                token_index: *pos - 1,
-            })
-        }
+        // `}` outside a block context (SubDef/R/K) is the WriteTape dual-tape operator.
+        // Inside brace-delimited blocks, `}` is consumed as the block terminator by
+        // parse_block (BlockEnd::BraceClose) before it ever reaches parse_single.
+        Token::BraceClose => Ok(AstNode::WriteTape),
 
         Token::LoopEnd => {
             Err(ParseError {

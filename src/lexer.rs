@@ -60,6 +60,14 @@ pub enum Token {
     TapeAddr,          // T — store current pointer address into cell
     FramebufferFlush,  // F — flush framebuffer to display
 
+    // Dual-tape (multicore) — inter-tape communication
+    ReadTape,          // { (standalone) — read from read-tape into current cell
+    ReadPtrRight,      // ( — advance read-tape pointer right
+    ReadPtrLeft,       // ) — advance read-tape pointer left
+    Transfer,          // P — bulk transfer: copy cell to write-tape, advance both ptrs
+    SwapTapes,         // Q — swap read-tape and write-tape roles
+    SyncPtrs,          // V — synchronize read/write tape pointers to main ptr position
+
     // FFI — foreign function interface
     FfiCall(String, String), // \ffi "lib" "func" — call an external shared library function
 
@@ -339,6 +347,19 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
             'e' => { chars.next(); col += 1; tokens.push(Token::ErrorWrite); }
             'T' => { chars.next(); col += 1; tokens.push(Token::TapeAddr); }
             'F' => { chars.next(); col += 1; tokens.push(Token::FramebufferFlush); }
+
+            // Dual-tape operators — inter-tape communication for multicore support.
+            // `{` is safe here: SubDef consumes `{` after `!#name`, R/K consume `{` after
+            // `R`/`K`, `.{`/`,{` consume `{` in the fd-spec path, `#{` consumes `{` for
+            // multi-cell. A standalone `{` (not preceded by any of those) is ReadTape.
+            // `}` is NOT handled here — it stays as BraceClose, and the parser emits
+            // WriteTape when BraceClose appears outside a block context.
+            '{' => { chars.next(); col += 1; tokens.push(Token::ReadTape); }
+            '(' => { chars.next(); col += 1; tokens.push(Token::ReadPtrRight); }
+            ')' => { chars.next(); col += 1; tokens.push(Token::ReadPtrLeft); }
+            'P' => { chars.next(); col += 1; tokens.push(Token::Transfer); }
+            'Q' => { chars.next(); col += 1; tokens.push(Token::SwapTapes); }
+            'V' => { chars.next(); col += 1; tokens.push(Token::SyncPtrs); }
 
             // # — numeric literal (#N), hex literal (#0xHH), or multi-cell setup (#{a,b,c})
             '#' => {

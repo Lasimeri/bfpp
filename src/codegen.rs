@@ -15,6 +15,7 @@ pub struct CodegenOptions {
     pub call_depth: usize,  // max recursive subroutine call depth before abort
     pub framebuffer: Option<(u32, u32)>, // if Some((w,h)), emit SDL2 framebuffer support
     pub eof_value: u8,      // value written to cell on EOF during input (`,`)
+    pub render_threads: usize, // number of render threads for framebuffer pipeline (default 8)
 }
 
 impl Default for CodegenOptions {
@@ -25,6 +26,7 @@ impl Default for CodegenOptions {
             call_depth: 256,
             framebuffer: None,
             eof_value: 0,
+            render_threads: 8,
         }
     }
 }
@@ -38,6 +40,10 @@ pub struct CodegenResult {
     pub uses_ffi: bool,
     /// True if any __tui_* intrinsics are used — triggers bfpp_rt.c compilation
     pub uses_tui_runtime: bool,
+    /// True if framebuffer pipeline is used — triggers bfpp_fb_pipeline.c compilation
+    pub uses_fb_pipeline: bool,
+    /// True if any threading intrinsics are used — triggers -pthread and bfpp_rt_parallel.c
+    pub uses_threading: bool,
 }
 
 pub fn generate(program: &Program, opts: &CodegenOptions) -> CodegenResult {
@@ -48,8 +54,10 @@ pub fn generate(program: &Program, opts: &CodegenOptions) -> CodegenResult {
     // time.h for __sleep, bfpp_rt.h for __tui_*)
     let intrinsics = detect_intrinsics(&program.nodes);
     let uses_tui_runtime = intrinsics.tui;
+    let uses_fb_pipeline = opts.framebuffer.is_some();
+    let uses_threading = intrinsics.threading;
     let c_source = generate_c(program, opts, uses_ffi, &intrinsics);
-    CodegenResult { c_source, uses_ffi, uses_tui_runtime }
+    CodegenResult { c_source, uses_ffi, uses_tui_runtime, uses_fb_pipeline, uses_threading }
 }
 
 // Recursively checks whether any node in the AST uses \ffi calls.
@@ -103,6 +111,16 @@ fn generate_c(program: &Program, opts: &CodegenOptions, uses_ffi: bool, intrinsi
         out.push('\n');
     }
 
+    // Subroutine table: static array of function pointers indexed by position.
+    // Used by __spawn to look up subroutine entry points at runtime.
+    if intrinsics.threading && !ctx.subroutines.is_empty() {
+        out.push_str("static void (*bfpp_sub_table[])(void) = {\n");
+        for name in &ctx.subroutines {
+            out.push_str(&format!("    bfpp_sub_{},\n", mangle_name(name)));
+        }
+        out.push_str("};\n\n");
+    }
+
     // Emit subroutine bodies. Each gets a call-depth guard (prologue/epilogue)
     // to enforce the CALL_DEPTH limit and prevent unbounded recursion from
     // blowing the C stack. The prologue increments+checks; the epilogue decrements.
@@ -132,7 +150,7 @@ fn generate_c(program: &Program, opts: &CodegenOptions, uses_ffi: bool, intrinsi
         indent(&mut out, ctx.indent);
         out.push_str("#ifdef BFPP_FRAMEBUFFER\n");
         indent(&mut out, ctx.indent);
-        out.push_str("bfpp_fb_init();\n");
+        out.push_str("bfpp_fb_pipeline_init(BFPP_FB_WIDTH, BFPP_FB_HEIGHT, tape, BFPP_FB_OFFSET);\n");
         indent(&mut out, ctx.indent);
         out.push_str("#endif\n");
     }
@@ -143,7 +161,7 @@ fn generate_c(program: &Program, opts: &CodegenOptions, uses_ffi: bool, intrinsi
         indent(&mut out, ctx.indent);
         out.push_str("#ifdef BFPP_FRAMEBUFFER\n");
         indent(&mut out, ctx.indent);
-        out.push_str("bfpp_fb_cleanup();\n");
+        out.push_str("bfpp_fb_pipeline_cleanup();\n");
         indent(&mut out, ctx.indent);
         out.push_str("#endif\n");
     }
@@ -229,6 +247,13 @@ fn emit_header(opts: &CodegenOptions, uses_ffi: bool, intrinsics: &IntrinsicUsag
         // non-blocking key input. Compiled as a separate .c file by the driver.
         h.push_str("#include \"bfpp_rt.h\"\n");
     }
+    if intrinsics.threading {
+        // Parallel runtime: thread pool, mutexes, barriers, atomics.
+        h.push_str("#include <pthread.h>\n");
+        h.push_str("#include <stdatomic.h>\n");
+        h.push_str("#include <sched.h>\n");
+        h.push_str("#include \"bfpp_rt_parallel.h\"\n");
+    }
     h.push('\n');
 
     // Framebuffer: maps the last W*H*3 bytes of the tape as an RGB24 pixel
@@ -287,13 +312,39 @@ fn emit_header(opts: &CodegenOptions, uses_ffi: bool, intrinsics: &IntrinsicUsag
     //   continuation byte (part of a wider cell), 1/2/4/8 means tape[i] is
     //   the start of a cell with that many bytes. Acts as a sentinel so
     //   bfpp_get/bfpp_set know the cell's byte span.
+    // tape[] is always shared (the inter-thread communication channel).
+    // When threading is active:
+    //   - Per-thread state (ptr, sp, etc.) uses _Thread_local with EXTERNAL linkage
+    //     so bfpp_rt_parallel.c's thread entry wrapper can reset them via extern.
+    //   - `static` is dropped — the runtime needs to see these symbols.
+    // When threading is NOT active: everything is `static` (internal linkage, single TU).
     h.push_str("static uint8_t tape[TAPE_SIZE];\n");
-    h.push_str("static int ptr = 0;\n");
-    h.push_str("static int bfpp_err = 0;\n");
-    h.push_str("static uint64_t stack[STACK_SIZE];\n");
-    h.push_str("static int sp = 0;\n");
-    h.push_str("static int bfpp_call_depth = 0;\n");
-    h.push_str("static uint8_t cell_width[TAPE_SIZE]; /* 0=continuation, 1,2,4,8 */\n");
+
+    if intrinsics.threading {
+        // External linkage _Thread_local: runtime's bfpp_thread_entry() references these
+        h.push_str("_Thread_local int ptr = 0;\n");
+        h.push_str("_Thread_local int bfpp_err = 0;\n");
+        h.push_str("_Thread_local uint64_t stack[STACK_SIZE];\n");
+        h.push_str("_Thread_local int sp = 0;\n");
+        h.push_str("_Thread_local int bfpp_call_depth = 0;\n");
+        h.push_str("_Thread_local uint8_t cell_width[TAPE_SIZE];\n");
+    } else {
+        h.push_str("static int ptr = 0;\n");
+        h.push_str("static int bfpp_err = 0;\n");
+        h.push_str("static uint64_t stack[STACK_SIZE];\n");
+        h.push_str("static int sp = 0;\n");
+        h.push_str("static int bfpp_call_depth = 0;\n");
+        h.push_str("static uint8_t cell_width[TAPE_SIZE]; /* 0=continuation, 1,2,4,8 */\n");
+    }
+
+    // Dual-tape state: separate read/write tapes for data transformation.
+    // Always static — thread entry doesn't reset these (each subroutine manages its own).
+    h.push_str("static uint8_t rtape[TAPE_SIZE];\n");
+    h.push_str("static uint8_t wtape[TAPE_SIZE];\n");
+    h.push_str("static int rptr = 0;\n");
+    h.push_str("static int wptr = 0;\n");
+    h.push_str("static uint8_t rcell_width[TAPE_SIZE];\n");
+    h.push_str("static uint8_t wcell_width[TAPE_SIZE];\n");
     // Terminal intrinsic state: saved_termios captures the original terminal
     // settings before __term_raw modifies them, so __term_restore can revert.
     // bfpp_term_raw tracks whether we're currently in raw mode to avoid
@@ -424,84 +475,16 @@ static void __attribute__((constructor)) bfpp_init(void) {
         h.push_str("}\n\n");
     }
 
-    // SDL2 framebuffer system. Guarded by #ifdef BFPP_FRAMEBUFFER so the
-    // generated code compiles without SDL2 if framebuffer wasn't requested.
-    //
-    // bfpp_fb_init: creates SDL window + renderer + streaming texture.
-    //   Falls back to software renderer if accelerated isn't available.
-    //   All three SDL objects are NULL-checked — if any creation step fails,
-    //   earlier objects are destroyed and the fb is left disabled (NULL).
-    //
-    // bfpp_fb_flush (invoked by `F`): uploads tape[BFPP_FB_OFFSET..] as
-    //   RGB24 pixels to the texture, renders it, and pumps the SDL event
-    //   queue. Handles SDL_QUIT by cleaning up and exit(0). The NULL checks
-    //   on texture/renderer make flush a safe no-op if init failed.
-    //
-    // bfpp_fb_cleanup: teardown in reverse allocation order. Each pointer
-    //   is NULL-checked so cleanup is safe even if init partially failed.
+    // SDL2 framebuffer system. Uses the tiled render pipeline (bfpp_fb_pipeline.h/c)
+    // for parallel strip processing with triple buffering and cache management.
+    // The pipeline spawns a dedicated presenter thread (owns SDL) + N render threads.
+    // The F operator becomes non-blocking (sets atomic flag), the presenter thread
+    // flushes at vsync cadence. __fb_sync blocks until the next present completes.
     if opts.framebuffer.is_some() {
-        h.push_str(r#"
-#ifdef BFPP_FRAMEBUFFER
-static SDL_Window *bfpp_fb_window = NULL;
-static SDL_Renderer *bfpp_fb_renderer = NULL;
-static SDL_Texture *bfpp_fb_texture = NULL;
-
-static void bfpp_fb_init(void) {
-    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
-        fprintf(stderr, "SDL init failed: %s\n", SDL_GetError());
-        return;
-    }
-    bfpp_fb_window = SDL_CreateWindow("BF++",
-        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        BFPP_FB_WIDTH, BFPP_FB_HEIGHT, SDL_WINDOW_SHOWN);
-    if (!bfpp_fb_window) {
-        fprintf(stderr, "SDL window failed: %s\n", SDL_GetError());
-        SDL_Quit();
-        return;
-    }
-    bfpp_fb_renderer = SDL_CreateRenderer(bfpp_fb_window, -1,
-        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-    if (!bfpp_fb_renderer) {
-        bfpp_fb_renderer = SDL_CreateRenderer(bfpp_fb_window, -1, 0);
-    }
-    if (!bfpp_fb_renderer) {
-        SDL_DestroyWindow(bfpp_fb_window);
-        bfpp_fb_window = NULL;
-        SDL_Quit();
-        return;
-    }
-    bfpp_fb_texture = SDL_CreateTexture(bfpp_fb_renderer,
-        SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING,
-        BFPP_FB_WIDTH, BFPP_FB_HEIGHT);
-}
-
-static void bfpp_fb_flush(void) {
-    if (!bfpp_fb_texture || !bfpp_fb_renderer) return;
-    SDL_UpdateTexture(bfpp_fb_texture, NULL, &tape[BFPP_FB_OFFSET], BFPP_FB_WIDTH * 3);
-    SDL_RenderClear(bfpp_fb_renderer);
-    SDL_RenderCopy(bfpp_fb_renderer, bfpp_fb_texture, NULL, NULL);
-    SDL_RenderPresent(bfpp_fb_renderer);
-    SDL_Event e;
-    while (SDL_PollEvent(&e)) {
-        if (e.type == SDL_QUIT) {
-            SDL_DestroyTexture(bfpp_fb_texture);
-            SDL_DestroyRenderer(bfpp_fb_renderer);
-            SDL_DestroyWindow(bfpp_fb_window);
-            SDL_Quit();
-            exit(0);
-        }
-    }
-}
-
-static void bfpp_fb_cleanup(void) {
-    if (bfpp_fb_texture) SDL_DestroyTexture(bfpp_fb_texture);
-    if (bfpp_fb_renderer) SDL_DestroyRenderer(bfpp_fb_renderer);
-    if (bfpp_fb_window) SDL_DestroyWindow(bfpp_fb_window);
-    SDL_Quit();
-}
-#endif
-
-"#);
+        h.push_str("#ifdef BFPP_FRAMEBUFFER\n");
+        h.push_str("#include \"bfpp_fb_pipeline.h\"\n");
+        h.push_str(&format!("#define BFPP_FB_RENDER_THREADS {}\n", opts.render_threads));
+        h.push_str("#endif\n\n");
     }
 
     h
@@ -800,14 +783,46 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
             out.push_str("bfpp_push((uint64_t)(uintptr_t)&tape[ptr]);\n");
         }
 
-        // Framebuffer flush
+        // Framebuffer flush — non-blocking (sets atomic flag, presenter thread picks it up)
         AstNode::FramebufferFlush => {
             indent(out, ctx.indent);
             out.push_str("#ifdef BFPP_FRAMEBUFFER\n");
             indent(out, ctx.indent);
-            out.push_str("bfpp_fb_flush();\n");
+            out.push_str("bfpp_fb_request_flush();\n");
             indent(out, ctx.indent);
             out.push_str("#endif\n");
+        }
+
+        // ── Dual-tape operators ─────────────────────────────
+        AstNode::ReadTape => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_set(ptr, rtape[rptr]);\n");
+        }
+        AstNode::WriteTape => {
+            indent(out, ctx.indent);
+            out.push_str("wtape[wptr] = (uint8_t)bfpp_get(ptr);\n");
+        }
+        AstNode::ReadPtrRight => {
+            indent(out, ctx.indent);
+            out.push_str("rptr = (rptr + 1) & TAPE_MASK;\n");
+        }
+        AstNode::ReadPtrLeft => {
+            indent(out, ctx.indent);
+            out.push_str("rptr = (rptr - 1 + TAPE_SIZE) & TAPE_MASK;\n");
+        }
+        AstNode::Transfer => {
+            indent(out, ctx.indent);
+            out.push_str("wtape[wptr] = rtape[rptr];\n");
+        }
+        AstNode::SwapTapes => {
+            // Swap read/write tape pointers + pointer indices. Uses a static
+            // scratch buffer to avoid stack-allocating TAPE_SIZE bytes.
+            indent(out, ctx.indent);
+            out.push_str("{ static _Thread_local uint8_t _swap_tmp[TAPE_SIZE]; memcpy(_swap_tmp, rtape, TAPE_SIZE); memcpy(rtape, wtape, TAPE_SIZE); memcpy(wtape, _swap_tmp, TAPE_SIZE); int _tp = rptr; rptr = wptr; wptr = _tp; }\n");
+        }
+        AstNode::SyncPtrs => {
+            indent(out, ctx.indent);
+            out.push_str("rptr = wptr;\n");
         }
 
         // Numeric literal: set current cell to an immediate value
@@ -1242,6 +1257,98 @@ fn emit_intrinsic(out: &mut String, name: &str, ctx: &mut GenCtx) {
             out.push_str("bfpp_set(ptr, (uint64_t)(int64_t)bfpp_tui_poll_key((int)bfpp_get(ptr)));\n");
         }
 
+        // ── Framebuffer pipeline intrinsics ──────────────────
+        "__fb_sync" => {
+            indent(out, ctx.indent);
+            out.push_str("#ifdef BFPP_FRAMEBUFFER\n");
+            indent(out, ctx.indent);
+            out.push_str("bfpp_fb_sync();\n");
+            indent(out, ctx.indent);
+            out.push_str("#endif\n");
+        }
+        "__fb_pixel_nt" => {
+            // Input: tape[ptr]=x, [ptr+1]=y, [ptr+2]=r, [ptr+3]=g, [ptr+4]=b
+            indent(out, ctx.indent);
+            out.push_str("#ifdef BFPP_FRAMEBUFFER\n");
+            indent(out, ctx.indent);
+            out.push_str("bfpp_fb_write_pixel_nt(tape, BFPP_FB_OFFSET, (int)bfpp_get(ptr), (int)bfpp_get((ptr+1)&TAPE_MASK), BFPP_FB_WIDTH, (uint8_t)bfpp_get((ptr+2)&TAPE_MASK), (uint8_t)bfpp_get((ptr+3)&TAPE_MASK), (uint8_t)bfpp_get((ptr+4)&TAPE_MASK));\n");
+            indent(out, ctx.indent);
+            out.push_str("#endif\n");
+        }
+
+        // ── Threading intrinsics ────────────────────────────
+        "__spawn" => {
+            // Input: tape[ptr]=subroutine_index, tape[ptr+8]=start_ptr
+            // Output: tape[ptr]=thread_id (pthread_t)
+            indent(out, ctx.indent);
+            out.push_str("{ bfpp_thread_arg_t *_a = malloc(sizeof(bfpp_thread_arg_t)); ");
+            out.push_str("_a->func = bfpp_sub_table[(int)bfpp_get(ptr)]; ");
+            out.push_str("_a->start_ptr = (int)bfpp_get((ptr+8)&TAPE_MASK); ");
+            out.push_str("_a->index = atomic_fetch_add(&bfpp_next_thread_index, 1); ");
+            out.push_str("_a->tape_size = TAPE_SIZE; ");
+            out.push_str("pthread_t _tid; pthread_create(&_tid, NULL, bfpp_thread_entry, _a); ");
+            out.push_str("bfpp_set(ptr, (uint64_t)(uintptr_t)_tid); }\n");
+        }
+        "__join" => {
+            // Input: tape[ptr]=thread_id
+            indent(out, ctx.indent);
+            out.push_str("pthread_join((pthread_t)(uintptr_t)bfpp_get(ptr), NULL);\n");
+        }
+        "__yield" => {
+            indent(out, ctx.indent);
+            out.push_str("sched_yield();\n");
+        }
+        "__thread_id" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_set(ptr, (uint64_t)bfpp_thread_index);\n");
+        }
+        "__num_cores" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_set(ptr, (uint64_t)sysconf(_SC_NPROCESSORS_ONLN));\n");
+        }
+        "__mutex_init" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_mutex_init((int)bfpp_get(ptr));\n");
+        }
+        "__mutex_lock" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_mutex_lock((int)bfpp_get(ptr));\n");
+        }
+        "__mutex_unlock" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_mutex_unlock((int)bfpp_get(ptr));\n");
+        }
+        "__atomic_load" => {
+            // Input: tape[ptr]=addr. Output: tape[ptr]=value
+            indent(out, ctx.indent);
+            out.push_str("bfpp_set(ptr, bfpp_atomic_load(tape, (int)bfpp_get(ptr), cell_width[(int)bfpp_get(ptr) & TAPE_MASK]));\n");
+        }
+        "__atomic_store" => {
+            // Input: tape[ptr]=value, tape[ptr+1]=addr
+            indent(out, ctx.indent);
+            out.push_str("bfpp_atomic_store(tape, (int)bfpp_get((ptr+1)&TAPE_MASK), bfpp_get(ptr), cell_width[(int)bfpp_get((ptr+1)&TAPE_MASK) & TAPE_MASK]);\n");
+        }
+        "__atomic_add" => {
+            // Input: tape[ptr]=value, tape[ptr+1]=addr. Output: tape[ptr]=old_value
+            indent(out, ctx.indent);
+            out.push_str("bfpp_set(ptr, bfpp_atomic_add(tape, (int)bfpp_get((ptr+1)&TAPE_MASK), bfpp_get(ptr), cell_width[(int)bfpp_get((ptr+1)&TAPE_MASK) & TAPE_MASK]));\n");
+        }
+        "__atomic_cas" => {
+            // Input: tape[ptr]=expected, tape[ptr+1]=desired, tape[ptr+2]=addr
+            // Output: tape[ptr]=success (1/0)
+            indent(out, ctx.indent);
+            out.push_str("bfpp_set(ptr, (uint64_t)bfpp_atomic_cas(tape, (int)bfpp_get((ptr+2)&TAPE_MASK), bfpp_get(ptr), bfpp_get((ptr+1)&TAPE_MASK), cell_width[(int)bfpp_get((ptr+2)&TAPE_MASK) & TAPE_MASK]));\n");
+        }
+        "__barrier_init" => {
+            // Input: tape[ptr]=barrier_id, tape[ptr+1]=count
+            indent(out, ctx.indent);
+            out.push_str("bfpp_barrier_init((int)bfpp_get(ptr), (int)bfpp_get((ptr+1)&TAPE_MASK));\n");
+        }
+        "__barrier_wait" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_barrier_wait((int)bfpp_get(ptr));\n");
+        }
+
         // ── Unrecognized intrinsic ───────────────────────────
         _ => {
             indent(out, ctx.indent);
@@ -1264,6 +1371,8 @@ struct IntrinsicUsage {
     process: bool,   // __exit, __getpid — no extra headers (stdlib.h/unistd.h cover these)
     poll: bool,      // __poll_stdin — requires <poll.h>
     tui: bool,       // __tui_* — requires bfpp_rt.h/bfpp_rt.c external runtime
+    threading: bool, // __spawn, __join, __mutex_*, __atomic_*, __barrier_* — requires -pthread + bfpp_rt_parallel
+    fb_sync: bool,   // __fb_sync, __fb_pixel_nt — framebuffer pipeline intrinsics
 }
 
 // Pre-scan the entire AST for intrinsic calls and return a summary of
@@ -1294,6 +1403,11 @@ fn scan_intrinsics(nodes: &[AstNode], usage: &mut IntrinsicUsage) {
                     "__tui_begin" | "__tui_end" | "__tui_put" |
                     "__tui_puts" | "__tui_fill" | "__tui_box" |
                     "__tui_key" => usage.tui = true,
+                    "__spawn" | "__join" | "__yield" | "__thread_id" | "__num_cores" |
+                    "__mutex_init" | "__mutex_lock" | "__mutex_unlock" |
+                    "__atomic_load" | "__atomic_store" | "__atomic_add" | "__atomic_cas" |
+                    "__barrier_init" | "__barrier_wait" => usage.threading = true,
+                    "__fb_sync" | "__fb_pixel_nt" => usage.fb_sync = true,
                     _ => {}
                 }
             }
@@ -1372,7 +1486,7 @@ mod tests {
         let tokens = lex("F").unwrap();
         let program = parse(&tokens).unwrap();
         let result = generate(&program, &CodegenOptions::default());
-        assert!(result.c_source.contains("bfpp_fb_flush"));
+        assert!(result.c_source.contains("bfpp_fb_request_flush"));
     }
 
     /// FFI calls emit dlopen/dlsym boilerplate and set the uses_ffi metadata flag.

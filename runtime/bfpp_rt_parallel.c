@@ -48,6 +48,11 @@ void *bfpp_thread_entry(void *arg)
     sp = 0;
     bfpp_err = 0;
     bfpp_call_depth = 0;
+    /* cell_width is _Thread_local — zero-initialized by default on thread creation.
+       Must be set to 1 (each cell is an independent 1-byte cell) before the
+       subroutine runs. tape_size comes from the arg struct (TAPE_SIZE is a
+       compile-time define in the generated C, not available here). */
+    memset(cell_width, 1, (size_t)a->tape_size);
 
     /* Execute the subroutine */
     a->func();
@@ -178,4 +183,5 @@ _Thread_local int ptr = 0;
 _Thread_local int sp = 0;
 _Thread_local int bfpp_err = 0;
 _Thread_local int bfpp_call_depth = 0;
+_Thread_local uint8_t cell_width[65536];
 #endif

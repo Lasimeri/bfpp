@@ -50,6 +50,10 @@ struct Cli {
     #[arg(long)]
     framebuffer: Option<String>,
 
+    /// Number of render threads for framebuffer pipeline
+    #[arg(long, default_value = "8")]
+    render_threads: usize,
+
     /// Disable all optimizations
     #[arg(long)]
     no_optimize: bool,
@@ -180,6 +184,7 @@ fn main() {
         call_depth: cli.call_depth,
         framebuffer,
         eof_value: cli.eof,
+        render_threads: cli.render_threads,
     };
 
     let codegen_result = codegen::generate(&optimized_program, &opts);
@@ -231,15 +236,53 @@ fn main() {
         "-Wno-unused-function",
     ]);
 
-    // -lSDL2: only needed when framebuffer mode is active (renders tape region
-    // as an SDL2 window)
-    if framebuffer.is_some() {
-        cc_cmd.args(["-lSDL2"]);
+    // -lSDL2 + pipeline runtime: when framebuffer mode is active, link SDL2
+    // and compile the tiled render pipeline (8-thread strip-parallel processing).
+    if codegen_result.uses_fb_pipeline {
+        cc_cmd.args(["-lSDL2", "-pthread", "-msse4.1"]);
+        // Search for pipeline runtime in ./runtime/ or <exe_dir>/runtime/
+        let runtime_paths = [
+            PathBuf::from("runtime"),
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("runtime")))
+                .unwrap_or_default(),
+        ];
+        for rt_dir in &runtime_paths {
+            if rt_dir.join("bfpp_fb_pipeline.c").exists() {
+                cc_cmd.arg(format!("-I{}", rt_dir.display()));
+                cc_cmd.arg(rt_dir.join("bfpp_fb_pipeline.c").to_str().unwrap());
+                break;
+            }
+        }
     }
 
     // -ldl: needed for dlopen/dlsym when the program uses FFI calls (\ffi)
     if codegen_result.uses_ffi {
         cc_cmd.args(["-ldl"]);
+    }
+
+    // Threading runtime: when any __spawn/__join/__mutex_*/__atomic_*/__barrier_*
+    // intrinsic is used, link pthread and compile the parallel runtime.
+    if codegen_result.uses_threading {
+        if !codegen_result.uses_fb_pipeline {
+            // -pthread already added if framebuffer pipeline is active
+            cc_cmd.arg("-pthread");
+        }
+        let runtime_paths = [
+            PathBuf::from("runtime"),
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("runtime")))
+                .unwrap_or_default(),
+        ];
+        for rt_dir in &runtime_paths {
+            if rt_dir.join("bfpp_rt_parallel.c").exists() {
+                cc_cmd.arg(format!("-I{}", rt_dir.display()));
+                cc_cmd.arg(rt_dir.join("bfpp_rt_parallel.c").to_str().unwrap());
+                break;
+            }
+        }
     }
 
     // TUI runtime: when any __tui_* intrinsic is used, the generated C calls

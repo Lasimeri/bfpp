@@ -27,6 +27,7 @@ typedef struct {
     void (*func)(void);   /* subroutine entry point */
     int start_ptr;        /* initial tape pointer for this thread */
     int index;            /* thread-local index */
+    int tape_size;        /* TAPE_SIZE — needed for cell_width init */
 } bfpp_thread_arg_t;
 
 /* Thread entry wrapper: sets thread-local state, calls subroutine.
@@ -64,6 +65,7 @@ extern _Thread_local int ptr;
 extern _Thread_local int sp;
 extern _Thread_local int bfpp_err;
 extern _Thread_local int bfpp_call_depth;
+extern _Thread_local uint8_t cell_width[];
 
 /* ── Thread index tracking ─────────────────────────────────────── */
 

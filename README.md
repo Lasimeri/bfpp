@@ -81,7 +81,21 @@ A Brainfuck superset transpiler that compiles to C, adding syscalls, subroutines
 | Symbol | Name | Semantics |
 |--------|------|-----------|
 | `T` | Tape address | Push `&tape[ptr]` (C pointer) onto stack. Used to pass buffer addresses to syscalls/FFI |
-| `F` | Framebuffer flush | Flush tape framebuffer region to SDL2 window. No-op if framebuffer not enabled |
+| `F` | Framebuffer flush | Request framebuffer flush (non-blocking). Sets atomic flag; presenter thread renders at vsync cadence. No-op if framebuffer not enabled |
+
+### Dual-Tape (Multicore Data Transformation)
+
+Separate read/write tapes for parallel data processing. Each thread gets its own R/W tape pair; the primary `tape[]` stays shared.
+
+| Symbol | Name | Semantics |
+|--------|------|-----------|
+| `{` | Read tape | `tape[ptr] = rtape[rptr]` — copy from read tape into current cell (standalone `{` only, not opening a block) |
+| `}` | Write tape | `wtape[wptr] = tape[ptr]` — copy current cell to write tape (standalone `}` only, not closing a block) |
+| `(` | Read ptr right | `rptr++` (wraps via bitmask) |
+| `)` | Read ptr left | `rptr--` (wraps via bitmask) |
+| `P` | Transfer | `wtape[wptr] = rtape[rptr]` — direct copy between tapes |
+| `Q` | Swap tapes | Swap read and write tape contents + pointers |
+| `V` | Sync pointers | `rptr = wptr` — synchronize read pointer to write pointer position |
 
 ### FFI
 
@@ -443,6 +457,38 @@ These require the C runtime library (`runtime/bfpp_rt.{h,c}`). The compiler auto
 | `!#__tui_key` | `tape[ptr]` = timeout in ms | `tape[ptr]` = keycode (ASCII or `BFPP_KEY_*` constants for arrows/special keys). Returns -1 on timeout |
 
 Color values: -1 = terminal default, 0-7 = standard ANSI, 8-15 = bright, 16-231 = 256-color RGB cube, 232-255 = grayscale.
+
+### Threading Intrinsics
+
+Require `-pthread` and `runtime/bfpp_rt_parallel.{h,c}` (auto-linked when any threading intrinsic is detected). Up to 128 threads, 256 mutexes, 64 barriers.
+
+| Intrinsic | Input | Output / Effect |
+|-----------|-------|-----------------|
+| `!#__spawn` | `tape[ptr]` = subroutine index (0-based definition order), `tape[ptr+8]` = start_ptr | `tape[ptr]` = thread_id (64-bit). Requires `%8` cell width at ptr. Creates a new thread running the indexed subroutine |
+| `!#__join` | `tape[ptr]` = thread_id | Blocks until the thread finishes |
+| `!#__yield` | -- | `sched_yield()` — yield CPU to other threads |
+| `!#__thread_id` | -- | `tape[ptr]` = thread index (0 = main, 1+ = spawned order) |
+| `!#__num_cores` | -- | `tape[ptr]` = number of available CPU cores |
+| `!#__mutex_init` | `tape[ptr]` = mutex_id (0-255) | Initialize mutex (also auto-inits on first lock) |
+| `!#__mutex_lock` | `tape[ptr]` = mutex_id | Lock mutex (blocks if held by another thread) |
+| `!#__mutex_unlock` | `tape[ptr]` = mutex_id | Unlock mutex |
+| `!#__atomic_load` | `tape[ptr]` = address | `tape[ptr]` = value at address (atomic, width-aware) |
+| `!#__atomic_store` | `tape[ptr]` = value, `tape[ptr+1]` = address | Atomically store value at address |
+| `!#__atomic_add` | `tape[ptr]` = value, `tape[ptr+1]` = address | `tape[ptr]` = old value. Atomically adds value to address |
+| `!#__atomic_cas` | `tape[ptr]` = expected, `tape[ptr+1]` = desired, `tape[ptr+2]` = address | `tape[ptr]` = 1 if swapped, 0 if failed |
+| `!#__barrier_init` | `tape[ptr]` = barrier_id (0-63), `tape[ptr+1]` = count | Initialize barrier with participant count |
+| `!#__barrier_wait` | `tape[ptr]` = barrier_id | Block until all participants arrive |
+
+**Threading model**: Shared tape (`tape[]`) is the communication channel. Per-thread state (`ptr`, `sp`, `bfpp_err`, `bfpp_call_depth`, `cell_width`) is `_Thread_local` — each thread gets its own copy, initialized by the thread entry wrapper. Region-partitioned memory: programmer manages which tape regions each thread owns; atomics for cross-region communication.
+
+### Framebuffer Pipeline Intrinsics
+
+Available when `--framebuffer WxH` is active. The pipeline uses 8 render threads + 1 presenter thread (owns SDL). `F` is non-blocking; the presenter thread renders at vsync cadence.
+
+| Intrinsic | Input | Output / Effect |
+|-----------|-------|-----------------|
+| `!#__fb_sync` | -- | Block until the next frame is presented to the display (vsync wait point) |
+| `!#__fb_pixel_nt` | `tape[ptr]` = x, `[ptr+1]` = y, `[ptr+2]` = r, `[ptr+3]` = g, `[ptr+4]` = b | Non-temporal pixel write to framebuffer (cache-bypassing) |
 
 ---
 

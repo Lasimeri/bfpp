@@ -76,6 +76,15 @@ pub enum AstNode {
     TapeAddr,               // T — push &tape[ptr] onto stack (raw pointer)
     FramebufferFlush,       // F — flush framebuffer to display
 
+    // ── Dual-tape (multicore) ─────────────────────────────────────
+    ReadTape,               // { (standalone) — read from read-tape into current cell
+    WriteTape,              // } (standalone) — write current cell to write-tape
+    ReadPtrRight,           // ( — advance read-tape pointer right
+    ReadPtrLeft,            // ) — advance read-tape pointer left
+    Transfer,               // P — bulk transfer: copy current cell to write-tape, advance both ptrs
+    SwapTapes,              // Q — swap read-tape and write-tape roles
+    SyncPtrs,               // V — synchronize read/write tape pointers to main ptr position
+
     // ── FFI ─────────────────────────────────────────────────────────
     // Foreign function interface: call a C function from a shared library.
     // The analyzer validates that neither lib nor func name is empty.
