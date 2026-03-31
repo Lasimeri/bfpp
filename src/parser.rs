@@ -238,6 +238,10 @@ fn parse_single(tokens: &[Token], pos: &mut usize) -> Result<AstNode, ParseError
         Token::TapeAddr => Ok(AstNode::TapeAddr),
         Token::FramebufferFlush => Ok(AstNode::FramebufferFlush),
 
+        // ── Immediate value & direct width ─────────────────────────
+        Token::NumericLit(val) => Ok(AstNode::SetValue(*val)),
+        Token::SetCellWidth(w) => Ok(AstNode::SetCellWidth(*w)),
+
         // ── FFI ─────────────────────────────────────────────────────
         Token::FfiCall(lib, func) => Ok(AstNode::FfiCall(lib.clone(), func.clone())),
 

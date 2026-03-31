@@ -81,6 +81,10 @@ pub enum AstNode {
     // The analyzer validates that neither lib nor func name is empty.
     FfiCall(String, String), // \ffi "lib" "func"
 
+    // ── Immediate value & direct width ──────────────────────────────
+    SetValue(u64),          // #N — set current cell to immediate value N
+    SetCellWidth(u8),       // %N — set cell width directly (1, 2, 4, or 8)
+
     // ── Optimizer synthetic nodes ───────────────────────────────────
     // These never appear in parser output. The optimizer rewrites certain
     // Loop patterns into these more efficient representations for codegen.

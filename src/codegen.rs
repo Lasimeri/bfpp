@@ -758,6 +758,36 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
             out.push_str("#endif\n");
         }
 
+        // Numeric literal: set current cell to an immediate value
+        AstNode::SetValue(val) => {
+            indent(out, ctx.indent);
+            out.push_str(&format!("bfpp_set(ptr, {}ULL);\n", val));
+        }
+
+        // Direct cell width: set cell width to a specific value (1, 2, 4, or 8)
+        // without cycling. Handles sub-cell release and continuation marking
+        // the same way bfpp_cycle_width does.
+        AstNode::SetCellWidth(w) => {
+            indent(out, ctx.indent);
+            out.push_str("{ int old_w = cell_width[ptr]; int i;\n");
+            indent(out, ctx.indent);
+            out.push_str("for (i = 1; i < old_w; i++) cell_width[ptr + i] = 1;\n");
+            indent(out, ctx.indent);
+            out.push_str(&format!("cell_width[ptr] = {};\n", w));
+            if *w > 1 {
+                indent(out, ctx.indent);
+                out.push_str(&format!("for (i = 1; i < {}; i++) {{\n", w));
+                indent(out, ctx.indent + 1);
+                out.push_str("if (cell_width[ptr + i] != 1) { bfpp_err = BFPP_ERR_INVALID_ARG; cell_width[ptr] = 1; break; }\n");
+                indent(out, ctx.indent + 1);
+                out.push_str("cell_width[ptr + i] = 0;\n");
+                indent(out, ctx.indent);
+                out.push_str("}\n");
+            }
+            indent(out, ctx.indent);
+            out.push_str("}\n");
+        }
+
         // FFI call (\ffi "lib" "func"): dynamic library call via dlopen/dlsym.
         // Opens the library, resolves the symbol, reads 6 args from
         // tape[ptr+8..ptr+48] (same layout as syscall), calls the function,

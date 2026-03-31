@@ -62,6 +62,12 @@ pub enum Token {
 
     // FFI — foreign function interface
     FfiCall(String, String), // \ffi "lib" "func" — call an external shared library function
+
+    // Numeric literal — set current cell to an immediate value
+    NumericLit(u64),   // #N or #0xHH — set cell to value N (respects cell width)
+
+    // Direct cell width — set cell width without cycling
+    SetCellWidth(u8),  // %1, %2, %4, %8 — set cell width directly
 }
 
 // File descriptor specifier for fd-directed I/O (.{N} and ,{N} syntax).
@@ -152,7 +158,17 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
             // Extended memory
             '@' => { chars.next(); col += 1; tokens.push(Token::AbsoluteAddr); }
             '*' => { chars.next(); col += 1; tokens.push(Token::Deref); }
-            '%' => { chars.next(); col += 1; tokens.push(Token::CellWidthCycle); }
+            '%' => {
+                chars.next(); col += 1;
+                // Check for direct width: %1, %2, %4, %8
+                match chars.peek() {
+                    Some('1') => { chars.next(); col += 1; tokens.push(Token::SetCellWidth(1)); }
+                    Some('2') => { chars.next(); col += 1; tokens.push(Token::SetCellWidth(2)); }
+                    Some('4') => { chars.next(); col += 1; tokens.push(Token::SetCellWidth(4)); }
+                    Some('8') => { chars.next(); col += 1; tokens.push(Token::SetCellWidth(8)); }
+                    _ => { tokens.push(Token::CellWidthCycle); }
+                }
+            }
 
             // Stack
             '$' => { chars.next(); col += 1; tokens.push(Token::Push); }
@@ -300,6 +316,97 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
             'e' => { chars.next(); col += 1; tokens.push(Token::ErrorWrite); }
             'T' => { chars.next(); col += 1; tokens.push(Token::TapeAddr); }
             'F' => { chars.next(); col += 1; tokens.push(Token::FramebufferFlush); }
+
+            // Numeric literal: #N (decimal) or #0xHH (hex) — set current cell to immediate value
+            '#' => {
+                chars.next(); col += 1;
+                let mut num_str = String::new();
+                // Check for hex prefix 0x
+                let is_hex = chars.peek() == Some(&'0') && {
+                    let mut la = chars.clone();
+                    la.next();
+                    matches!(la.peek(), Some('x') | Some('X'))
+                };
+                if is_hex {
+                    chars.next(); col += 1; // consume '0'
+                    chars.next(); col += 1; // consume 'x'
+                    while let Some(&c) = chars.peek() {
+                        if c.is_ascii_hexdigit() {
+                            num_str.push(c);
+                            chars.next(); col += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if num_str.is_empty() {
+                        return Err(LexError {
+                            message: "Expected hex digits after '#0x'".into(),
+                            line, col,
+                        });
+                    }
+                    let val = u64::from_str_radix(&num_str, 16).map_err(|_| LexError {
+                        message: format!("Invalid hex literal: #0x{}", num_str),
+                        line, col,
+                    })?;
+                    tokens.push(Token::NumericLit(val));
+                } else {
+                    while let Some(&c) = chars.peek() {
+                        if c.is_ascii_digit() {
+                            num_str.push(c);
+                            chars.next(); col += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if num_str.is_empty() {
+                        return Err(LexError {
+                            message: "Expected digits after '#'".into(),
+                            line, col,
+                        });
+                    }
+                    let val: u64 = num_str.parse().map_err(|_| LexError {
+                        message: format!("Invalid numeric literal: #{}", num_str),
+                        line, col,
+                    })?;
+                    tokens.push(Token::NumericLit(val));
+                }
+            }
+
+            // Block comment: /* ... */ with nesting support
+            '/' => {
+                chars.next(); col += 1;
+                if chars.peek() == Some(&'*') {
+                    chars.next(); col += 1;
+                    let mut depth = 1u32;
+                    while depth > 0 {
+                        match chars.next() {
+                            Some('*') => {
+                                col += 1;
+                                if chars.peek() == Some(&'/') {
+                                    chars.next(); col += 1;
+                                    depth -= 1;
+                                }
+                            }
+                            Some('/') => {
+                                col += 1;
+                                if chars.peek() == Some(&'*') {
+                                    chars.next(); col += 1;
+                                    depth += 1;
+                                }
+                            }
+                            Some('\n') => { line += 1; col = 1; }
+                            Some(_) => { col += 1; }
+                            None => {
+                                return Err(LexError {
+                                    message: "Unterminated block comment /* ...".into(),
+                                    line, col,
+                                });
+                            }
+                        }
+                    }
+                }
+                // Standalone '/' not followed by '*' is silently ignored
+            }
 
             // Wildcard: silently ignore whitespace, digits, and any unrecognized characters.
             // This is by design — BF convention treats everything non-instructional as a comment.
