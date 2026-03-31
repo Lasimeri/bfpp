@@ -24,22 +24,27 @@ run_test() {
         return
     fi
 
-    local actual
-    actual=$("$tmpbin" 2>&1) || true
+    local actual_file="/tmp/bfpp_test_$$_${name}_out"
+    local expected_file="/tmp/bfpp_test_$$_${name}_exp"
+    "$tmpbin" > "$actual_file" 2>&1 || true
     rm -f "$tmpbin"
 
-    local expected_content
-    expected_content=$(cat "$expected")
+    # Normalize: strip trailing whitespace/newlines for comparison.
+    # Avoids false failures from trailing newline differences between
+    # program output and expected files.
+    perl -pe 'chomp if eof' "$actual_file" > "${actual_file}.norm" 2>/dev/null
+    perl -pe 'chomp if eof' "$expected" > "${expected_file}.norm" 2>/dev/null
 
-    if [ "$actual" = "$expected_content" ]; then
+    if cmp -s "${actual_file}.norm" "${expected_file}.norm"; then
         PASS=$((PASS + 1))
         echo "  PASS: ${name}"
     else
         FAIL=$((FAIL + 1))
         ERRORS="${ERRORS}\n  FAIL: ${name}"
-        ERRORS="${ERRORS}\n    expected: $(echo "$expected_content" | head -1)"
-        ERRORS="${ERRORS}\n    actual:   $(echo "$actual" | head -1)"
+        ERRORS="${ERRORS}\n    expected: $(head -c 60 "$expected")"
+        ERRORS="${ERRORS}\n    actual:   $(head -c 60 "$actual_file")"
     fi
+    rm -f "$actual_file" "${actual_file}.norm" "${expected_file}.norm"
 }
 
 echo "BF++ Integration Tests"
