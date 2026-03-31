@@ -1,8 +1,12 @@
 [package]
 name = "bfpp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "BF++ transpiler — Brainfuck extended with system calls, subroutines, and error handling"
+description = "BF++ transpiler — Brainfuck extended with numeric literals, cell width control, subroutines, error handling, syscalls, FFI, compiler intrinsics, and a double-buffered TUI runtime"
+license = "MIT"
+repository = "https://github.com/Lasimeri/bfpp"
+keywords = ["brainfuck", "transpiler", "esoteric", "compiler"]
+categories = ["compilers", "command-line-utilities"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
