@@ -1232,4 +1232,69 @@ mod tests {
         assert!(result.c_source.contains("ceil"));
         assert!(result.uses_ffi);
     }
+
+    #[test]
+    fn test_set_value_codegen() {
+        let tokens = lex("#42 .").unwrap();
+        let program = parse(&tokens).unwrap();
+        let result = generate(&program, &CodegenOptions::default());
+        assert!(result.c_source.contains("bfpp_set(ptr, 42ULL)"));
+        assert!(result.c_source.contains("putchar"));
+    }
+
+    #[test]
+    fn test_set_value_hex_codegen() {
+        let tokens = lex("#0xFF").unwrap();
+        let program = parse(&tokens).unwrap();
+        let result = generate(&program, &CodegenOptions::default());
+        assert!(result.c_source.contains("bfpp_set(ptr, 255ULL)"));
+    }
+
+    #[test]
+    fn test_set_cell_width_codegen() {
+        let tokens = lex("%8 #100").unwrap();
+        let program = parse(&tokens).unwrap();
+        let result = generate(&program, &CodegenOptions::default());
+        assert!(result.c_source.contains("cell_width[ptr] = 8"));
+        assert!(result.c_source.contains("bfpp_set(ptr, 100ULL)"));
+    }
+
+    #[test]
+    fn test_intrinsic_sleep_codegen() {
+        let tokens = lex("#100 !#__sleep").unwrap();
+        let program = parse(&tokens).unwrap();
+        let result = generate(&program, &CodegenOptions::default());
+        assert!(result.c_source.contains("usleep"));
+        assert!(result.c_source.contains("#include <time.h>"));
+    }
+
+    #[test]
+    fn test_intrinsic_exit_codegen() {
+        let tokens = lex("#0 !#__exit").unwrap();
+        let program = parse(&tokens).unwrap();
+        let result = generate(&program, &CodegenOptions::default());
+        assert!(result.c_source.contains("exit((int)bfpp_get(ptr))"));
+    }
+
+    #[test]
+    fn test_intrinsic_tui_codegen() {
+        let tokens = lex("!#__tui_init !#__tui_cleanup").unwrap();
+        let program = parse(&tokens).unwrap();
+        let result = generate(&program, &CodegenOptions::default());
+        assert!(result.c_source.contains("bfpp_tui_init()"));
+        assert!(result.c_source.contains("bfpp_tui_cleanup()"));
+        assert!(result.c_source.contains("#include \"bfpp_rt.h\""));
+        assert!(result.uses_tui_runtime);
+    }
+
+    #[test]
+    fn test_intrinsic_term_codegen() {
+        let tokens = lex("!#__term_raw !#__term_size !#__term_restore").unwrap();
+        let program = parse(&tokens).unwrap();
+        let result = generate(&program, &CodegenOptions::default());
+        assert!(result.c_source.contains("tcsetattr"));
+        assert!(result.c_source.contains("ioctl"));
+        assert!(result.c_source.contains("#include <termios.h>"));
+        assert!(result.c_source.contains("struct termios bfpp_saved_termios"));
+    }
 }

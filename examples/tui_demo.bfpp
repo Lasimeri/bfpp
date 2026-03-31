@@ -1,28 +1,75 @@
-; BF++ TUI demo — ANSI escape sequences for terminal UI
-; Prints a colored box using raw ANSI codes
+; BF++ TUI Demo — terminal UI using #N numeric literals and tui.bfpp
+;
+; Compile and run:
+;   bfpp examples/tui_demo.bfpp --include stdlib -o tui_demo
+;   ./tui_demo
+;
+; Demonstrates: clear screen, cursor positioning, 256-color mode,
+; box drawing, horizontal/vertical lines, and keypress reading.
 
-; ESC = 27
-; Print ESC[2J (clear screen)
-++++++++++++++++++++++++++++. ; 27 = ESC... wait, need exact 27
+!include "tui.bfpp"
+
+; Clear screen
+!#cl
+
+; Hide cursor
+!#ch
+
+; Set colors: fg=231 (white), bg=17 (dark blue)
+#231 > #17 < !#co
+
+; Draw a box at row 2, col 5, width 40, height 10
+#2 > #5 > #40 > #10 <<< !#db
+
+; Reset colors
+!#cr
+
+; Set title color: fg=214 (gold), bg=17 (dark blue)
+#214 > #17 < !#co
+
+; Move cursor to row 3, col 8 and print title
+#3 > #8 < !#cm
+"BF++ TUI Demo\0"
+<<<<<<<<<<<<<<
+[.>]
+
+; Reset colors
+[-] !#cr
+
+; Set info color: fg=252 (light gray), bg=-1 (default)
+#252 > #255 < !#co   ; 255 wraps to -1 as signed int8
+
+; Move to row 5, col 8
+#5 > #8 < !#cm
+"This is rendered with ANSI escapes\0"
+<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+[.>]
+
+; Move to row 7, col 8
 [-]
-+++++++++++++++++++++++++++  ; cell = 27
-.                            ; print ESC
-[-] ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ ; [ = 91
-.
-[-] ++++++++++++++++++++++++++++++++++++++++++++++++++ ; 2 = 50
-.
-[-] ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ ; J = 74
-.
+#7 > #8 < !#cm
+"Press any key to exit...\0"
+<<<<<<<<<<<<<<<<<<<<<<<<
+[.>]
 
-; Print "BF++ TUI Demo" with color
-; ESC[32m (green text)
-[-] ++++++++++++++++++++++++++++. ; ESC
-[-] ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ . ; [
-[-] ++++++++++++++++++++++++++++++++++++++++++++++++++++. ; 3
-[-] ++++++++++++++++++++++++++++++++++++++++++++++++++. ; 2
-[-] +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++. ; m
+; Reset colors
+[-] !#cr
 
-; Print text
-"BF++ TUI Demo\n\0"
-<<<<<<<<<<<<<<<<<
+; Draw a horizontal line at row 11, col 5, length 40, char '-'
+[-]
+#11 > #5 > #40 > #45 <<< !#dl
+
+; Show cursor
+[-] !#cs
+
+; Move cursor below the box
+#13 > #1 < !#cm
+
+; Read a keypress
+[-] !#kb
+
+; Print newline and exit message
+#10 .
+"Done!\n\0"
+<<<<<<
 [.>]

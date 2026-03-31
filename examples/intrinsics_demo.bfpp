@@ -1,0 +1,45 @@
+; BF++ Intrinsics Demo
+; Demonstrates compiler intrinsics — subroutine calls starting with __
+; that the compiler replaces with inline C code.
+;
+; Compile and run:
+;   bfpp examples/intrinsics_demo.bfpp -o intrinsics_demo
+;   ./intrinsics_demo
+
+!include "io.bfpp"
+
+; --- __getenv: read environment variable ---
+; Write "HOME" at ptr, call __getenv which overwrites with the value
+"HOME\0"
+<<<<<                   ; back to start of "HOME" (5 bytes: H,O,M,E,\0)
+!#__getenv              ; reads HOME, writes value at ptr (overwrites "HOME")
+!#.>                    ; print the result path
+#10 . [-]              ; newline
+
+; --- __getpid: get process ID ---
+[-]
+!#__getpid              ; tape[ptr] = pid
+!#.+                    ; print as decimal
+#10 .                   ; newline
+
+; --- __time_ms: monotonic timestamp ---
+[-]
+!#__time_ms             ; tape[ptr] = timestamp in ms
+!#.+                    ; print timestamp
+#10 .
+
+; --- __sleep: pause execution ---
+[-]
+#50                     ; 50 milliseconds
+!#__sleep               ; pause
+
+; --- __time_ms again to show elapsed time ---
+[-]
+!#__time_ms
+!#.+
+#10 .
+
+; --- __exit: clean exit with code 0 ---
+[-]
+#0
+!#__exit
