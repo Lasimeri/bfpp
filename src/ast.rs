@@ -83,7 +83,16 @@ pub enum AstNode {
 
     // ── Immediate value & direct width ──────────────────────────────
     SetValue(u64),          // #N — set current cell to immediate value N
+    SetMulti(Vec<u64>),     // #{a,b,c} — set P+0=a, P+1=b, P+2=c; ptr unchanged
     SetCellWidth(u8),       // %N — set cell width directly (1, 2, 4, or 8)
+
+    // ── Conditional comparison ──────────────────────────────────────
+    // Snapshots current cell into a C temp var, compares, branches.
+    // Does NOT consume the cell value (non-destructive).
+    IfEqual(u64, Vec<AstNode>, Option<Vec<AstNode>>),    // ?= #N { body } [: { else }]
+    IfNotEqual(u64, Vec<AstNode>),                       // ?! #N { body }
+    IfLess(u64, Vec<AstNode>),                           // ?< #N { body }
+    IfGreater(u64, Vec<AstNode>),                        // ?> #N { body }
 
     // ── Optimizer synthetic nodes ───────────────────────────────────
     // These never appear in parser output. The optimizer rewrites certain

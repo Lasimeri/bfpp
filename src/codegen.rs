@@ -816,6 +816,67 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
             out.push_str(&format!("bfpp_set(ptr, {}ULL);\n", val));
         }
 
+        // Multi-cell setup: set P+0, P+1, ... P+N from a list of values.
+        // Pointer stays at P+0 after the operation.
+        AstNode::SetMulti(values) => {
+            indent(out, ctx.indent);
+            out.push_str("{\n");
+            ctx.indent += 1;
+            for (i, val) in values.iter().enumerate() {
+                indent(out, ctx.indent);
+                out.push_str(&format!("bfpp_set((ptr + {}) & TAPE_MASK, {}ULL);\n", i, val));
+            }
+            ctx.indent -= 1;
+            indent(out, ctx.indent);
+            out.push_str("}\n");
+        }
+
+        // Conditional comparisons: snapshot current cell value, compare, branch.
+        // Non-destructive — the cell value is preserved after the comparison.
+        AstNode::IfEqual(val, body, else_body) => {
+            indent(out, ctx.indent);
+            out.push_str(&format!("if (bfpp_get(ptr) == {}ULL) {{\n", val));
+            ctx.indent += 1;
+            emit_nodes(out, body, ctx);
+            ctx.indent -= 1;
+            if let Some(else_nodes) = else_body {
+                indent(out, ctx.indent);
+                out.push_str("} else {\n");
+                ctx.indent += 1;
+                emit_nodes(out, else_nodes, ctx);
+                ctx.indent -= 1;
+            }
+            indent(out, ctx.indent);
+            out.push_str("}\n");
+        }
+        AstNode::IfNotEqual(val, body) => {
+            indent(out, ctx.indent);
+            out.push_str(&format!("if (bfpp_get(ptr) != {}ULL) {{\n", val));
+            ctx.indent += 1;
+            emit_nodes(out, body, ctx);
+            ctx.indent -= 1;
+            indent(out, ctx.indent);
+            out.push_str("}\n");
+        }
+        AstNode::IfLess(val, body) => {
+            indent(out, ctx.indent);
+            out.push_str(&format!("if (bfpp_get(ptr) < {}ULL) {{\n", val));
+            ctx.indent += 1;
+            emit_nodes(out, body, ctx);
+            ctx.indent -= 1;
+            indent(out, ctx.indent);
+            out.push_str("}\n");
+        }
+        AstNode::IfGreater(val, body) => {
+            indent(out, ctx.indent);
+            out.push_str(&format!("if (bfpp_get(ptr) > {}ULL) {{\n", val));
+            ctx.indent += 1;
+            emit_nodes(out, body, ctx);
+            ctx.indent -= 1;
+            indent(out, ctx.indent);
+            out.push_str("}\n");
+        }
+
         // Direct cell width: set cell width to a specific value (1, 2, 4, or 8)
         // without cycling. Handles sub-cell release and continuation marking
         // the same way bfpp_cycle_width does.
@@ -1083,6 +1144,25 @@ fn emit_intrinsic(out: &mut String, name: &str, ctx: &mut GenCtx) {
             // Output: tape[ptr]=1 if data ready, 0 if timeout
             indent(out, ctx.indent);
             out.push_str("{ struct pollfd pfd = {0, POLLIN, 0}; int r = poll(&pfd, 1, (int)bfpp_get(ptr)); bfpp_set(ptr, r > 0 ? 1 : 0); }\n");
+        }
+
+        // ── Memory operations ─────────────────────────────────────
+        "__memcpy" => {
+            // Input: tape[ptr]=dst, tape[ptr+1]=src, tape[ptr+2]=count
+            // Uses memmove (handles overlapping regions)
+            indent(out, ctx.indent);
+            out.push_str("{ int dst = (int)bfpp_get(ptr) & TAPE_MASK; int src = (int)bfpp_get((ptr+1) & TAPE_MASK) & TAPE_MASK; int cnt = (int)bfpp_get((ptr+2) & TAPE_MASK); if (cnt > 0 && dst + cnt <= TAPE_SIZE && src + cnt <= TAPE_SIZE) memmove(&tape[dst], &tape[src], cnt); }\n");
+        }
+        "__memset" => {
+            // Input: tape[ptr]=addr, tape[ptr+1]=value, tape[ptr+2]=count
+            indent(out, ctx.indent);
+            out.push_str("{ int addr = (int)bfpp_get(ptr) & TAPE_MASK; uint8_t val = (uint8_t)bfpp_get((ptr+1) & TAPE_MASK); int cnt = (int)bfpp_get((ptr+2) & TAPE_MASK); if (cnt > 0 && addr + cnt <= TAPE_SIZE) memset(&tape[addr], val, cnt); }\n");
+        }
+        "__memchr" => {
+            // Input: tape[ptr]=start_addr, tape[ptr+1]=byte, tape[ptr+2]=max_count
+            // Output: tape[ptr]=found_addr (or 0 if not found)
+            indent(out, ctx.indent);
+            out.push_str("{ int start = (int)bfpp_get(ptr) & TAPE_MASK; uint8_t needle = (uint8_t)bfpp_get((ptr+1) & TAPE_MASK); int maxn = (int)bfpp_get((ptr+2) & TAPE_MASK); if (maxn > TAPE_SIZE - start) maxn = TAPE_SIZE - start; uint8_t *found = memchr(&tape[start], needle, maxn); bfpp_set(ptr, found ? (uint64_t)(found - tape) : 0); }\n");
         }
 
         // ── TUI Runtime ──────────────────────────────────────────
@@ -1382,5 +1462,57 @@ mod tests {
         assert!(result.c_source.contains("ioctl"));
         assert!(result.c_source.contains("#include <termios.h>"));
         assert!(result.c_source.contains("struct termios bfpp_saved_termios"));
+    }
+
+    #[test]
+    fn test_multi_cell_codegen() {
+        let tokens = lex("#{65, 66, 67}").unwrap();
+        let program = parse(&tokens).unwrap();
+        let result = generate(&program, &CodegenOptions::default());
+        assert!(result.c_source.contains("bfpp_set((ptr + 0)"));
+        assert!(result.c_source.contains("65ULL"));
+        assert!(result.c_source.contains("bfpp_set((ptr + 2)"));
+        assert!(result.c_source.contains("67ULL"));
+    }
+
+    #[test]
+    fn test_if_equal_codegen() {
+        let tokens = lex("?= #17 [ #89 . ]").unwrap();
+        let program = parse(&tokens).unwrap();
+        let result = generate(&program, &CodegenOptions::default());
+        assert!(result.c_source.contains("if (bfpp_get(ptr) == 17ULL)"));
+    }
+
+    #[test]
+    fn test_if_else_codegen() {
+        let tokens = lex("?= #65 [ #89 . ] : [ #78 . ]").unwrap();
+        let program = parse(&tokens).unwrap();
+        let result = generate(&program, &CodegenOptions::default());
+        assert!(result.c_source.contains("if (bfpp_get(ptr) == 65ULL)"));
+        assert!(result.c_source.contains("} else {"));
+    }
+
+    #[test]
+    fn test_if_less_codegen() {
+        let tokens = lex("?< #32 [ #89 . ]").unwrap();
+        let program = parse(&tokens).unwrap();
+        let result = generate(&program, &CodegenOptions::default());
+        assert!(result.c_source.contains("if (bfpp_get(ptr) < 32ULL)"));
+    }
+
+    #[test]
+    fn test_memcpy_intrinsic_codegen() {
+        let tokens = lex("!#__memcpy").unwrap();
+        let program = parse(&tokens).unwrap();
+        let result = generate(&program, &CodegenOptions::default());
+        assert!(result.c_source.contains("memmove"));
+    }
+
+    #[test]
+    fn test_memset_intrinsic_codegen() {
+        let tokens = lex("!#__memset").unwrap();
+        let program = parse(&tokens).unwrap();
+        let result = generate(&program, &CodegenOptions::default());
+        assert!(result.c_source.contains("memset(&tape"));
     }
 }

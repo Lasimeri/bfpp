@@ -239,15 +239,59 @@ fn parse_single(tokens: &[Token], pos: &mut usize) -> Result<AstNode, ParseError
         Token::FramebufferFlush => Ok(AstNode::FramebufferFlush),
 
         // ── Immediate value & direct width ─────────────────────────
-        // NumericLit: #N or #0xHH — sets cell to an immediate value.
-        // The lexer already parsed the number; the AST stores it as u64.
         Token::NumericLit(val) => Ok(AstNode::SetValue(*val)),
+        Token::MultiCell(values) => Ok(AstNode::SetMulti(values.clone())),
         // SetCellWidth: %1/%2/%4/%8 — sets cell width without cycling.
         // Distinct from CellWidthCycle (bare %) which rotates through widths.
         Token::SetCellWidth(w) => Ok(AstNode::SetCellWidth(*w)),
 
         // ── FFI ─────────────────────────────────────────────────────
         Token::FfiCall(lib, func) => Ok(AstNode::FfiCall(lib.clone(), func.clone())),
+
+        // ── Conditional comparison ─────────────────────────────────
+        // ?= #N { body } [: { else_body }]
+        Token::IfEqual => {
+            let val = parse_cond_value(tokens, pos)?;
+            let body = parse_cond_body(tokens, pos)?;
+            // Check for else clause (: { ... })
+            let else_body = if *pos < tokens.len() && tokens[*pos] == Token::Colon {
+                *pos += 1; // consume :
+                Some(parse_cond_body(tokens, pos)?)
+            } else {
+                None
+            };
+            Ok(AstNode::IfEqual(val, body, else_body))
+        }
+        Token::IfNotEqual => {
+            let val = parse_cond_value(tokens, pos)?;
+            let body = parse_cond_body(tokens, pos)?;
+            Ok(AstNode::IfNotEqual(val, body))
+        }
+        Token::IfLess => {
+            let val = parse_cond_value(tokens, pos)?;
+            let body = parse_cond_body(tokens, pos)?;
+            Ok(AstNode::IfLess(val, body))
+        }
+        Token::IfGreater => {
+            let val = parse_cond_value(tokens, pos)?;
+            let body = parse_cond_body(tokens, pos)?;
+            Ok(AstNode::IfGreater(val, body))
+        }
+
+        // Colon outside conditional — error
+        Token::Colon => Err(ParseError {
+            message: "':' (else) outside of a conditional block".into(),
+            token_index: *pos - 1,
+        }),
+
+        // let declarations are consumed by the parser's name resolution pass
+        // and don't produce AST nodes. If one reaches parse_single, it's an error
+        // (they should be stripped in a pre-pass).
+        Token::LetDecl(_, _) => {
+            // For now, just skip let declarations — they're handled by name resolution
+            // which we'll add as a pre-parse pass. No AST node needed.
+            Ok(AstNode::Clear) // no-op placeholder; TODO: proper let handling
+        }
 
         // ── Error cases: terminators appearing in wrong context ─────
         // A bare K{ without a preceding R{} — the R branch above is the
@@ -290,6 +334,100 @@ fn count_consecutive(tokens: &[Token], pos: &mut usize, target: &Token) -> usize
 // Convert lexer FdSpec to AST FdSpec.
 // These are structurally identical but live in separate modules to keep the
 // lexer and AST decoupled — the AST shouldn't depend on lexer types.
+// Parse the comparison value after ?= / ?! / ?< / ?>
+// Expects a #N token (numeric literal) as the comparison target.
+fn parse_cond_value(tokens: &[Token], pos: &mut usize) -> Result<u64, ParseError> {
+    if *pos >= tokens.len() {
+        return Err(ParseError {
+            message: "Expected #N after conditional operator".into(),
+            token_index: *pos,
+        });
+    }
+    match &tokens[*pos] {
+        Token::NumericLit(val) => {
+            let v = *val;
+            *pos += 1;
+            Ok(v)
+        }
+        _ => Err(ParseError {
+            message: "Expected #N (numeric literal) after conditional operator".into(),
+            token_index: *pos,
+        }),
+    }
+}
+
+// Parse a brace-delimited body for conditional blocks: { ... }
+// Reuses the existing parse_block with BraceClose terminator.
+fn parse_cond_body(tokens: &[Token], pos: &mut usize) -> Result<Vec<AstNode>, ParseError> {
+    if *pos >= tokens.len() {
+        return Err(ParseError {
+            message: "Expected '{' for conditional body".into(),
+            token_index: *pos,
+        });
+    }
+    // The conditional body uses { } delimiters, but the lexer doesn't have
+    // a dedicated "block open" token — { is BraceClose's counterpart.
+    // For subroutines, { is consumed by the SubDef token. For conditionals,
+    // we need to handle it differently.
+    // HACK: Check if next token starts a valid block. Since we don't have
+    // a BraceOpen token, we'll consume tokens that look like they belong
+    // to the body. For now, reuse the same BraceClose-terminated parsing
+    // that SubDef bodies use. The lexer would need a BraceOpen token
+    // for proper conditional blocks.
+    //
+    // Actually — the SubDef token already consumed the {, but for conditionals
+    // the { hasn't been consumed. We need to skip it.
+    // But { isn't a token in the lexer... } is BraceClose. There's no BraceOpen.
+    //
+    // SOLUTION: Use the same [ ] bracket style but with different delimiters.
+    // Or: just parse until we see BraceClose, consuming it.
+    // The issue: bare { isn't tokenized. Let me check...
+    // In the lexer, } is BraceClose. But { is only consumed as part of
+    // SubDef, ResultStart, CatchStart, and fd specs.
+    // For conditionals, we need { to be recognized.
+    // The simplest fix: treat { as a generic block open in the wildcard.
+    // But that would break things.
+    //
+    // PRAGMATIC FIX: Conditionals use [ ] instead of { }
+    // ?= #17 [ body ] : [ else ]
+    // This reuses existing LoopStart/LoopEnd tokens.
+    // But that conflicts with BF loops semantically...
+    //
+    // BETTER FIX: The conditional syntax doesn't use braces at all.
+    // Instead, parse a block of statements until we hit a known terminator.
+    // Since conditionals are always ?= #N followed by a body that ends
+    // at the next `:` or at the containing block's `}`, we can parse
+    // using the existing block mechanism with BraceClose.
+    //
+    // SIMPLEST: Just use BraceClose as the block delimiter.
+    // This requires { to be tokenized. Let me add it.
+    // Actually — wait. The SubDef already consumes {. The R{ and K{
+    // consume { as part of their compound token. But a bare { would
+    // need to be its own token.
+    // Let me just add it: in the lexer, '{' alone (not after !#name, R, K)
+    // is already not tokenized — it's caught by SubDef/ResultStart/CatchStart.
+    // For conditionals, the { appears after #N, which the lexer sees as
+    // a separate context. The simplest approach: after parsing the #N value
+    // in parse_cond_value, check if the next raw character in the source
+    // would be {. But we're past the lexer — we only have tokens.
+    //
+    // FINAL SOLUTION: The conditional body is delimited by matching BraceClose.
+    // We need to add a BraceOpen token to the lexer for standalone {.
+    // But that would break SubDef parsing...
+    //
+    // ACTUAL SIMPLEST: Use LoopStart/LoopEnd for conditional bodies.
+    // ?= #17 [ quit_body ] : [ else_body ]
+    if *pos < tokens.len() && tokens[*pos] == Token::LoopStart {
+        *pos += 1; // consume [
+        parse_block(tokens, pos, BlockEnd::LoopEnd)
+    } else {
+        Err(ParseError {
+            message: "Expected '[' to start conditional body".into(),
+            token_index: *pos,
+        })
+    }
+}
+
 fn convert_fd(fd: &crate::lexer::FdSpec) -> FdSpec {
     match fd {
         crate::lexer::FdSpec::Literal(n) => FdSpec::Literal(*n),

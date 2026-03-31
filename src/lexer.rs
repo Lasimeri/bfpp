@@ -66,8 +66,21 @@ pub enum Token {
     // Numeric literal — set current cell to an immediate value
     NumericLit(u64),   // #N or #0xHH — set cell to value N (respects cell width)
 
+    // Multi-cell setup — set consecutive cells from P+0 in one shot
+    MultiCell(Vec<u64>), // #{a, b, c} — set P+0=a, P+1=b, P+2=c; ptr stays at P+0
+
     // Direct cell width — set cell width without cycling
     SetCellWidth(u8),  // %1, %2, %4, %8 — set cell width directly
+
+    // Conditional comparison — if current cell == N, execute block
+    IfEqual,     // ?= — followed by #N { body } optionally : { else }
+    IfNotEqual,  // ?! — followed by #N { body }
+    IfLess,      // ?< — followed by #N { body }
+    IfGreater,   // ?> — followed by #N { body }
+    Colon,       // : — else separator in ?= #N { } : { }
+
+    // Named variable declaration
+    LetDecl(String, u64), // let name N — compile-time alias for tape position
 }
 
 // File descriptor specifier for fd-directed I/O (.{N} and ,{N} syntax).
@@ -276,7 +289,17 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
             '&' => { chars.next(); col += 1; tokens.push(Token::BitAnd); }
 
             // Error handling
-            '?' => { chars.next(); col += 1; tokens.push(Token::Propagate); }
+            '?' => {
+                chars.next(); col += 1;
+                // Check for conditional operators: ?= ?! ?< ?>
+                match chars.peek() {
+                    Some('=') => { chars.next(); col += 1; tokens.push(Token::IfEqual); }
+                    Some('!') => { chars.next(); col += 1; tokens.push(Token::IfNotEqual); }
+                    Some('<') => { chars.next(); col += 1; tokens.push(Token::IfLess); }
+                    Some('>') => { chars.next(); col += 1; tokens.push(Token::IfGreater); }
+                    _ => { tokens.push(Token::Propagate); }
+                }
+            }
 
             // R{ and K{ — error handling blocks. Unlike subroutines, R and K are not
             // standalone tokens — they MUST be followed by {. A bare R or K is a lex error,
@@ -317,9 +340,64 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
             'T' => { chars.next(); col += 1; tokens.push(Token::TapeAddr); }
             'F' => { chars.next(); col += 1; tokens.push(Token::FramebufferFlush); }
 
-            // Numeric literal: #N (decimal) or #0xHH (hex) — set current cell to immediate value
+            // # — numeric literal (#N), hex literal (#0xHH), or multi-cell setup (#{a,b,c})
             '#' => {
                 chars.next(); col += 1;
+
+                // Check for multi-cell setup: #{...}
+                if chars.peek() == Some(&'{') {
+                    chars.next(); col += 1; // consume {
+                    let mut values = Vec::new();
+                    loop {
+                        // Skip whitespace
+                        while chars.peek().is_some_and(|c| c.is_whitespace() && *c != '\n') {
+                            if *chars.peek().unwrap() == '\n' { line += 1; col = 1; }
+                            chars.next(); col += 1;
+                        }
+                        if chars.peek() == Some(&'}') {
+                            chars.next(); col += 1;
+                            break;
+                        }
+                        // Parse a number (decimal or 0x hex)
+                        let mut ns = String::new();
+                        let hex = chars.peek() == Some(&'0') && {
+                            let mut la = chars.clone(); la.next();
+                            matches!(la.peek(), Some('x') | Some('X'))
+                        };
+                        if hex {
+                            chars.next(); col += 1; // 0
+                            chars.next(); col += 1; // x
+                            while chars.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
+                                ns.push(*chars.peek().unwrap());
+                                chars.next(); col += 1;
+                            }
+                            values.push(u64::from_str_radix(&ns, 16).map_err(|_| LexError {
+                                message: format!("Invalid hex in #{{...}}: 0x{}", ns), line, col,
+                            })?);
+                        } else {
+                            while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+                                ns.push(*chars.peek().unwrap());
+                                chars.next(); col += 1;
+                            }
+                            if ns.is_empty() {
+                                return Err(LexError {
+                                    message: "Expected number in #{...}".into(), line, col,
+                                });
+                            }
+                            values.push(ns.parse::<u64>().map_err(|_| LexError {
+                                message: format!("Invalid number in #{{...}}: {}", ns), line, col,
+                            })?);
+                        }
+                        // Skip comma and whitespace
+                        while chars.peek().is_some_and(|c| *c == ',' || c.is_whitespace()) {
+                            if chars.peek() == Some(&'\n') { line += 1; col = 1; }
+                            chars.next(); col += 1;
+                        }
+                    }
+                    tokens.push(Token::MultiCell(values));
+                    continue;
+                }
+
                 let mut num_str = String::new();
                 // Check for hex prefix 0x
                 let is_hex = chars.peek() == Some(&'0') && {
@@ -406,6 +484,80 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
                     }
                 }
                 // Standalone '/' not followed by '*' is silently ignored
+            }
+
+            // Colon — else separator in conditional blocks: ?= #N { } : { }
+            ':' => { chars.next(); col += 1; tokens.push(Token::Colon); }
+
+            // 'l' — check for 'let' keyword (named variable declaration)
+            'l' => {
+                let mut la = chars.clone();
+                la.next(); // l
+                if la.peek() == Some(&'e') {
+                    la.next(); // e
+                    if la.peek() == Some(&'t') {
+                        la.next(); // t
+                        // Must be followed by whitespace (not part of a subroutine name)
+                        if la.peek().is_some_and(|c| c.is_whitespace()) {
+                            chars.next(); col += 1; // l
+                            chars.next(); col += 1; // e
+                            chars.next(); col += 1; // t
+                            // Skip whitespace
+                            while chars.peek().is_some_and(|c| c.is_whitespace() && *c != '\n') {
+                                chars.next(); col += 1;
+                            }
+                            // Parse name (alphanumeric + _)
+                            let mut name = String::new();
+                            while chars.peek().is_some_and(|c| c.is_alphanumeric() || *c == '_') {
+                                name.push(*chars.peek().unwrap());
+                                chars.next(); col += 1;
+                            }
+                            if name.is_empty() {
+                                return Err(LexError {
+                                    message: "Expected name after 'let'".into(), line, col,
+                                });
+                            }
+                            // Skip whitespace
+                            while chars.peek().is_some_and(|c| c.is_whitespace() && *c != '\n') {
+                                chars.next(); col += 1;
+                            }
+                            // Parse value (decimal or 0x hex)
+                            let mut vs = String::new();
+                            let hex = chars.peek() == Some(&'0') && {
+                                let mut la2 = chars.clone(); la2.next();
+                                matches!(la2.peek(), Some('x') | Some('X'))
+                            };
+                            let val = if hex {
+                                chars.next(); col += 1; // 0
+                                chars.next(); col += 1; // x
+                                while chars.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
+                                    vs.push(*chars.peek().unwrap());
+                                    chars.next(); col += 1;
+                                }
+                                u64::from_str_radix(&vs, 16).map_err(|_| LexError {
+                                    message: format!("Invalid hex in let: 0x{}", vs), line, col,
+                                })?
+                            } else {
+                                while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+                                    vs.push(*chars.peek().unwrap());
+                                    chars.next(); col += 1;
+                                }
+                                if vs.is_empty() {
+                                    return Err(LexError {
+                                        message: "Expected value after 'let name'".into(), line, col,
+                                    });
+                                }
+                                vs.parse::<u64>().map_err(|_| LexError {
+                                    message: format!("Invalid number in let: {}", vs), line, col,
+                                })?
+                            };
+                            tokens.push(Token::LetDecl(name, val));
+                            continue;
+                        }
+                    }
+                }
+                // Not 'let' — fall through to ignored char
+                chars.next(); col += 1;
             }
 
             // Wildcard: silently ignore whitespace, digits, and any unrecognized characters.
@@ -795,5 +947,56 @@ mod tests {
     #[test]
     fn test_standalone_k_error() {
         assert!(lex("K +").is_err());
+    }
+
+    #[test]
+    fn test_multi_cell() {
+        let tokens = lex("#{72, 101, 108}").unwrap();
+        assert_eq!(tokens, vec![Token::MultiCell(vec![72, 101, 108])]);
+    }
+
+    #[test]
+    fn test_multi_cell_hex() {
+        let tokens = lex("#{0x48, 0x65}").unwrap();
+        assert_eq!(tokens, vec![Token::MultiCell(vec![0x48, 0x65])]);
+    }
+
+    #[test]
+    fn test_if_equal() {
+        let tokens = lex("?= #17").unwrap();
+        assert_eq!(tokens, vec![Token::IfEqual, Token::NumericLit(17)]);
+    }
+
+    #[test]
+    fn test_if_not_equal() {
+        let tokens = lex("?! #5").unwrap();
+        assert_eq!(tokens, vec![Token::IfNotEqual, Token::NumericLit(5)]);
+    }
+
+    #[test]
+    fn test_if_less_greater() {
+        let tokens = lex("?< #32 ?> #126").unwrap();
+        assert_eq!(tokens, vec![
+            Token::IfLess, Token::NumericLit(32),
+            Token::IfGreater, Token::NumericLit(126),
+        ]);
+    }
+
+    #[test]
+    fn test_colon_token() {
+        let tokens = lex(": +").unwrap();
+        assert_eq!(tokens, vec![Token::Colon, Token::Increment]);
+    }
+
+    #[test]
+    fn test_let_declaration() {
+        let tokens = lex("let cursor_x 50").unwrap();
+        assert_eq!(tokens, vec![Token::LetDecl("cursor_x".into(), 50)]);
+    }
+
+    #[test]
+    fn test_let_hex() {
+        let tokens = lex("let addr 0x9000").unwrap();
+        assert_eq!(tokens, vec![Token::LetDecl("addr".into(), 0x9000)]);
     }
 }
