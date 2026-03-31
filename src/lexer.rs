@@ -1,8 +1,14 @@
 /// BF++ Lexer — tokenizes source into a stream of tokens.
+///
+/// The lexer operates as a single-pass character dispatcher: each iteration peeks at
+/// the current character and dispatches to the appropriate token constructor. Multi-char
+/// tokens (strings, subroutines, fd specs, FFI) consume additional characters inline
+/// via helper functions. Unrecognized characters are silently ignored, which is
+/// intentional — BF traditionally treats non-instruction chars as comments.
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
-    // Core BF
+    // Core BF — the original 8 Brainfuck instructions
     MoveRight,
     MoveLeft,
     Increment,
@@ -12,30 +18,30 @@ pub enum Token {
     LoopStart,
     LoopEnd,
 
-    // Extended memory
-    AbsoluteAddr,   // @
-    Deref,          // *
-    CellWidthCycle, // %
+    // Extended memory — pointer addressing and cell width control
+    AbsoluteAddr,   // @ — jump pointer to address stored in current cell
+    Deref,          // * — dereference: use current cell's value as a pointer
+    CellWidthCycle, // % — cycle cell width (8→16→32 bit)
 
-    // String literal (already parsed bytes)
+    // String literal — pre-parsed into raw bytes (escape sequences already resolved)
     StringLit(Vec<u8>),
 
-    // Stack
+    // Stack — push/pop current cell value to an auxiliary stack
     Push,  // $
     Pop,   // ~
 
-    // Subroutines
-    SubDef(String),   // !#name{ — name extracted, { consumed
-    SubCall(String),  // !#name (not followed by {)
-    BraceClose,       // }
-    Return,           // ^
+    // Subroutines — definition and invocation
+    SubDef(String),   // !#name{ — opens a named subroutine body
+    SubCall(String),  // !#name (no trailing {) — invokes a previously defined subroutine
+    BraceClose,       // } — closes a subroutine def, R{}, or K{} block
+    Return,           // ^ — early return from subroutine
 
-    // Syscall
-    Syscall,          // backslash (standalone)
-    OutputFd(FdSpec), // .{N}
-    InputFd(FdSpec),  // ,{N}
+    // Syscall and fd-directed I/O
+    Syscall,          // \ (standalone) — raw syscall
+    OutputFd(FdSpec), // .{N} or .{*} — write to a specific or indirect fd
+    InputFd(FdSpec),  // ,{N} or ,{*} — read from a specific or indirect fd
 
-    // Bitwise
+    // Bitwise — single-char operators on current cell
     BitOr,       // |
     BitAnd,      // &
     BitXor,      // x
@@ -43,21 +49,23 @@ pub enum Token {
     ShiftRight,  // r
     BitNot,      // n
 
-    // Error handling
-    ErrorRead,   // E
-    ErrorWrite,  // e
-    Propagate,   // ?
-    ResultStart, // R{
-    CatchStart,  // K{
+    // Error handling — result/catch pattern
+    ErrorRead,   // E — read error register into current cell
+    ErrorWrite,  // e — write current cell into error register
+    Propagate,   // ? — propagate error (abort current block if error is set)
+    ResultStart, // R{ — begin a result block (catches errors from body)
+    CatchStart,  // K{ — begin a catch block (runs if preceding R{} errored)
 
     // Tape address & framebuffer
-    TapeAddr,          // T
-    FramebufferFlush,  // F
+    TapeAddr,          // T — store current pointer address into cell
+    FramebufferFlush,  // F — flush framebuffer to display
 
-    // FFI
-    FfiCall(String, String), // \ffi "lib" "func"
+    // FFI — foreign function interface
+    FfiCall(String, String), // \ffi "lib" "func" — call an external shared library function
 }
 
+// File descriptor specifier for fd-directed I/O (.{N} and ,{N} syntax).
+// Literal holds a compile-time fd number; Indirect means "read fd from current cell at runtime."
 #[derive(Debug, Clone, PartialEq)]
 pub enum FdSpec {
     Literal(u32),
@@ -77,6 +85,13 @@ impl std::fmt::Display for LexError {
     }
 }
 
+/// Main lexer entry point. Consumes a source string and produces a flat token stream.
+///
+/// Design: single-pass, peek-based character dispatch. Each match arm handles one
+/// token class. Multi-character tokens (strings, subroutines, fd specs, FFI) delegate
+/// to dedicated parsers that advance the iterator. Unrecognized characters fall through
+/// to the wildcard arm and are silently ignored — this preserves BF's convention that
+/// non-instruction characters serve as inline comments.
 pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
     let mut tokens = Vec::new();
     let mut chars = source.chars().peekable();
@@ -85,7 +100,7 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
 
     while let Some(&ch) = chars.peek() {
         match ch {
-            // Comment — skip to end of line
+            // Comment — semicolon consumes everything to end of line (but not the newline itself)
             ';' => {
                 while let Some(&c) = chars.peek() {
                     if c == '\n' {
@@ -112,7 +127,8 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
             '[' => { chars.next(); col += 1; tokens.push(Token::LoopStart); }
             ']' => { chars.next(); col += 1; tokens.push(Token::LoopEnd); }
 
-            // . — could be Output or .{N} fd-extended
+            // . and , are overloaded: plain is standard I/O, followed by {N} is fd-directed.
+            // Peek after consuming the char to decide which variant to emit.
             '.' => {
                 chars.next(); col += 1;
                 if chars.peek() == Some(&'{') {
@@ -123,7 +139,6 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
                 }
             }
 
-            // , — could be Input or ,{N}
             ',' => {
                 chars.next(); col += 1;
                 if chars.peek() == Some(&'{') {
@@ -152,7 +167,10 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
                 tokens.push(Token::StringLit(s));
             }
 
-            // Subroutine def/call: !#name{ or !#name
+            // Subroutine syntax: !#name{ (definition) or !#name (call).
+            // The trailing { distinguishes defs from calls. The name can contain
+            // BF operator chars (see is_sub_name_symbol), allowing names like "!#>>" —
+            // this is intentional so subroutine names can be mnemonic for their operation.
             '!' => {
                 chars.next(); col += 1;
                 if chars.peek() != Some(&'#') {
@@ -169,6 +187,7 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
                         line, col,
                     });
                 }
+                // Trailing { means definition; absence means call
                 if chars.peek() == Some(&'{') {
                     chars.next(); col += 1;
                     tokens.push(Token::SubDef(name));
@@ -180,17 +199,19 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
             // Brace close (ends subroutine def, R block, or K block)
             '}' => { chars.next(); col += 1; tokens.push(Token::BraceClose); }
 
-            // Syscall: \ or \ffi "lib" "func"
+            // Backslash: either a standalone syscall (\) or an FFI call (\ffi "lib" "func").
+            // Uses lookahead cloning to check for "ffi" without consuming chars prematurely —
+            // if the lookahead doesn't match, the backslash is emitted as a plain Syscall token.
             '\\' => {
                 chars.next(); col += 1;
-                // Check for \ffi
                 if chars.peek() == Some(&'f') {
+                    // Clone the iterator to peek 3 chars ahead without consuming
                     let mut lookahead = chars.clone();
                     lookahead.next(); // f
                     if lookahead.peek() == Some(&'f') {
                         lookahead.next(); // second f
                         if lookahead.peek() == Some(&'i') {
-                            // Consume ffi
+                            // Confirmed \ffi — now consume the chars for real
                             chars.next(); col += 1; // f
                             chars.next(); col += 1; // f
                             chars.next(); col += 1; // i
@@ -241,7 +262,9 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
             // Error handling
             '?' => { chars.next(); col += 1; tokens.push(Token::Propagate); }
 
-            // R{ and K{ — result/catch blocks
+            // R{ and K{ — error handling blocks. Unlike subroutines, R and K are not
+            // standalone tokens — they MUST be followed by {. A bare R or K is a lex error,
+            // not a no-op, to catch typos early.
             'R' => {
                 chars.next(); col += 1;
                 if chars.peek() == Some(&'{') {
@@ -267,7 +290,8 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
                 }
             }
 
-            // Single-char alpha operators
+            // Single-char alpha operators — these use lowercase/uppercase letters as mnemonics.
+            // Case matters: E (read error) vs e (write error), etc.
             'x' => { chars.next(); col += 1; tokens.push(Token::BitXor); }
             's' => { chars.next(); col += 1; tokens.push(Token::ShiftLeft); }
             'r' => { chars.next(); col += 1; tokens.push(Token::ShiftRight); }
@@ -277,7 +301,8 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
             'T' => { chars.next(); col += 1; tokens.push(Token::TapeAddr); }
             'F' => { chars.next(); col += 1; tokens.push(Token::FramebufferFlush); }
 
-            // All other characters are ignored (whitespace, unrecognized chars)
+            // Wildcard: silently ignore whitespace, digits, and any unrecognized characters.
+            // This is by design — BF convention treats everything non-instructional as a comment.
             _ => {
                 chars.next();
                 col += 1;
@@ -288,7 +313,11 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
     Ok(tokens)
 }
 
-/// Parse {N} or {*} fd specifier. Assumes '{' is the next char.
+// Parse {N} or {*} fd specifier after a . or , token.
+// Two forms:
+//   {N}  — literal fd number (e.g., {2} for stderr)
+//   {*}  — indirect: fd number is read from the current cell at runtime
+// Caller has already consumed the . or , and confirmed '{' is next.
 fn parse_fd_spec(
     chars: &mut std::iter::Peekable<std::str::Chars>,
     col: &mut usize,
@@ -297,6 +326,7 @@ fn parse_fd_spec(
     // consume '{'
     chars.next(); *col += 1;
 
+    // Check for indirect specifier {*}
     if chars.peek() == Some(&'*') {
         chars.next(); *col += 1;
         if chars.peek() == Some(&'}') {
@@ -309,6 +339,7 @@ fn parse_fd_spec(
         });
     }
 
+    // Literal fd: accumulate digits until closing }
     let mut num_str = String::new();
     while let Some(&c) = chars.peek() {
         if c == '}' {
@@ -326,6 +357,7 @@ fn parse_fd_spec(
         }
     }
 
+    // Parse accumulated digits as u32 — empty string (bare {}) fails here
     let fd: u32 = num_str.parse().map_err(|_| LexError {
         message: "Invalid fd number".into(),
         line, col: *col,
@@ -334,30 +366,37 @@ fn parse_fd_spec(
     Ok(FdSpec::Literal(fd))
 }
 
-/// Parse a string literal, consuming the opening and closing quotes.
-/// Handles escape sequences.
+// Parse a string literal, consuming opening and closing quotes, and resolving
+// escape sequences into raw bytes. Returns Vec<u8> (not String) because BF++
+// string literals can contain arbitrary bytes via \x escapes and \0 null bytes.
+//
+// Supported escapes: \0 \n \r \t \\ \" \xHH
+// Multi-line strings are allowed — embedded newlines update the line counter.
+// Unknown escape sequences are a hard error (not silently passed through).
 fn parse_string_literal(
     chars: &mut std::iter::Peekable<std::str::Chars>,
     col: &mut usize,
     line: &mut usize,
 ) -> Result<Vec<u8>, LexError> {
-    // consume opening "
-    chars.next(); *col += 1;
-    let start_line = *line;
+    chars.next(); *col += 1; // consume opening "
+    let start_line = *line;  // remember where the string started for error reporting
 
     let mut bytes = Vec::new();
     loop {
         match chars.next() {
+            // EOF inside a string literal
             None => {
                 return Err(LexError {
                     message: "Unterminated string literal".into(),
                     line: start_line, col: *col,
                 });
             }
+            // Unescaped closing quote — end of string
             Some('"') => {
                 *col += 1;
                 break;
             }
+            // Escape sequence — dispatch on the character after the backslash
             Some('\\') => {
                 *col += 1;
                 match chars.next() {
@@ -367,6 +406,7 @@ fn parse_string_literal(
                     Some('t') => { *col += 1; bytes.push(b'\t'); }
                     Some('\\') => { *col += 1; bytes.push(b'\\'); }
                     Some('"') => { *col += 1; bytes.push(b'"'); }
+                    // Hex escape: \xHH — exactly two hex digits required
                     Some('x') => {
                         *col += 1;
                         let h1 = chars.next().ok_or(LexError {
@@ -399,14 +439,15 @@ fn parse_string_literal(
                     }
                 }
             }
+            // Bare newline inside string — allowed (multi-line string), update position
             Some('\n') => {
                 bytes.push(b'\n');
                 *line += 1;
                 *col = 1;
             }
+            // Normal character — encode as UTF-8 bytes (handles multibyte chars correctly)
             Some(c) => {
                 *col += 1;
-                // Encode as UTF-8 bytes
                 let mut buf = [0u8; 4];
                 let encoded = c.encode_utf8(&mut buf);
                 bytes.extend_from_slice(encoded.as_bytes());
@@ -417,8 +458,10 @@ fn parse_string_literal(
     Ok(bytes)
 }
 
-/// Parse subroutine name characters (after !#).
-/// Valid chars: symbols used in BF++ ops + alphanumeric.
+// Consume subroutine name characters after the !# prefix.
+// Name terminates at the first character that isn't alphanumeric or a recognized
+// BF++ operator symbol. This allows mnemonic names like "!#add", "!#>>", or "!#mul/div".
+// The terminator (typically { or whitespace) is NOT consumed.
 fn parse_sub_name(
     chars: &mut std::iter::Peekable<std::str::Chars>,
     col: &mut usize,
@@ -436,6 +479,10 @@ fn parse_sub_name(
     name
 }
 
+// Characters allowed in subroutine names beyond alphanumerics.
+// Includes BF operators and common separator chars (_, /) so names can
+// embed operational hints. Notably excludes {, }, [, ], !, #, ", and ;
+// which have structural meaning in the grammar.
 fn is_sub_name_symbol(c: char) -> bool {
     matches!(c, '>' | '<' | '+' | '-' | '.' | ',' | '@' | '*' | '%'
         | '$' | '~' | '\\' | '|' | '&' | '^' | '_' | '/')

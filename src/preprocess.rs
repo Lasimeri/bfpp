@@ -1,11 +1,23 @@
 // BF++ Preprocessor — handles `!include "filename"` directives.
 //
-// Runs as a text-level expansion pass before lexing.
-// Resolves includes relative to: source dir → --include paths → ./stdlib/ → exe-relative stdlib.
+// Runs as a text-level expansion pass BEFORE lexing. This means included content
+// is spliced into the source as raw text — included files can define subroutines,
+// contain partial expressions, etc. The lexer sees one flat string.
+//
+// Include resolution order (first match wins):
+//   1. Relative to the directory of the file containing the !include
+//   2. Each --include path provided on the command line, in order
+//   3. ./stdlib/ relative to the current working directory
+//   4. stdlib/ relative to the bfpp executable's directory
+//
+// Cycle detection: a HashSet of canonical paths prevents infinite recursion.
+// Re-including an already-visited file is silently skipped (not an error),
+// which allows diamond-shaped include graphs to work correctly.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+// Guard against runaway include chains (mutual recursion through many files)
 const MAX_INCLUDE_DEPTH: usize = 64;
 
 #[derive(Debug)]
@@ -21,17 +33,28 @@ impl std::fmt::Display for PreprocessError {
     }
 }
 
+/// Public entry point for preprocessing. Seeds the visited set with the root file
+/// and delegates to the recursive `expand` function.
 pub fn preprocess(
     source: &str,
     source_path: &Path,
     include_paths: &[PathBuf],
 ) -> Result<String, PreprocessError> {
     let mut visited = HashSet::new();
+    // Canonicalize to resolve symlinks — ensures two paths to the same file are deduplicated.
+    // Falls back to the raw path if canonicalize fails (e.g., the path doesn't exist on disk
+    // because we're processing an in-memory source with a synthetic path, as in tests).
     let canonical = source_path.canonicalize().unwrap_or_else(|_| source_path.to_path_buf());
     visited.insert(canonical.clone());
     expand(source, source_path, include_paths, &mut visited, 0)
 }
 
+// Recursive expansion workhorse. Processes one source text, line by line:
+// - Lines starting with `!include "..."` (outside string literals) are replaced
+//   with the recursively-expanded contents of the referenced file.
+// - All other lines pass through unchanged.
+// - String-state tracking prevents !include inside multi-line string literals
+//   from being treated as directives.
 fn expand(
     source: &str,
     source_path: &Path,
@@ -49,14 +72,14 @@ fn expand(
 
     let source_dir = source_path.parent().unwrap_or(Path::new("."));
     let mut result = String::new();
+    // Tracks whether we're currently inside a multi-line string literal.
+    // When true, !include directives are treated as string content, not expanded.
     let mut in_string = false;
 
     for (line_num, line) in source.lines().enumerate() {
-        // Track string literal state (simple: toggle on unescaped ")
-        // But !include must be at line start (possibly with whitespace), so
-        // we just check if the trimmed line starts with !include
         let trimmed = line.trim();
 
+        // Only process !include if we're not inside a string literal
         if !in_string && trimmed.starts_with("!include ") {
             let rest = trimmed.strip_prefix("!include ").unwrap().trim();
             if rest.starts_with('"') && rest.ends_with('"') && rest.len() >= 2 {
@@ -70,7 +93,8 @@ fn expand(
 
                 let canonical = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
                 if !visited.insert(canonical.clone()) {
-                    // Already included — skip (not an error, just dedup)
+                    // Already included — silently skip to support diamond-shaped include graphs.
+                    // e.g., A includes B and C, both of which include D — D is only expanded once.
                     result.push('\n');
                     continue;
                 }
@@ -95,10 +119,17 @@ fn expand(
             }
         }
 
-        // Track string state across lines (for multi-line strings)
+        // Track string-literal state across lines so that !include directives
+        // inside multi-line strings are not expanded. We scan every line for
+        // unescaped quote characters and toggle in_string accordingly.
         for (i, ch) in line.chars().enumerate() {
             if ch == '"' {
-                // Count consecutive backslashes before this quote
+                // Determine if this quote is escaped by counting consecutive
+                // backslashes immediately preceding it. The key insight:
+                //   \"    → 1 backslash (odd)  → quote IS escaped (backslash escapes the quote)
+                //   \\"   → 2 backslashes (even) → quote is NOT escaped (first \ escapes second \)
+                //   \\\"  → 3 backslashes (odd)  → quote IS escaped (\\ + \")
+                // So: odd count = escaped quote, even count = real quote.
                 let mut backslash_count = 0;
                 let bytes = line.as_bytes();
                 let mut j = i;
@@ -106,8 +137,6 @@ fn expand(
                     backslash_count += 1;
                     j -= 1;
                 }
-                // Even number of backslashes = real quote
-                // Odd number = the quote itself is escaped
                 if backslash_count % 2 == 0 {
                     in_string = !in_string;
                 }
@@ -121,14 +150,19 @@ fn expand(
     Ok(result)
 }
 
+// Resolve an include filename to an actual filesystem path.
+// Tries four locations in priority order, returning the first that exists.
+// This order mirrors how C compilers resolve #include "..." — local first, then
+// search paths, then system-level locations.
 fn resolve_include(filename: &str, source_dir: &Path, include_paths: &[PathBuf]) -> Option<PathBuf> {
-    // 1. Relative to source file directory
+    // 1. Relative to the file that contains the !include directive.
+    //    Highest priority — local includes should shadow stdlib versions.
     let candidate = source_dir.join(filename);
     if candidate.exists() {
         return Some(candidate);
     }
 
-    // 2. --include paths
+    // 2. User-specified --include paths, checked in the order provided.
     for path in include_paths {
         let candidate = path.join(filename);
         if candidate.exists() {
@@ -136,13 +170,15 @@ fn resolve_include(filename: &str, source_dir: &Path, include_paths: &[PathBuf])
         }
     }
 
-    // 3. ./stdlib/ relative to CWD
+    // 3. ./stdlib/ relative to CWD — supports running from the project root
+    //    without needing explicit --include flags.
     let candidate = PathBuf::from("stdlib").join(filename);
     if candidate.exists() {
         return Some(candidate);
     }
 
-    // 4. Relative to the executable's directory
+    // 4. stdlib/ relative to the bfpp executable — supports installed binaries
+    //    that ship with a stdlib directory alongside the binary.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe.parent() {
             let candidate = exe_dir.join("stdlib").join(filename);

@@ -1,4 +1,22 @@
-// BF++ Parser — transforms token stream into AST.
+// BF++ Parser — transforms a flat token stream into a structured AST.
+//
+// Architecture: recursive-descent parser driven by `parse_block` / `parse_single`.
+//
+// `parse_block` consumes tokens until it hits the expected `BlockEnd` terminator
+// (EOF, `]`, or `}`). Each iteration calls `parse_single` to consume one logical
+// node. This naturally handles nesting: when `parse_single` sees a `[`, it calls
+// `parse_block` with `BlockEnd::LoopEnd`, which recurses until the matching `]`.
+// Same pattern for `{`-delimited subroutine bodies and R/K blocks.
+//
+// Coalescing: consecutive identical movement/arithmetic tokens (>, <, +, -)
+// are collapsed into a single AST node with a count. This happens in
+// `parse_single` via `count_consecutive` — after consuming the first token,
+// it greedily eats all following tokens of the same kind.
+//
+// Bracket matching: handled structurally by the recursive descent. An unmatched
+// `[` surfaces as `parse_block` reaching EOF while expecting `BlockEnd::LoopEnd`.
+// A stray `]` outside any loop is caught by the "unexpected terminator" check
+// at the top of `parse_block`.
 
 use crate::ast::{AstNode, FdSpec, Program};
 use crate::lexer::Token;
@@ -15,12 +33,19 @@ impl std::fmt::Display for ParseError {
     }
 }
 
+// Entry point: parse the full token stream into a Program.
+// Wraps parse_block with BlockEnd::Eof so the entire input is consumed.
 pub fn parse(tokens: &[Token]) -> Result<Program, ParseError> {
     let mut pos = 0;
     let nodes = parse_block(tokens, &mut pos, BlockEnd::Eof)?;
     Ok(Program { nodes })
 }
 
+// Determines what token ends the current block context.
+// The recursive descent uses this to know when to stop and return:
+//   - Eof: top-level program, stop at end of input
+//   - LoopEnd: inside [...], stop at `]`
+//   - BraceClose: inside {...}, stop at `}` (subroutine bodies, R/K blocks)
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum BlockEnd {
     Eof,
@@ -28,13 +53,22 @@ enum BlockEnd {
     BraceClose,  // }
 }
 
+// Parse a sequence of nodes until the expected block terminator.
+//
+// This is the core recursive-descent driver. On each iteration it:
+// 1. Checks if the current token is the expected terminator → return collected nodes
+// 2. Checks for unexpected terminators (e.g., `]` when expecting `}`) → error
+// 3. Otherwise delegates to parse_single to consume one node
+//
+// If we reach end-of-input without finding the expected terminator (and it's
+// not Eof), that's an unterminated bracket/brace error.
 fn parse_block(tokens: &[Token], pos: &mut usize, end: BlockEnd) -> Result<Vec<AstNode>, ParseError> {
     let mut nodes = Vec::new();
 
     while *pos < tokens.len() {
         let token = &tokens[*pos];
 
-        // Check for block terminator
+        // Check for block terminator — consume it and return
         match (end, token) {
             (BlockEnd::LoopEnd, Token::LoopEnd) => {
                 *pos += 1;
@@ -47,7 +81,8 @@ fn parse_block(tokens: &[Token], pos: &mut usize, end: BlockEnd) -> Result<Vec<A
             _ => {}
         }
 
-        // Unexpected terminators
+        // A `]` when we're not inside a loop is always an error.
+        // (A `}` outside a brace context is handled by parse_single as a fallthrough.)
         if matches!(token, Token::LoopEnd) && end != BlockEnd::LoopEnd {
             return Err(ParseError {
                 message: "Unexpected ']' without matching '['".into(),
@@ -59,6 +94,7 @@ fn parse_block(tokens: &[Token], pos: &mut usize, end: BlockEnd) -> Result<Vec<A
         nodes.push(node);
     }
 
+    // Reached end of input — only valid if we expected Eof
     match end {
         BlockEnd::Eof => Ok(nodes),
         BlockEnd::LoopEnd => Err(ParseError {
@@ -72,12 +108,35 @@ fn parse_block(tokens: &[Token], pos: &mut usize, end: BlockEnd) -> Result<Vec<A
     }
 }
 
+// Parse a single AST node from the current token position.
+//
+// Consumes tokens[*pos] and advances pos. For most tokens this is a 1:1
+// mapping. Special cases:
+//
+// - Movement/arithmetic tokens: after consuming the first, `count_consecutive`
+//   greedily eats all identical following tokens. `>>>>` becomes MoveRight(4).
+//
+// - Deref (`*`): recursively calls parse_single to wrap the NEXT op. So `*+`
+//   parses as Deref(Increment(1)). If `*` is at end of input, that's an error —
+//   deref must always have a target.
+//
+// - LoopStart (`[`): calls parse_block with LoopEnd to consume the loop body.
+//
+// - SubDef (`!#name{`): the lexer already consumed the `{`, so we call
+//   parse_block with BraceClose to get the body. SubCall (`!#name`) is a
+//   simple leaf node — no body to parse.
+//
+// - ResultStart (`R{`): parse the result body, then REQUIRE a CatchStart (`K{`)
+//   immediately after. This enforces the R{...}K{...} pairing at parse time.
+//
+// - CatchStart (`K{`) appearing WITHOUT a preceding R{} is an error — caught
+//   as a fallthrough case at the bottom.
 fn parse_single(tokens: &[Token], pos: &mut usize) -> Result<AstNode, ParseError> {
     let token = &tokens[*pos];
     *pos += 1;
 
     match token {
-        // Core BF — coalesce consecutive identical ops
+        // ── Core BF — coalesce consecutive identical ops ─────────────
         Token::MoveRight => {
             let count = 1 + count_consecutive(tokens, pos, &Token::MoveRight);
             Ok(AstNode::MoveRight(count))
@@ -97,15 +156,17 @@ fn parse_single(tokens: &[Token], pos: &mut usize) -> Result<AstNode, ParseError
         Token::Output => Ok(AstNode::Output),
         Token::Input => Ok(AstNode::Input),
 
-        // Loop
+        // ── Loop: recurse into parse_block until `]` ─────────────────
         Token::LoopStart => {
             let body = parse_block(tokens, pos, BlockEnd::LoopEnd)?;
             Ok(AstNode::Loop(body))
         }
 
-        // Extended memory
+        // ── Extended memory ──────────────────────────────────────────
         Token::AbsoluteAddr => Ok(AstNode::AbsoluteAddr),
         Token::Deref => {
+            // Deref wraps the next op: `*+` → Deref(Increment(1))
+            // Must have a following token to wrap; bare `*` at EOF is an error.
             if *pos < tokens.len() {
                 let inner = parse_single(tokens, pos)?;
                 Ok(AstNode::Deref(Box::new(inner)))
@@ -118,27 +179,30 @@ fn parse_single(tokens: &[Token], pos: &mut usize) -> Result<AstNode, ParseError
         }
         Token::CellWidthCycle => Ok(AstNode::CellWidthCycle),
 
-        // String literal
+        // ── String literal ───────────────────────────────────────────
         Token::StringLit(bytes) => Ok(AstNode::StringLit(bytes.clone())),
 
-        // Stack
+        // ── Stack ────────────────────────────────────────────────────
         Token::Push => Ok(AstNode::Push),
         Token::Pop => Ok(AstNode::Pop),
 
-        // Subroutines
+        // ── Subroutines ─────────────────────────────────────────────
+        // SubDef: the lexer already consumed the opening `{`, so we parse
+        // the body until `}` via BraceClose.
         Token::SubDef(name) => {
             let body = parse_block(tokens, pos, BlockEnd::BraceClose)?;
             Ok(AstNode::SubDef(name.clone(), body))
         }
+        // SubCall: bare name reference, no body to parse.
         Token::SubCall(name) => Ok(AstNode::SubCall(name.clone())),
         Token::Return => Ok(AstNode::Return),
 
-        // Syscall
+        // ── Syscall & fd-directed I/O ────────────────────────────────
         Token::Syscall => Ok(AstNode::Syscall),
         Token::OutputFd(fd) => Ok(AstNode::OutputFd(convert_fd(fd))),
         Token::InputFd(fd) => Ok(AstNode::InputFd(convert_fd(fd))),
 
-        // Bitwise
+        // ── Bitwise ─────────────────────────────────────────────────
         Token::BitOr => Ok(AstNode::BitOr),
         Token::BitAnd => Ok(AstNode::BitAnd),
         Token::BitXor => Ok(AstNode::BitXor),
@@ -146,14 +210,18 @@ fn parse_single(tokens: &[Token], pos: &mut usize) -> Result<AstNode, ParseError
         Token::ShiftRight => Ok(AstNode::ShiftRight),
         Token::BitNot => Ok(AstNode::BitNot),
 
-        // Error handling
+        // ── Error handling ──────────────────────────────────────────
         Token::ErrorRead => Ok(AstNode::ErrorRead),
         Token::ErrorWrite => Ok(AstNode::ErrorWrite),
         Token::Propagate => Ok(AstNode::Propagate),
 
+        // R{...}K{...} — result/catch block pair.
+        // Parse the R body first, then enforce that K{ follows immediately.
+        // This is the only place where two consecutive block constructs are
+        // required to be paired — the parser rejects an orphan R{} or K{}.
         Token::ResultStart => {
             let result_body = parse_block(tokens, pos, BlockEnd::BraceClose)?;
-            // Expect K{ immediately after
+            // K{ must follow immediately — no intervening tokens allowed
             if *pos < tokens.len() && tokens[*pos] == Token::CatchStart {
                 *pos += 1;
                 let catch_body = parse_block(tokens, pos, BlockEnd::BraceClose)?;
@@ -166,13 +234,16 @@ fn parse_single(tokens: &[Token], pos: &mut usize) -> Result<AstNode, ParseError
             }
         }
 
-        // Tape address & framebuffer
+        // ── Tape address & framebuffer ──────────────────────────────
         Token::TapeAddr => Ok(AstNode::TapeAddr),
         Token::FramebufferFlush => Ok(AstNode::FramebufferFlush),
 
-        // FFI
+        // ── FFI ─────────────────────────────────────────────────────
         Token::FfiCall(lib, func) => Ok(AstNode::FfiCall(lib.clone(), func.clone())),
 
+        // ── Error cases: terminators appearing in wrong context ─────
+        // A bare K{ without a preceding R{} — the R branch above is the
+        // only valid way to enter a catch block.
         Token::CatchStart => {
             Err(ParseError {
                 message: "K{...} catch block without preceding R{...} result block".into(),
@@ -197,6 +268,8 @@ fn parse_single(tokens: &[Token], pos: &mut usize) -> Result<AstNode, ParseError
 }
 
 /// Count consecutive tokens matching `target`, advancing `pos`.
+/// Used by the coalescing logic: after consuming the first `+`, this eats
+/// all following `+` tokens and returns the extra count (so total = 1 + result).
 fn count_consecutive(tokens: &[Token], pos: &mut usize, target: &Token) -> usize {
     let mut count = 0;
     while *pos < tokens.len() && &tokens[*pos] == target {
@@ -206,6 +279,9 @@ fn count_consecutive(tokens: &[Token], pos: &mut usize, target: &Token) -> usize
     count
 }
 
+// Convert lexer FdSpec to AST FdSpec.
+// These are structurally identical but live in separate modules to keep the
+// lexer and AST decoupled — the AST shouldn't depend on lexer types.
 fn convert_fd(fd: &crate::lexer::FdSpec) -> FdSpec {
     match fd {
         crate::lexer::FdSpec::Literal(n) => FdSpec::Literal(*n),

@@ -1,13 +1,20 @@
 // BF++ Code Generator — AST → C source.
+//
+// Strategy: walks the BF++ AST and emits a single-file C program that
+// includes its own runtime (tape, pointer, stack, cell-width system, error
+// handling, optional SDL framebuffer, optional FFI via dlopen/dlsym).
+// The generated C is self-contained — no external BF++ runtime library.
+// Subroutines are lifted to C functions with forward declarations;
+// everything else lands in main().
 
 use crate::ast::{AstNode, FdSpec, Program};
 
 pub struct CodegenOptions {
-    pub tape_size: usize,
-    pub stack_size: usize,
-    pub call_depth: usize,
-    pub framebuffer: Option<(u32, u32)>,
-    pub eof_value: u8,
+    pub tape_size: usize,   // number of bytes in the BF tape (should be power-of-two for TAPE_MASK)
+    pub stack_size: usize,  // max depth of the BF++ value stack ($~ operations)
+    pub call_depth: usize,  // max recursive subroutine call depth before abort
+    pub framebuffer: Option<(u32, u32)>, // if Some((w,h)), emit SDL2 framebuffer support
+    pub eof_value: u8,      // value written to cell on EOF during input (`,`)
 }
 
 impl Default for CodegenOptions {
@@ -29,11 +36,15 @@ pub struct CodegenResult {
 }
 
 pub fn generate(program: &Program, opts: &CodegenOptions) -> CodegenResult {
+    // Pre-scan for FFI usage so we know whether to #include <dlfcn.h>
     let uses_ffi = program_uses_ffi(&program.nodes);
     let c_source = generate_c(program, opts, uses_ffi);
     CodegenResult { c_source, uses_ffi }
 }
 
+// Recursively checks whether any node in the AST uses \ffi calls.
+// Needed at codegen time to conditionally emit the dlfcn.h include and
+// set the uses_ffi metadata flag (which tells the compiler driver to link -ldl).
 fn program_uses_ffi(nodes: &[AstNode]) -> bool {
     for node in nodes {
         match node {
@@ -53,6 +64,7 @@ fn program_uses_ffi(nodes: &[AstNode]) -> bool {
     false
 }
 
+// Main C generation pipeline: header → forward decls → subroutine bodies → main().
 fn generate_c(program: &Program, opts: &CodegenOptions, uses_ffi: bool) -> String {
     let mut out = String::new();
     let mut ctx = GenCtx {
@@ -63,13 +75,17 @@ fn generate_c(program: &Program, opts: &CodegenOptions, uses_ffi: bool) -> Strin
         in_result_block: false,
     };
 
-    // First pass: collect subroutine definitions
+    // First pass: collect subroutine names for forward declarations.
+    // Only scans top-level nodes — BF++ subroutine defs are always top-level.
     collect_subroutines(&program.nodes, &mut ctx.subroutines);
 
-    // Emit header
+    // Emit the C runtime header: includes, #defines, static globals,
+    // helper functions (bfpp_get/set/push/pop/cycle_width, errno mapping,
+    // syscall wrapper, constructor, and optional SDL framebuffer).
     out.push_str(&emit_header(opts, uses_ffi));
 
-    // Emit subroutine forward declarations
+    // Forward-declare all subroutines so they can call each other
+    // regardless of definition order (mutual recursion).
     for name in &ctx.subroutines {
         out.push_str(&format!("void bfpp_sub_{}(void);\n", mangle_name(name)));
     }
@@ -77,16 +93,20 @@ fn generate_c(program: &Program, opts: &CodegenOptions, uses_ffi: bool) -> Strin
         out.push('\n');
     }
 
-    // Emit subroutine definitions
+    // Emit subroutine bodies. Each gets a call-depth guard (prologue/epilogue)
+    // to enforce the CALL_DEPTH limit and prevent unbounded recursion from
+    // blowing the C stack. The prologue increments+checks; the epilogue decrements.
+    // Return (^) inside a subroutine also decrements before returning.
     for node in &program.nodes {
         if let AstNode::SubDef(name, body) = node {
             out.push_str(&format!("void bfpp_sub_{}(void) {{\n", mangle_name(name)));
             ctx.indent = 1;
             ctx.in_subroutine = true;
-            // Call depth guard
+            // Prologue: increment call depth and abort on overflow
             indent(&mut out, ctx.indent);
             out.push_str("if (++bfpp_call_depth > CALL_DEPTH) { fprintf(stderr, \"bfpp: call stack overflow\\n\"); exit(1); }\n");
             emit_nodes(&mut out, body, &mut ctx);
+            // Epilogue: decrement call depth on normal fall-through
             indent(&mut out, ctx.indent);
             out.push_str("bfpp_call_depth--;\n");
             out.push_str("}\n\n");
@@ -125,6 +145,17 @@ fn generate_c(program: &Program, opts: &CodegenOptions, uses_ffi: bool) -> Strin
     out
 }
 
+// Codegen context — threaded through all emit_* functions.
+//
+// - indent: current C indentation level (number of 4-space tabs)
+// - subroutines: collected subroutine names (for forward decls)
+// - eof_value: what `,` writes on EOF (user-configurable)
+// - in_subroutine: true when emitting inside a subroutine body.
+//   Affects Return (^ emits `bfpp_call_depth--; return;` vs `return 0;`)
+//   and Propagate (? must decrement call depth before returning).
+// - in_result_block: true when inside the R{...} portion of an R/K block.
+//   Propagate (?) emits `break;` instead of `return;` so control
+//   transfers to the K (catch) block via the do/while(0) wrapper.
 struct GenCtx {
     indent: usize,
     subroutines: Vec<String>,
@@ -141,9 +172,17 @@ fn collect_subroutines(nodes: &[AstNode], names: &mut Vec<String>) {
     }
 }
 
+// Emits the entire C runtime that precedes main(). This is the "header" of
+// the generated file — includes, defines, static state, and helper functions.
+// Everything a BF++ program needs at runtime is generated here so the output
+// is a single self-contained .c file.
 fn emit_header(opts: &CodegenOptions, uses_ffi: bool) -> String {
     let mut h = String::new();
     h.push_str("/* Generated by BF++ transpiler */\n");
+
+    // Standard C + POSIX headers for I/O, memory, networking, and syscalls.
+    // Always included because the runtime uses them unconditionally
+    // (syscall wrapper, errno mapping, socket ops).
     h.push_str("#include <stdio.h>\n");
     h.push_str("#include <stdlib.h>\n");
     h.push_str("#include <string.h>\n");
@@ -157,11 +196,17 @@ fn emit_header(opts: &CodegenOptions, uses_ffi: bool) -> String {
     h.push_str("#include <netinet/in.h>\n");
     h.push_str("#include <arpa/inet.h>\n");
     h.push_str("#include <sys/syscall.h>\n");
+    // dlfcn.h only if the program uses \ffi — avoids unnecessary dep
     if uses_ffi {
         h.push_str("#include <dlfcn.h>\n");
     }
     h.push('\n');
 
+    // Framebuffer: maps the last W*H*3 bytes of the tape as an RGB24 pixel
+    // buffer. BFPP_FB_OFFSET is the tape index where the framebuffer starts.
+    // BF++ programs write pixel data there, then `F` flushes to an SDL window.
+    // Placed at the tape's end so normal BF pointer movement near cell 0
+    // doesn't accidentally clobber the framebuffer region.
     if let Some((w, h_)) = opts.framebuffer {
         h.push_str("#include <SDL2/SDL.h>\n");
         h.push_str("#define BFPP_FRAMEBUFFER\n");
@@ -170,13 +215,18 @@ fn emit_header(opts: &CodegenOptions, uses_ffi: bool) -> String {
         h.push_str("#define BFPP_FB_OFFSET (TAPE_SIZE - (BFPP_FB_WIDTH * BFPP_FB_HEIGHT * 3))\n");
     }
 
+    // TAPE_MASK = TAPE_SIZE - 1: used for fast modular wrapping (ptr & TAPE_MASK)
+    // instead of modulo. Requires TAPE_SIZE to be a power of two.
     h.push_str(&format!("#define TAPE_SIZE {}\n", opts.tape_size));
     h.push_str("#define TAPE_MASK (TAPE_SIZE - 1)\n");
     h.push_str(&format!("#define STACK_SIZE {}\n", opts.stack_size));
     h.push_str(&format!("#define CALL_DEPTH {}\n", opts.call_depth));
     h.push('\n');
 
-    // Error code defines — single source of truth from error_codes.rs constants
+    // Error code #defines — generated from the Rust constants in error_codes.rs.
+    // This is the bridge: Rust owns the values, C code references BFPP_ERR_*
+    // names. The errno_mapping_c_source() function uses these same numeric
+    // values in its switch statement, keeping everything consistent.
     h.push_str(&format!("#define BFPP_OK {}\n", crate::error_codes::OK));
     h.push_str(&format!("#define BFPP_ERR_GENERIC {}\n", crate::error_codes::ERR_GENERIC));
     h.push_str(&format!("#define BFPP_ERR_NOT_FOUND {}\n", crate::error_codes::ERR_NOT_FOUND));
@@ -197,7 +247,17 @@ fn emit_header(opts: &CodegenOptions, uses_ffi: bool) -> String {
     h.push_str(&format!("#define BFPP_ERR_NOSYM {}\n", crate::error_codes::ERR_NOSYM));
     h.push('\n');
 
-    // Core state
+    // Core runtime state — all static globals, zero-initialized by bfpp_init().
+    // tape: the BF memory array (byte-addressable, but cell_width[] overlays
+    //   multi-byte cells on top via bfpp_get/bfpp_set).
+    // ptr: current tape head position.
+    // bfpp_err: the global error register (read by `E`, written by `e`).
+    // stack/sp: the BF++ value stack ($ pushes, ~ pops). Holds uint64_t values.
+    // bfpp_call_depth: subroutine recursion depth counter.
+    // cell_width: parallel array — cell_width[i] == 0 means tape[i] is a
+    //   continuation byte (part of a wider cell), 1/2/4/8 means tape[i] is
+    //   the start of a cell with that many bytes. Acts as a sentinel so
+    //   bfpp_get/bfpp_set know the cell's byte span.
     h.push_str("static uint8_t tape[TAPE_SIZE];\n");
     h.push_str("static int ptr = 0;\n");
     h.push_str("static int bfpp_err = 0;\n");
@@ -207,7 +267,22 @@ fn emit_header(opts: &CodegenOptions, uses_ffi: bool) -> String {
     h.push_str("static uint8_t cell_width[TAPE_SIZE]; /* 0=continuation, 1,2,4,8 */\n");
     h.push('\n');
 
-    // Helper: get cell value respecting width
+    // Cell-width-aware accessors. All tape reads/writes go through bfpp_get/set
+    // so multi-byte cells (2/4/8 bytes via %) work transparently.
+    // cell_width[p] == 0 is the continuation-byte sentinel: accessing it is
+    // an error (you landed in the middle of a wider cell). Uses memcpy for
+    // safe unaligned access — the tape isn't guaranteed to be naturally aligned.
+    //
+    // bfpp_push/pop: value stack with bounds checking. Overflow sets ERR_OOM,
+    // underflow sets ERR_INVALID_ARG. Both silently return on error (no abort)
+    // so the program can check `E` and handle it.
+    //
+    // bfpp_cycle_width: cycles a cell's width 1→2→4→8→1. Before widening,
+    // releases old continuation bytes (restores them to width=1). Then checks
+    // that the new sub-cells are all width=1 (available). If any sub-cell is
+    // already a continuation byte for another cell or is itself a wide cell,
+    // reverts to width=1 and sets ERR_INVALID_ARG. This prevents overlapping
+    // multi-byte cells.
     h.push_str(r#"static uint64_t bfpp_get(int p) {
     p &= TAPE_MASK;
     if (cell_width[p] == 0) { bfpp_err = BFPP_ERR_INVALID_ARG; return 0; } /* continuation byte */
@@ -267,11 +342,14 @@ static void bfpp_cycle_width(int p) {
 
 "#);
 
-    // errno mapping
+    // errno→bfpp_err mapping function (generated from error_codes.rs)
     h.push_str(crate::error_codes::errno_mapping_c_source());
     h.push('\n');
 
-    // Syscall wrapper
+    // Syscall wrapper: reads syscall number + 6 args from tape[ptr..ptr+48]
+    // (each in an 8-byte cell), issues the syscall, writes result back to
+    // tape[ptr]. On failure, translates errno to bfpp_err via the mapping
+    // function and writes -1 to tape[ptr]. On success, sets bfpp_err = OK.
     h.push_str(r#"static void bfpp_syscall_exec(void) {
     uint64_t num = bfpp_get(ptr);
     uint64_t a1 = bfpp_get(ptr + 8);
@@ -290,15 +368,31 @@ static void bfpp_cycle_width(int p) {
     }
 }
 
+/* Constructor: runs before main(). Zeros the tape, sets every cell_width
+   entry to 1 (each cell starts as a single byte), and zeros the stack. */
 static void __attribute__((constructor)) bfpp_init(void) {
     memset(tape, 0, TAPE_SIZE);
-    memset(cell_width, 1, TAPE_SIZE);
+    memset(cell_width, 1, TAPE_SIZE);  /* 1 = independent 1-byte cell */
     memset(stack, 0, sizeof(stack));
 }
 
 "#);
 
-    // SDL2 framebuffer support
+    // SDL2 framebuffer system. Guarded by #ifdef BFPP_FRAMEBUFFER so the
+    // generated code compiles without SDL2 if framebuffer wasn't requested.
+    //
+    // bfpp_fb_init: creates SDL window + renderer + streaming texture.
+    //   Falls back to software renderer if accelerated isn't available.
+    //   All three SDL objects are NULL-checked — if any creation step fails,
+    //   earlier objects are destroyed and the fb is left disabled (NULL).
+    //
+    // bfpp_fb_flush (invoked by `F`): uploads tape[BFPP_FB_OFFSET..] as
+    //   RGB24 pixels to the texture, renders it, and pumps the SDL event
+    //   queue. Handles SDL_QUIT by cleaning up and exit(0). The NULL checks
+    //   on texture/renderer make flush a safe no-op if init failed.
+    //
+    // bfpp_fb_cleanup: teardown in reverse allocation order. Each pointer
+    //   is NULL-checked so cleanup is safe even if init partially failed.
     if opts.framebuffer.is_some() {
         h.push_str(r#"
 #ifdef BFPP_FRAMEBUFFER
@@ -373,6 +467,8 @@ fn emit_nodes(out: &mut String, nodes: &[AstNode], ctx: &mut GenCtx) {
     }
 }
 
+// Used in main() to skip SubDef nodes — those were already emitted as
+// top-level C functions before main(). Everything else is emitted inline.
 fn emit_nodes_skip_subdefs(out: &mut String, nodes: &[AstNode], ctx: &mut GenCtx) {
     for node in nodes {
         if matches!(node, AstNode::SubDef(_, _)) {
@@ -382,6 +478,9 @@ fn emit_nodes_skip_subdefs(out: &mut String, nodes: &[AstNode], ctx: &mut GenCtx
     }
 }
 
+// Per-node C emission. Each AstNode maps to one or more lines of C code.
+// The ctx tracks indentation and context flags that alter codegen behavior
+// (in_subroutine, in_result_block).
 fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
     match node {
         AstNode::MoveRight(n) => {
@@ -434,6 +533,10 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
             indent(out, ctx.indent);
             out.push_str("ptr = (int)bfpp_get(ptr) & TAPE_MASK;\n");
         }
+        // Dereference: saves ptr, jumps to the address stored in the current
+        // cell, executes the inner operation there, then restores ptr. This is
+        // what makes pointer-indirect operations possible in a single-pointer
+        // architecture.
         AstNode::Deref(inner) => {
             indent(out, ctx.indent);
             out.push_str("{ int saved_ptr = ptr; ptr = (int)bfpp_get(ptr) & TAPE_MASK;\n");
@@ -485,6 +588,10 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
             indent(out, ctx.indent);
             out.push_str(&format!("bfpp_sub_{}();\n", mangle_name(name)));
         }
+        // Return (^) emits different code depending on context:
+        // - In a subroutine: must decrement call depth before returning (the
+        //   normal epilogue won't run since we're returning early).
+        // - In main: emits `return 0;` to exit the program.
         AstNode::Return => {
             indent(out, ctx.indent);
             if ctx.in_subroutine {
@@ -567,6 +674,12 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
             indent(out, ctx.indent);
             out.push_str("bfpp_err = (int)bfpp_get(ptr);\n");
         }
+        // Propagate (?) — early-exit on error. Three behaviors:
+        // 1. Inside R{...} block: `break;` — exits the do/while(0) wrapper,
+        //    falling through to the K{...} (catch) block.
+        // 2. Inside a subroutine (but not in an R block): decrements call
+        //    depth and returns from the subroutine.
+        // 3. In main: returns from main (exits the program).
         AstNode::Propagate => {
             indent(out, ctx.indent);
             if ctx.in_result_block {
@@ -577,6 +690,21 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
                 out.push_str("if (bfpp_err) return;\n");
             }
         }
+        // R{...}K{...} — result/catch block (try/catch analogue).
+        //
+        // Implementation uses the do { ... } while(0) trick: the R body is
+        // wrapped in do/while(0), so `break;` (from Propagate/?) jumps to
+        // the statement after the loop — which is the K (catch) block.
+        // This avoids goto while keeping structured control flow.
+        //
+        // Error register lifecycle:
+        // 1. Save the outer bfpp_err (so R/K blocks can nest).
+        // 2. Clear bfpp_err to BFPP_OK — the R body starts with a clean slate.
+        // 3. Execute R body. If ? fires, `break` exits to K.
+        // 4. If bfpp_err is set, execute K body (the catch path).
+        // 5. If the R block succeeded (bfpp_err still OK), restore the
+        //    saved outer error — don't mask a pre-existing error from the
+        //    caller just because this R block succeeded.
         AstNode::ResultBlock(result_body, catch_body) => {
             indent(out, ctx.indent);
             out.push_str("{\n");
@@ -585,7 +713,7 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
             out.push_str("int saved_err = bfpp_err;\n");
             indent(out, ctx.indent);
             out.push_str("bfpp_err = BFPP_OK;\n");
-            // Wrap R block in do/while(0) so ? (Propagate) can break to K block
+            // do/while(0) wrapper — enables `break`-based error propagation
             indent(out, ctx.indent);
             out.push_str("do {\n");
             ctx.indent += 1;
@@ -597,12 +725,14 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
             indent(out, ctx.indent);
             out.push_str("} while(0);\n");
             indent(out, ctx.indent);
+            // K (catch) block — only executes if bfpp_err was set during R body
             out.push_str("if (bfpp_err) {\n");
             ctx.indent += 1;
             emit_nodes(out, catch_body, ctx);
             ctx.indent -= 1;
             indent(out, ctx.indent);
             out.push_str("}\n");
+            // Restore outer error if R block succeeded (don't clobber caller's error state)
             indent(out, ctx.indent);
             out.push_str("if (!bfpp_err) bfpp_err = saved_err;\n");
             ctx.indent -= 1;
@@ -610,7 +740,9 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
             out.push_str("}\n");
         }
 
-        // Tape address
+        // Tape address (T): pushes the actual C pointer to tape[ptr] onto the
+        // BF++ stack. Enables passing tape addresses to syscalls or FFI functions
+        // that expect memory pointers (e.g., read/write buffer addresses).
         AstNode::TapeAddr => {
             indent(out, ctx.indent);
             out.push_str("bfpp_push((uint64_t)(uintptr_t)&tape[ptr]);\n");
@@ -626,7 +758,11 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
             out.push_str("#endif\n");
         }
 
-        // FFI call
+        // FFI call (\ffi "lib" "func"): dynamic library call via dlopen/dlsym.
+        // Opens the library, resolves the symbol, reads 6 args from
+        // tape[ptr+8..ptr+48] (same layout as syscall), calls the function,
+        // writes the result to tape[ptr]. Sets ERR_NOLIB or ERR_NOSYM on
+        // failure. Always closes the library handle after the call.
         AstNode::FfiCall(lib, func) => {
             indent(out, ctx.indent);
             out.push_str("{\n");
@@ -679,7 +815,12 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
             out.push_str("}\n");
         }
 
-        // Optimizer synthetic
+        // Optimizer-generated nodes: these don't appear in source BF++ but are
+        // produced by the optimizer when it recognizes common patterns.
+        // Clear: [-] → set cell to 0 directly.
+        // ScanRight/ScanLeft: [>]/[<] → linear scan for a zero cell.
+        // MultiplyMove: [->>+++<<] patterns → multiply current cell value by
+        //   constant factors and add to cells at known offsets, then clear.
         AstNode::Clear => {
             indent(out, ctx.indent);
             out.push_str("bfpp_set(ptr, 0);\n");
@@ -728,6 +869,13 @@ fn indent(out: &mut String, level: usize) {
 }
 
 /// Mangle a subroutine name for C identifier compatibility.
+///
+/// BF++ subroutine names can contain operator characters (>, <, +, *, etc.)
+/// that are illegal in C identifiers. Each special char is replaced with a
+/// readable ASCII word (e.g., '>' → "gt", '*' → "star"). Unknown characters
+/// get a unicode-hex escape ("u{XX}"). Combined with the "bfpp_sub_" prefix
+/// added at the call site, this guarantees unique, valid C function names
+/// that don't collide with libc or user symbols.
 fn mangle_name(name: &str) -> String {
     let mut mangled = String::new();
     for c in name.chars() {
