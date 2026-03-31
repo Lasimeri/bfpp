@@ -465,3 +465,23 @@
 ;   ; 5. Attrib 1: normal (3 floats, stride 24, offset 12)
 ;   #1 > #3 > #24 > #12 <<<        ; index=1, size=3, stride=24, offset=12
 ;   !#__gl_vertex_attrib
+
+; ── Multi-GPU ──────────────────────────────────────────────────
+; Input: P+0 = mode (0=off, 1=SFR, 2=AFR, 3=auto)
+\mgpu{ !#__gl_multi_gpu }
+
+; Output: P+0 ← GPU count
+\gpuc{ !#__gl_gpu_count }
+
+; Output: P+0 ← last frame time in microseconds
+\ftim{ !#__gl_frame_time }
+
+; ── Scene Oracle ───────────────────────────────────────────────
+; Publish current scene state to triple buffer (no params)
+\spub{ !#__scene_publish }
+
+; Enable/disable oracle mode. Input: P+0 = 0 or 1
+\smod{ !#__scene_mode }
+
+; Set max extrapolation lookahead. Input: P+0 = ms (Q16.16)
+\sext{ !#__scene_extrap_ms }

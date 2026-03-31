@@ -297,6 +297,35 @@ fn main() {
         }
     }
 
+    // Multi-GPU + Scene Oracle runtime: when __gl_multi_gpu/__gl_gpu_count/__scene_*
+    // intrinsics are used, link EGL and compile the multi-GPU and oracle runtime files.
+    if codegen_result.uses_multigpu {
+        cc_cmd.arg("-lEGL");
+        let runtime_paths = [
+            PathBuf::from("runtime"),
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("runtime")))
+                .unwrap_or_default(),
+        ];
+        let mgpu_files = [
+            "bfpp_rt_3d_multigpu.c",
+            "bfpp_rt_3d_oracle.c",
+        ];
+        for rt_dir in &runtime_paths {
+            if rt_dir.join("bfpp_rt_3d_multigpu.c").exists() {
+                cc_cmd.arg(format!("-I{}", rt_dir.display()));
+                for f in &mgpu_files {
+                    let path = rt_dir.join(f);
+                    if path.exists() {
+                        cc_cmd.arg(path.to_str().unwrap());
+                    }
+                }
+                break;
+            }
+        }
+    }
+
     // Threading runtime: when any __spawn/__join/__mutex_*/__atomic_*/__barrier_*
     // intrinsic is used, link pthread and compile the parallel runtime.
     if codegen_result.uses_threading {

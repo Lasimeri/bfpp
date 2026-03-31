@@ -113,4 +113,18 @@ void bfpp_sw_set_mvp(uint8_t *tape, int ptr);
 void bfpp_sw_set_light(uint8_t *tape, int ptr);
 void bfpp_sw_set_color(uint8_t *tape, int ptr);
 
+/* ── Multi-GPU + Frame timing ───────────────────────────────── */
+/* Defined in bfpp_rt_3d.c (frame_time) and bfpp_rt_3d_multigpu.c */
+
+void bfpp_gl_multi_gpu(uint8_t *tape, int ptr);
+void bfpp_gl_gpu_count(uint8_t *tape, int ptr);
+void bfpp_gl_frame_time(uint8_t *tape, int ptr);
+
+/* ── Scene Oracle ───────────────────────────────────────────── */
+/* Defined in bfpp_rt_3d_oracle.c. Lock-free CPU-decoupled rendering. */
+
+void bfpp_scene_publish_intrinsic(uint8_t *tape, int ptr);
+void bfpp_scene_mode_intrinsic(uint8_t *tape, int ptr);
+void bfpp_scene_extrap_ms_intrinsic(uint8_t *tape, int ptr);
+
 #endif /* BFPP_RT_3D_H */

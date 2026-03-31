@@ -46,6 +46,8 @@ pub struct CodegenResult {
     pub uses_threading: bool,
     /// True if any 3D intrinsics are used — triggers bfpp_rt_3d*.c compilation + GL/GLEW linking
     pub uses_3d: bool,
+    /// True if multi-GPU/oracle intrinsics used — triggers bfpp_rt_3d_multigpu/oracle + EGL
+    pub uses_multigpu: bool,
 }
 
 pub fn generate(program: &Program, opts: &CodegenOptions) -> CodegenResult {
@@ -59,8 +61,9 @@ pub fn generate(program: &Program, opts: &CodegenOptions) -> CodegenResult {
     let uses_fb_pipeline = opts.framebuffer.is_some();
     let uses_threading = intrinsics.threading;
     let uses_3d = intrinsics.gl3d;
+    let uses_multigpu = intrinsics.multigpu;
     let c_source = generate_c(program, opts, uses_ffi, &intrinsics);
-    CodegenResult { c_source, uses_ffi, uses_tui_runtime, uses_fb_pipeline, uses_threading, uses_3d }
+    CodegenResult { c_source, uses_ffi, uses_tui_runtime, uses_fb_pipeline, uses_threading, uses_3d, uses_multigpu }
 }
 
 // Recursively checks whether any node in the AST uses \ffi calls.
@@ -260,6 +263,11 @@ fn emit_header(opts: &CodegenOptions, uses_ffi: bool, intrinsics: &IntrinsicUsag
     if intrinsics.gl3d {
         // 3D rendering: OpenGL proxy layer, fixed-point math, mesh generators, software fallback.
         h.push_str("#include \"bfpp_rt_3d.h\"\n");
+    }
+    if intrinsics.multigpu {
+        // Multi-GPU + Scene Oracle: EGL multi-context, SFR/AFR, lock-free triple buffer.
+        h.push_str("#include \"bfpp_rt_3d_multigpu.h\"\n");
+        h.push_str("#include \"bfpp_rt_3d_oracle.h\"\n");
     }
     h.push('\n');
 
@@ -1492,6 +1500,32 @@ fn emit_intrinsic(out: &mut String, name: &str, ctx: &mut GenCtx) {
             out.push_str("bfpp_mesh_cylinder(tape, ptr);\n");
         }
 
+        // ── Multi-GPU + Scene Oracle intrinsics ────────────
+        "__gl_multi_gpu" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_multi_gpu(tape, ptr);\n");
+        }
+        "__gl_gpu_count" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_gpu_count(tape, ptr);\n");
+        }
+        "__gl_frame_time" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_frame_time(tape, ptr);\n");
+        }
+        "__scene_publish" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_scene_publish_intrinsic(tape, ptr);\n");
+        }
+        "__scene_mode" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_scene_mode_intrinsic(tape, ptr);\n");
+        }
+        "__scene_extrap_ms" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_scene_extrap_ms_intrinsic(tape, ptr);\n");
+        }
+
         // ── Threading intrinsics ────────────────────────────
         "__spawn" => {
             // Input: tape[ptr]=subroutine_index, tape[ptr+8]=start_ptr
@@ -1590,6 +1624,7 @@ struct IntrinsicUsage {
     threading: bool, // __spawn, __join, __mutex_*, __atomic_*, __barrier_* — requires -pthread + bfpp_rt_parallel
     fb_sync: bool,   // __fb_sync, __fb_pixel_nt — framebuffer pipeline intrinsics
     gl3d: bool,      // __gl_*, __fp_*, __mat4_*, __mesh_* — requires bfpp_rt_3d + OpenGL/GLEW + math
+    multigpu: bool,  // __gl_multi_gpu, __gl_gpu_count, __gl_frame_time, __scene_* — requires bfpp_rt_3d_multigpu + bfpp_rt_3d_oracle + EGL
 }
 
 // Pre-scan the entire AST for intrinsic calls and return a summary of
@@ -1641,6 +1676,11 @@ fn scan_intrinsics(nodes: &[AstNode], usage: &mut IntrinsicUsage) {
                     "__mat4_translate" | "__mat4_perspective" |
                     "__mesh_cube" | "__mesh_sphere" | "__mesh_torus" |
                     "__mesh_plane" | "__mesh_cylinder" => usage.gl3d = true,
+                    "__gl_multi_gpu" | "__gl_gpu_count" | "__gl_frame_time" |
+                    "__scene_publish" | "__scene_mode" | "__scene_extrap_ms" => {
+                        usage.gl3d = true;
+                        usage.multigpu = true;
+                    }
                     _ => {}
                 }
             }

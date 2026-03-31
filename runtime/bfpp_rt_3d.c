@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <time.h>
 
 /* ── Error codes ─────────────────────────────────────────────── */
 
@@ -55,6 +56,16 @@ static struct {
     GLuint fbo_color;       /* color attachment texture                    */
     GLuint fbo_depth;       /* depth renderbuffer                          */
 
+    /* PBO double-buffer for async readback (Phase 0) */
+    GLuint pbo[2];
+    int    pbo_index;
+    int    pbo_initialized;
+    int    pbo_first_frame;  /* skip map on first frame — no data yet */
+
+    /* Frame timing */
+    uint64_t frame_start_ns;
+    uint64_t last_frame_us;  /* microseconds */
+
     /* Resource tracking — BF++ programs manage IDs explicitly.
      * Static arrays; no dynamic allocation needed for the small
      * resource counts that BF++ programs use. */
@@ -77,6 +88,9 @@ static struct {
 
     /* Default shader program (compiled from bfpp_rt_3d_shaders.h) */
     GLuint default_program;
+
+    /* Multi-GPU dispatch mode (0=none, set by bfpp_rt_3d_multigpu.c) */
+    int multi_mode;
 } g3d;
 
 /* ── Section B: Q16.16 helpers ───────────────────────────────── */
@@ -135,6 +149,29 @@ static inline void tape_set_u32(uint8_t *tape, int addr, uint32_t val)
 static int  create_offscreen_fbo(int w, int h);
 static void compile_default_shaders(void);
 static void setup_shadow_fbo(int index);
+static void init_pbo(int w, int h);
+static void cleanup_pbo(void);
+
+static void init_pbo(int w, int h) {
+    int size = w * h * 3;  /* RGB24 */
+    glGenBuffers(2, g3d.pbo);
+    for (int i = 0; i < 2; i++) {
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, g3d.pbo[i]);
+        glBufferData(GL_PIXEL_PACK_BUFFER, size, NULL, GL_STREAM_READ);
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    g3d.pbo_index = 0;
+    g3d.pbo_initialized = 1;
+    g3d.pbo_first_frame = 1;
+}
+
+static void cleanup_pbo(void) {
+    if (g3d.pbo_initialized) {
+        glDeleteBuffers(2, g3d.pbo);
+        g3d.pbo[0] = g3d.pbo[1] = 0;
+        g3d.pbo_initialized = 0;
+    }
+}
 
 /*
  * Initialize the 3D subsystem.
@@ -222,6 +259,9 @@ void bfpp_3d_init(int width, int height, uint8_t *tape, int fb_offset)
 
     /* Compile default shader program */
     compile_default_shaders();
+
+    /* Initialize PBO double-buffer for async readback */
+    init_pbo(width, height);
 
     /* Set initial GL state */
     glViewport(0, 0, width, height);
@@ -330,6 +370,9 @@ void bfpp_3d_cleanup(void)
             if (g3d.shadow_depth[i])
                 glDeleteTextures(1, &g3d.shadow_depth[i]);
         }
+
+        /* Delete PBOs */
+        cleanup_pbo();
 
         /* Delete main FBO */
         if (g3d.fbo)       glDeleteFramebuffers(1, &g3d.fbo);
@@ -949,12 +992,12 @@ void bfpp_gl_depth_test(uint8_t *tape, int ptr)
  * Read the rendered frame from the FBO into tape[fb_offset] and
  * trigger a flush through the FB pipeline.
  *
- * Steps:
- *   1. Bind the FBO as read framebuffer.
- *   2. glReadPixels RGB into tape[fb_offset].
- *   3. Flip vertically (GL origin is bottom-left, FB pipeline expects top-left).
- *   4. Call bfpp_fb_request_flush().
+ * Uses PBO double-buffered async readback when available:
+ *   Frame N: initiate async read into pbo[current]
+ *   Frame N: map pbo[previous] (already complete), copy to tape
+ *   Net effect: 1 frame of readback latency, but no GPU sync stall.
  *
+ * Falls back to synchronous glReadPixels if PBOs aren't initialized.
  * For software mode, delegates to bfpp_sw_present().
  */
 void bfpp_gl_present(uint8_t *tape, int ptr)
@@ -964,17 +1007,56 @@ void bfpp_gl_present(uint8_t *tape, int ptr)
         return;
     }
 
+    /* Multi-GPU dispatch (Phase 1+) */
+    /* if (g3d.multi_mode != 0) { bfpp_mgpu_present(tape, ptr); return; } */
+
+    /* Frame timing */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    if (g3d.frame_start_ns > 0) {
+        g3d.last_frame_us = (now_ns - g3d.frame_start_ns) / 1000;
+    }
+    g3d.frame_start_ns = now_ns;
+
     uint8_t *fb = tape + g3d.fb_offset;
     int w = g3d.width;
     int h = g3d.height;
     int stride = w * 3;
+    int fb_size = w * h * 3;
 
-    /* Read pixels from FBO */
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, g3d.fbo);
-    glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, fb);
+    if (!g3d.pbo_initialized) {
+        /* Fallback: synchronous readback */
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, g3d.fbo);
+        glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, fb);
+    } else {
+        /* Async PBO double-buffered readback:
+         * Frame N: initiate async read into pbo[current]
+         * Frame N: map pbo[previous] (already complete), copy to tape
+         * Net effect: 1 frame of readback latency, but no GPU sync stall */
 
-    /* Flip vertically — swap rows in-place.
-     * GL gives bottom-to-top; FB pipeline expects top-to-bottom. */
+        /* Step 1: Initiate async readback of current frame into pbo[current] */
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, g3d.pbo[g3d.pbo_index]);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, g3d.fbo);
+        glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, 0);
+
+        /* Step 2: Map previous frame's PBO (skip on first frame) */
+        if (!g3d.pbo_first_frame) {
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, g3d.pbo[g3d.pbo_index ^ 1]);
+            void *data = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, fb_size, GL_MAP_READ_BIT);
+            if (data) {
+                memcpy(fb, data, (size_t)fb_size);
+                glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+            }
+        } else {
+            g3d.pbo_first_frame = 0;
+        }
+
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        g3d.pbo_index ^= 1;
+    }
+
+    /* Flip vertically — GL is bottom-up, FB pipeline expects top-down */
     uint8_t *row_buf = (uint8_t *)malloc((size_t)stride);
     if (row_buf) {
         for (int y = 0; y < h / 2; y++) {
@@ -987,8 +1069,16 @@ void bfpp_gl_present(uint8_t *tape, int ptr)
         free(row_buf);
     }
 
-    /* Push frame to the FB pipeline presenter thread */
     bfpp_fb_request_flush();
+}
+
+/*
+ * Query last frame time in microseconds.
+ * Output: tape[ptr] = frame_time_us (uint32)
+ */
+void bfpp_gl_frame_time(uint8_t *tape, int ptr)
+{
+    tape_set_u32(tape, ptr, (uint32_t)g3d.last_frame_us);
 }
 
 /* ── Section J: Shadow mapping ───────────────────────────────── */

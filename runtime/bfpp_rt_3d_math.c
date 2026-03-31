@@ -11,7 +11,9 @@
  * Q16.16 values = 64 bytes on tape.
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE  /* M_PI */
+#endif
 #include "bfpp_rt_3d.h"
 #include <stdint.h>
 #include <string.h>
