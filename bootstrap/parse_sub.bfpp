@@ -1,0 +1,235 @@
+; parse_sub.bfpp — Subroutine definition and call parsing for bootstrap compiler
+;
+; Called from main loop when '!' (33) is detected.
+; Handles both subroutine definitions (!#name{body}) and calls (!#name).
+;
+; Uses Option A: GCC implicit function declaration. No forward decls needed.
+; Definitions emit: void bfpp_sub_NAME(void){ ... }
+; Calls emit:      bfpp_sub_NAME();
+;
+; Name mangling matches the Rust compiler's mangle_name():
+;   > → gt, < → lt, + → plus, - → minus, . → dot, * → star,
+;   % → pct, @ → at, $ → dollar, ~ → tilde, ^ → caret,
+;   | → pipe, & → amp. Letters/digits/_ pass through.
+;
+; Cell layout:
+;   cell 0     = working char / general purpose
+;   cell 1     = reading flag (in !#psu name loop)
+;   cell 2     = is_def flag (in !#psu)
+;   cell 3     = body-active flag (in !#pbody)
+;   cell 10-13 = buffer address pointer (4-byte, for name storage/reading)
+;   tape[500..563] = name buffer (max 64 chars, null-terminated)
+
+!define POOL 3000000
+
+; ── Mangle single char → stdout ──
+; Input: P+0 = char. Emits mangled version to stdout.
+; After: P+0 = 0, ptr = 0.
+!#mc{
+    ?= #62  [ #POOL @ "gt\0"     #0 @ !#pr [-] ^ ]
+    ?= #60  [ #POOL @ "lt\0"     #0 @ !#pr [-] ^ ]
+    ?= #43  [ #POOL @ "plus\0"   #0 @ !#pr [-] ^ ]
+    ?= #45  [ #POOL @ "minus\0"  #0 @ !#pr [-] ^ ]
+    ?= #46  [ #POOL @ "dot\0"    #0 @ !#pr [-] ^ ]
+    ?= #42  [ #POOL @ "star\0"   #0 @ !#pr [-] ^ ]
+    ?= #37  [ #POOL @ "pct\0"    #0 @ !#pr [-] ^ ]
+    ?= #64  [ #POOL @ "at\0"     #0 @ !#pr [-] ^ ]
+    ?= #36  [ #POOL @ "dollar\0" #0 @ !#pr [-] ^ ]
+    ?= #126 [ #POOL @ "tilde\0"  #0 @ !#pr [-] ^ ]
+    ?= #94  [ #POOL @ "caret\0"  #0 @ !#pr [-] ^ ]
+    ?= #124 [ #POOL @ "pipe\0"   #0 @ !#pr [-] ^ ]
+    ?= #38  [ #POOL @ "amp\0"    #0 @ !#pr [-] ^ ]
+    ; Default: letter, digit, or underscore — emit as-is
+    [. [-]]
+    ^
+}
+
+; ── Emit mangled name from buffer ──
+; Reads tape[500..] until null byte, calling !#mc for each char.
+; Uses cell 10-13 as a 4-byte buffer address pointer.
+; After: ptr = 0, cell 0 = 0, cell 10-13 cleaned up.
+!#emn{
+    ; Set up address pointer at cell 10 = 500 (4-byte)
+    >>>>>>>>>>              ; ptr = 10
+    %4 #500                 ; cell_width[10] = 4, tape[10..13] = 500
+    *$                      ; push tape[500] (first name char)
+    <<<<<<<<<<              ; ptr = 0
+    %1 ~                    ; pop char to cell 0 (1-byte)
+
+    [                       ; while char != 0
+        !#mc                ; mangle and emit. cell 0 = 0 after.
+
+        ; Advance address and read next char
+        >>>>>>>>>>          ; ptr = 10
+        +                   ; tape[10..13]++ (next buffer position)
+        *$                  ; push tape[new_addr]
+        <<<<<<<<<<          ; ptr = 0
+        ~                   ; pop char to cell 0
+    ]
+
+    ; Clean up cell 10-13
+    >>>>>>>>>>              ; ptr = 10
+    %4 #0                   ; tape[10..13] = 0
+    %1                      ; cell_width[10] = 1 (restore default)
+    <<<<<<<<<<              ; ptr = 0
+    ^
+}
+
+; ── Process subroutine body until '}' ──
+; Reads and compiles chars from stdin, identical to main loop,
+; but exits when '}' is encountered at top nesting level.
+; Nested !#name{...} are handled by recursive !#psu calls.
+;
+; Uses cell 3 as body-active flag.
+; After: ptr = 0, cells 0-3 cleaned up.
+!#pbody{
+    ; cell 3 = 1 (body active)
+    >>> #1 <<<
+
+    ,                       ; read first body char
+    [
+        ?= #125 [           ; '}' at top level → end of body
+            >>> [-] <<<      ; clear body flag
+            [-]              ; clear char
+        ]
+
+        ; If char wasn't '}', process it
+        [
+            ; Comment: ; to end of line
+            ?= #59 [
+                [-] , [ ?= #10 [ [-] ] : [ [-] , ] ]
+            ]
+            ; Newline: ignore
+            ?= #10 [ [-] ]
+            ; Numeric literal: #N
+            ?= #35 [ [-] !#pn
+                ; Check if pn returned '}'
+                ?= #125 [
+                    >>> [-] <<<  ; clear body flag
+                    [-]          ; clear char
+                ]
+            ]
+            ; Subroutine def/call: !
+            ?= #33 [ [-] !#psu ]
+            ; String literal: "
+            ?= #34 [ [-] !#ps ]
+            ; All other chars: classify and emit
+            [ !#cl !#em ]
+
+            ; Read next char if body still active
+            >>> [
+                <<< ,        ; read next char
+                >>>
+            ] <<<
+        ]
+    ]
+
+    ; Clean up
+    [-] > [-] > [-] > [-] < < <
+    ^
+}
+
+; ── Parse subroutine definition or call ──
+; Called after '!' is consumed from stdin.
+; Reads '#', then name chars, determines def vs call, emits C.
+;
+; Uses cells 0-2 and cell 10-13 (via !#emn).
+; Name buffer: tape[500..563].
+; After: ptr = 0, all cells cleaned up.
+!#psu{
+    ,                       ; read next char (should be '#')
+    ?= #35 [                ; if '#'
+        [-]                 ; clear '#'
+
+        ; Set up name buffer write pointer at cell 10 = 500
+        >>>>>>>>>>          ; ptr = 10
+        %4 #500             ; cell_width[10] = 4, tape[10..13] = 500
+        <<<<<<<<<<          ; ptr = 0
+        %1                  ; cell_width[0] = 1
+
+        ; cell 1 = 1 (still reading name), cell 2 = 0 (call by default)
+        > #1 > [-] < <
+
+        ,                   ; read first name char
+
+        > [                 ; while still reading (cell 1)
+            <               ; ptr = 0 (current char)
+
+            ; Check for definition terminator '{'
+            ?= #123 [       ; '{' → it's a definition
+                >> #1 <<    ; cell 2 = 1 (def flag)
+                > [-] <     ; cell 1 = 0 (stop reading)
+                [-]         ; clear char
+            ]
+
+            ; Check for call terminators
+            ?= #10 [ > [-] < [-] ]   ; newline → call
+            ?= #32 [ > [-] < [-] ]   ; space → call
+            ?= #13 [ > [-] < [-] ]   ; CR → call
+
+            ; If char still nonzero, it's a name char → store in buffer
+            [
+                $                   ; push char
+                >>>>>>>>>>          ; ptr = 10
+                *~                  ; deref: jump to tape[10..13], pop char, write; restore ptr=10
+                +                   ; tape[10..13]++ (advance write position)
+                <<<<<<<<<<          ; ptr = 0
+                [-]                 ; clear cell 0
+                ,                   ; read next name char
+            ]
+
+            >                       ; ptr = 1 (check reading flag)
+        ]
+        <                           ; ptr = 0
+
+        ; Null-terminate name buffer at current write position
+        >>>>>>>>>>                  ; ptr = 10
+        #0 $                        ; push 0 (null byte) — but wait, #0 sets cell to 0
+        ; Actually: need to push a 0 value. Cell 10 has the address.
+        ; Use *[#0] ? No. Just jump to write pos and write 0.
+        ; Save address, write null, restore.
+        *[-]                        ; deref: jump to write_pos, clear cell (set to 0), restore
+        ; tape[write_pos] is now 0 (null terminated)
+
+        ; Clean up cell 10-13 (write pointer no longer needed here;
+        ; !#emn will set up its own read pointer)
+        %4 #0 %1                   ; tape[10..13] = 0, cell_width[10] = 1
+        <<<<<<<<<<                  ; ptr = 0
+
+        ; Emit C code based on def flag (cell 2)
+        >> [                        ; if def (cell 2 = 1)
+            [-]                     ; clear def flag
+
+            ; Emit: void bfpp_sub_
+            #POOL @ "void bfpp_sub_\0" #0 @ !#pr
+            ; Emit mangled name
+            !#emn
+            ; Emit: (void){\n
+            #POOL @ "(void){\n\0" #0 @ !#pr
+
+            ; Process body until '}'
+            !#pbody
+
+            ; Emit: }\n
+            #POOL @ "}\n\0" #0 @ !#pr
+
+        ] : [                       ; else: it's a call
+
+            ; Emit: bfpp_sub_
+            #POOL @ "bfpp_sub_\0" #0 @ !#pr
+            ; Emit mangled name
+            !#emn
+            ; Emit: ();\n
+            #POOL @ "();\n\0" #0 @ !#pr
+        ]
+        <<                          ; ptr = 0
+
+        ; Clean up cells 0-2
+        [-] > [-] > [-] < <
+
+    ] : [
+        ; Not '#' after '!' — ignore
+        [-]
+    ]
+    ^
+}
