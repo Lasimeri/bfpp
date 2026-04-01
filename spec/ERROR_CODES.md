@@ -30,7 +30,9 @@ The error register (`bfpp_err`) is a 64-bit integer separate from the tape. Valu
 | 13 | `ERR_NOT_CONNECTED` | Not connected | `ENOTCONN` |
 | 14 | `ERR_INTERRUPTED` | Interrupted | `EINTR` |
 | 15 | `ERR_IO` | I/O error | `EIO` |
-| 16–255 | — | Reserved for future standard use | — |
+| 16 | `ERR_NOLIB` | Shared library not found (FFI `dlopen` failed) | — |
+| 17 | `ERR_NOSYM` | Symbol not found in shared library (FFI `dlsym` failed) | — |
+| 18–255 | — | Reserved for future standard use | — |
 | 256+ | — | User-defined error codes | — |
 
 ---

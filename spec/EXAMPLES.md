@@ -681,3 +681,56 @@ bfpp gpu_demo.bfpp --tape-size 262144 -o gpu_demo
 <<<
 !#__gpu_reduce              ; tape[ptr] = sum of all elements
 ```
+
+---
+
+## 27. Auto-Parallelized Loop
+
+The optimizer automatically detects loops with provably independent iterations (no I/O, no cross-iteration aliasing, trip count ≥ 64) and rewrites them as `ParallelLoop` nodes that dispatch via `bfpp_parallel_for`. If the body is GPU-safe (arithmetic only), the loop is further upgraded to `GpuLoop` with an OpenCL kernel + CPU fallback.
+
+No source annotation is needed — the optimizer detects the pattern at `-O2`.
+
+```bfpp
+; Auto-parallelized loop: 1000 elements, stride 8
+; Optimizer detects: SetValue(1000) + Loop with stride-8 independent body
+; → ParallelLoop → bfpp_parallel_for across CPU cores
+; → GpuLoop (if body is GPU-safe) → OpenCL kernel with CPU fallback
+#1000
+[- >++++< >>>>>>>>]
+; Each iteration: decrement counter, add 4 to next cell, advance 8 cells
+; Body touches only cells [0..7] within each stride — no cross-iteration aliasing
+; 1000 ≥ 64 threshold → parallel dispatch engaged
+```
+
+**Detection criteria:**
+- `SetValue(N)` immediately before `Loop` (N = trip count, must be ≥ 64)
+- Loop body ends with `MoveRight(stride)` where stride ≥ 2
+- No `.`, `,`, subroutine calls, or nested loops in body
+- All cell accesses within `[0, stride)` per iteration
+
+---
+
+## 28. Compressed I/O
+
+Tape checkpoint save/load and compressed network/file transfers using zlib.
+
+```bfpp
+; Save entire tape state to a checkpoint file
+"checkpoint.bin\0"
+<<<<<<<<<<<<<<
+!#__tape_save
+
+; ... later, restore from checkpoint
+"checkpoint.bin\0"
+<<<<<<<<<<<<<<
+!#__tape_load
+; tape[ptr] = number of bytes loaded
+
+; Send compressed data over a TCP socket
+; fd in tape[ptr], data at tape[ptr+4], length at tape[ptr+8]
+!#__net_send_compressed
+
+; Write compressed data to a file
+; fd in tape[ptr], data at tape[ptr+4], length at tape[ptr+8]
+!#__file_write_compressed
+```

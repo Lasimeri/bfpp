@@ -657,22 +657,24 @@ Subroutine names are mangled: symbol characters are mapped to mnemonics (e.g., `
 
 ### 6.5 Optimizer Passes
 
-The compiler performs up to 12 optimization passes at `-O2`. Passes are applied in order; some are repeated after inlining/unrolling exposes new opportunities.
+The compiler performs up to 14 optimization passes at `-O2`. Passes are applied in order; some are repeated after inlining/unrolling exposes new opportunities.
 
 | # | Pass | Description | Level |
 |---|------|-------------|-------|
 | 1 | Clear loop detection | `[-]` → `bfpp_set(ptr, 0)` | `-O1` |
-| 2 | Increment coalescing | `+++` → `tape[ptr] += 3` | `-O1` |
-| 3 | Move coalescing | `>>>` → `ptr += 3`; `>>>>><<<` → `ptr += 2`; cancellation | `-O2` |
-| 4 | Dead store elimination | Remove writes to cells that are immediately overwritten | `-O2` |
-| 5 | Constant folding | `#5 > #3 <` with known cell values → propagate constants | `-O2` |
-| 6 | Subroutine inlining | Inline small subroutines (body ≤ threshold) at call site | `-O2` |
-| 7 | Compile-time conditional evaluation | Resolve `?=`/`?!`/if-else when cell value is known at compile time | `-O2` |
-| 8 | Loop unrolling | `#N [- body]` unrolled to N copies when N≤16 and body has no side effects | `-O2` |
-| 9 | Tail return elimination | Trailing `^` in subroutines removed (implicit return) | `-O2` |
-| 10 | Second fold+coalesce round | Re-run constant folding and move/increment coalescing after inline/unroll expose new patterns | `-O2` |
-| 11 | Copy loop optimization | `[->+<]` patterns → direct assignment | `-O2` |
-| 12 | Scan loop optimization | `[>]` / `[<]` → memchr-based scan | `-O2` |
+| 2 | Constant folding | `#5 > #3 <` with known cell values → propagate constants | `-O1` |
+| 3 | Move coalescing | `>>>` → `ptr += 3`; `>>>>><<<` → `ptr += 2`; cancellation | `-O1` |
+| 4 | Compile-time conditional evaluation | Resolve `?=`/`?!`/if-else when cell value is known at compile time | `-O2` |
+| 5 | Scan loop optimization | `[>]` / `[<]` → memchr-based scan | `-O2` |
+| 6 | Multiply-move detection | `[->+<]` patterns → direct assignment with factor | `-O2` |
+| 7 | Loop unrolling | `#N [- body]` unrolled to N copies when N≤16 and body has no side effects | `-O2` |
+| 8 | Auto-parallelism | Loops with ≥64 provably independent iterations rewritten to `ParallelLoop` → `bfpp_parallel_for` (see §6.10) | `-O2` |
+| 9 | GPU loop upgrade | `ParallelLoop` nodes with GPU-safe bodies upgraded to `GpuLoop` → OpenCL kernel dispatch with CPU fallback (see §6.10) | `-O2` |
+| 10 | Dead code elimination | Remove unreachable code after unconditional returns/errors | `-O2` |
+| 11 | Subroutine inlining | Inline small subroutines (body ≤ threshold) at call site | `-O2` |
+| 12 | Second constant folding | Re-run constant folding after inline/unroll expose new patterns | `-O2` |
+| 13 | Second move coalescing | Re-run move/increment coalescing on newly folded code | `-O2` |
+| 14 | Error folding | Fold error register writes followed by immediate propagation | `-O2` |
 
 ### 6.6 Parallel Compilation
 
@@ -694,6 +696,7 @@ The compiler supports parallel compilation for improved throughput:
 | `-lEGL` | Multi-GPU intrinsics |
 | `-lOpenCL` | GPU compute intrinsics (via `dlopen`) |
 | `-lpthread` | Threading intrinsics |
+| `-lz` | Compressed I/O intrinsics |
 
 ### 6.8 GPU-Accelerated Compilation
 
@@ -717,6 +720,66 @@ The `bootstrap/` directory contains a self-hosting BF++ compiler written in BF++
 | `parse_sub.bfpp` | 241 | Subroutine definition/call parser |
 
 The bootstrap compiler uses the self-hosting intrinsics (`__mul`, `__div`, `__mod`, `__strcmp`, `__strlen`, `__strcpy`, `__call`, `__hashmap_*`, `__array_*`) for efficient parsing and code generation. It parses a subset of BF++ and emits C output.
+
+### 6.10 Auto-Parallelism and GPU Loop Offloading
+
+The optimizer detects loops with provably independent iterations and rewrites them for parallel execution. This is fully automatic — no source-level annotation is required.
+
+**ParallelLoop (CPU multi-threading)**:
+
+Detection criteria:
+- A `SetValue(N)` immediately precedes a `Loop` (establishes trip count)
+- Trip count ≥ 64 (below this threshold, pthread dispatch overhead exceeds benefit)
+- Loop body ends with `MoveRight(stride)` where stride ≥ 2
+- No I/O operations (`.`, `,`), subroutine calls, or nested loops in the body
+- All cell accesses are within `[0, stride)` relative to the iteration pointer — no cross-iteration aliasing
+
+Codegen: the loop body is extracted into a file-scope C function (`_par_body_N`) and dispatched via `bfpp_parallel_for(base_ptr, trip_count, stride, body_fn)`. The runtime distributes iterations across available CPU cores. Falls back to sequential execution when `total < 2*ncpu`.
+
+Runtime: `bfpp_rt_parallel.{c,h}`.
+
+**GpuLoop (OpenCL offloading)**:
+
+A `ParallelLoop` node is upgraded to `GpuLoop` when the loop body is GPU-safe:
+- Body contains only arithmetic operations (`+`, `-`, `&`, `|`, `x`, `s`, `r`, `n`) and cell accesses
+- No stack operations, error handling, or tape pointer movement beyond the stride
+
+Codegen: emits a dual-path — an OpenCL kernel dispatch with a CPU `bfpp_parallel_for` fallback. The kernel source is generated at compile time and embedded in the C output. At runtime, if OpenCL is available and the GPU context is initialized, the kernel path is taken; otherwise the CPU fallback executes.
+
+```bfpp
+; Auto-parallelized loop: 1000 elements, stride 8
+; Optimizer detects this as ParallelLoop → uses bfpp_parallel_for
+; If body is GPU-safe, upgraded to GpuLoop → OpenCL kernel
+#1000
+[- >++++< >>>>>>>>]
+```
+
+### 6.11 Compressed I/O Intrinsics
+
+Compressed I/O intrinsics provide zlib-based compression for network, file, and tape checkpoint operations. When any compressed I/O intrinsic is used, the compiler emits `#include "bfpp_rt_compress.h"` and links with `-lz`.
+
+**Network compression**:
+
+| Intrinsic | Input Tape Layout | Output | Effect |
+|-----------|-------------------|--------|--------|
+| `__net_send_compressed` | `[ptr]`=fd, `[ptr+4]`=data_addr, `[ptr+8]`=len | — | Compress data with zlib and send over socket. Wire format: `[4-byte compressed_len][compressed_data]`. |
+| `__net_recv_compressed` | `[ptr]`=fd, `[ptr+4]`=dest_addr, `[ptr+8]`=max_len | `tape[ptr+12]` = decompressed size | Receive compressed data from socket and decompress into tape. |
+
+**File compression**:
+
+| Intrinsic | Input Tape Layout | Output | Effect |
+|-----------|-------------------|--------|--------|
+| `__file_write_compressed` | `[ptr]`=fd, `[ptr+4]`=data_addr, `[ptr+8]`=len | — | Compress and write to file. Header: `[original_size:4][compressed_size:4][compressed_data]`. |
+| `__file_read_compressed` | `[ptr]`=fd, `[ptr+4]`=dest_addr, `[ptr+8]`=max_len | `tape[ptr+12]` = decompressed size | Read compressed data from file and decompress. |
+
+**Tape checkpoints**:
+
+| Intrinsic | Input Tape Layout | Output | Effect |
+|-----------|-------------------|--------|--------|
+| `__tape_save` | `ptr` -> null-terminated file path | — | Save entire tape to file (trailing zeros stripped, remainder compressed). |
+| `__tape_load` | `ptr` -> null-terminated file path | `tape[ptr]` = bytes loaded | Load tape checkpoint from file, decompress, restore tape contents. |
+
+Runtime files: `bfpp_rt_compress.{c,h}`. Requires zlib (`-lz`).
 
 ---
 

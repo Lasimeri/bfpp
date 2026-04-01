@@ -14,6 +14,9 @@
 - **Terminal framebuffer backend** (`runtime/bfpp_fb_terminal.{c,h}`): true-color ANSI rendering with delta encoding, adaptive frame rate targeting 256KB/s SSH connections. Auto-detected when no display server is available. Override with `BFPP_TERMINAL_FB=1` or set bandwidth via `BFPP_TERMINAL_BW=N` (KB/s)
 - **Self-hosting bootstrap compiler** (`bootstrap/bfpp_self.bfpp` + `parse_num.bfpp` + `parse_str.bfpp` + `parse_sub.bfpp`): a BF++ compiler written in BF++ itself, demonstrating the language's self-hosting capability. Parses a subset of BF++ and emits C output
 - **`-mavx2 -mfma`** CC flags automatically added on x86_64 targets
+- **Auto-parallelism** (optimizer passes 8–9): loops with ≥64 provably independent iterations automatically rewritten as `ParallelLoop` → `bfpp_parallel_for` across CPU cores. GPU-safe loops further upgraded to `GpuLoop` → OpenCL kernel dispatch with CPU fallback. No source annotation required
+- **Compressed I/O intrinsics**: `__net_send_compressed`, `__net_recv_compressed`, `__file_write_compressed`, `__file_read_compressed` (zlib-based network/file compression), `__tape_save`, `__tape_load` (tape checkpoint save/restore with trailing-zero stripping and compression). Runtime: `bfpp_rt_compress.{c,h}`, requires `-lz`
+- **Parallel runtime** (`runtime/bfpp_rt_parallel.{c,h}`): `bfpp_parallel_for` thread pool dispatch, threading primitives (`__spawn`/`__join`), mutex/barrier arrays, atomic tape operations
 
 ### Changed
 - `rayon` added as a dependency (parallel codegen, optimizer, analyzer)
