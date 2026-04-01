@@ -593,3 +593,91 @@ bfpp examples/editor.bfpp --include stdlib --tape-size 262144 -o editor
 - **If/Else branching**: `?{...}:{...}` used extensively in the key dispatch loop to route different key codes to handler subroutines.
 - **Multicore pattern**: Fork a child process for disk I/O; parent continues rendering while child writes to disk. Child exit status checked via `__waitpid` on next save attempt.
 - **TUI double buffering**: Each frame builds the screen via `__tui_put`/`__tui_puts`/`__tui_fill`, then `__tui_end` diffs and emits only changed cells.
+
+---
+
+## 25. Bootstrap Compiler (`bootstrap/bfpp_self.bfpp`)
+
+A BF++ compiler written in BF++ itself (~565 lines across 4 files), demonstrating self-hosting capability. The bootstrap compiler reads BF++ source from stdin, parses it, and emits C output to stdout.
+
+**Compile the bootstrap compiler:**
+```bash
+bfpp bootstrap/bfpp_self.bfpp --include bootstrap --include stdlib --tape-size 1048576 -o bfpp_bootstrap
+```
+
+**Use it to compile a program:**
+```bash
+echo '"Hello, World!\n\0" <<<<<<<<<<<<<<< [.>]' | ./bfpp_bootstrap > hello.c
+cc -O2 hello.c -o hello
+./hello
+# Output: Hello, World!
+```
+
+**Key concepts demonstrated:**
+- **Self-hosting intrinsics**: Uses `__mul`, `__div`, `__mod` for numeric parsing, `__strcmp`/`__strlen`/`__strcpy` for name matching, `__hashmap_*` for subroutine registry, `__call` for computed dispatch.
+- **Modular parser design**: Separate `.bfpp` files for numeric literals, string literals, and subroutine parsing — each included via `!include`.
+- **Code generation**: Emits C preamble (includes, tape/stack declarations, helper functions), translates BF++ ops to C statements, emits postamble (main function closing).
+- **Hash map usage**: `__hashmap_init` creates a subroutine name table. As definitions are parsed, names are registered via `__hashmap_set`. On call, `__hashmap_get` resolves the name to a function pointer for `__call` dispatch.
+
+```bfpp
+; Excerpt from bootstrap/bfpp_self.bfpp — main dispatch loop
+; Read source character-by-character, dispatch to appropriate parser
+
+!include "parse_num.bfpp"
+!include "parse_str.bfpp"
+!include "parse_sub.bfpp"
+
+; ... (preamble emission omitted)
+
+; Main parse loop: read chars until EOF
+,                             ; read first char
+[
+  ; Dispatch based on character value
+  $ ?{                        ; save char, test if > (62)
+    ; ... handle '>' — emit ptr++
+  }:{
+    ; ... check next character class
+  }
+  ,                           ; read next char
+]
+
+; ... (postamble emission omitted)
+```
+
+---
+
+## 26. GPU Compute Offloading
+
+Using `__gpu_*` intrinsics to offload parallel computation to GPU via OpenCL.
+
+**Compile:**
+```bash
+bfpp gpu_demo.bfpp --tape-size 262144 -o gpu_demo
+```
+
+```bfpp
+; Initialize GPU compute
+!#__gpu_init
+
+; Query GPU count
+!#__gpu_count
+; tape[ptr] = number of OpenCL GPUs
+
+; Sort an array on the GPU
+; Set up array data at tape[0x1000]
+%4
+#4096 >                     ; addr = 0x1000
+#256                        ; count = 256 elements
+<
+!#__gpu_sort                ; GPU-accelerated parallel sort
+
+; Wait for completion
+!#__gpu_wait
+
+; Reduce (sum) an array
+#4096 >                     ; addr
+#256 >                      ; count
+#0                          ; op = 0 (sum)
+<<<
+!#__gpu_reduce              ; tape[ptr] = sum of all elements
+```

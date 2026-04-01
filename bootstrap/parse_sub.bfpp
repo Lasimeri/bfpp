@@ -95,7 +95,7 @@
             [-]              ; clear char
         ]
 
-        ; If char wasn't '}', process it
+        ; If char wasn't '}', process it (runs once, not a loop)
         [
             ; Comment: ; to end of line
             ?= #59 [
@@ -117,13 +117,14 @@
             ?= #34 [ [-] !#ps ]
             ; All other chars: classify and emit
             [ !#cl !#em ]
-
-            ; Read next char if body still active
-            >>> ?= #1 [
-                <<< ,        ; read next char
-                >>>
-            ] <<<
+            ; P+0 is now 0 from handlers above; inner block exits
         ]
+
+        ; Read next char if body still active (outside inner block)
+        >>> ?= #1 [
+            <<< ,            ; read next char
+            >>>
+        ] <<<
     ]
 
     ; Clean up

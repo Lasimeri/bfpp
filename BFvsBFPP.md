@@ -4,7 +4,7 @@
 
 **Standard Brainfuck** is a minimalist esoteric language with exactly 8 operators. It is Turing-complete but provides no I/O beyond single-byte stdin/stdout, no error handling, no subroutines, no bitwise operations, and no system interface. Programs operate on a fixed 30,000-cell tape of 8-bit values with a single pointer.
 
-**BF++** is a strict superset of Brainfuck that retains symbolic minimalism while adding 30+ operators for system calls, file I/O, networking, error handling, subroutines, bitwise arithmetic, FFI, and a framebuffer. Programs are transpiled to C11 via a Rust-based compiler, then compiled to native binaries. BF++ includes a standard library written in BF++ itself, a preprocessor with `!include` support, `!define`/`!undef` macros, if/else syntax, and a 12-pass optimizer.
+**BF++** is a strict superset of Brainfuck that retains symbolic minimalism while adding 30+ operators for system calls, file I/O, networking, error handling, subroutines, bitwise arithmetic, FFI, and a framebuffer. Programs are transpiled to C11 via a Rust-based compiler, then compiled to native binaries. BF++ includes a standard library written in BF++ itself, a preprocessor with `!include` support, `!define`/`!undef` macros, if/else syntax, a 12-pass optimizer, OpenCL GPU compute offloading, a terminal framebuffer backend for headless/SSH rendering, AVX2 SIMD acceleration, parallel compilation, and a self-hosting bootstrap compiler.
 
 ---
 

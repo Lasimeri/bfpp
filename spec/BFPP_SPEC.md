@@ -8,7 +8,7 @@
 
 ## 1. Overview
 
-BF++ is a Brainfuck-derived language that retains symbolic minimalism while adding operators for system calls, file I/O, networking, error handling, and subroutines. Programs are transpiled to C via a Rust-based compiler, then compiled to native binaries via gcc/clang.
+BF++ is a Brainfuck-derived language that retains symbolic minimalism while adding operators for system calls, file I/O, networking, error handling, and subroutines. Programs are transpiled to C via a Rust-based compiler with parallel codegen and analysis, then compiled to native binaries via gcc/clang with parallel CC invocation. Features include 3D rendering (OpenGL 3.3 + software fallback), multi-GPU support, OpenCL GPU compute offloading, AVX2 SIMD acceleration, a terminal framebuffer backend for headless/SSH rendering, and a self-hosting bootstrap compiler.
 
 BF++ is a strict superset of Brainfuck: all valid BF programs are valid BF++ programs with identical semantics.
 
@@ -653,6 +653,7 @@ Subroutine names are mangled: symbol characters are mapped to mnemonics (e.g., `
 | `--emit-c` | Output C source instead of compiling |
 | `--include PATH` | Add stdlib search path |
 | `--watch` | Poll input file every 500ms; recompile on change |
+| `--features gpu` | (cargo build flag) Enable OpenCL-accelerated lexing + pattern detection |
 
 ### 6.5 Optimizer Passes
 
