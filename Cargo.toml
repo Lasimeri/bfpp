@@ -10,3 +10,4 @@ categories = ["compilers", "command-line-utilities"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+rayon = "1"

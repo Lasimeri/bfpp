@@ -14,6 +14,7 @@
 // so that nested structures are optimized at every depth.
 
 use crate::ast::AstNode;
+use rayon::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OptLevel {
@@ -22,13 +23,8 @@ pub enum OptLevel {
     Full,  // O2: all Basic passes + scan-loop, multiply-move
 }
 
-// Entry point: applies the selected optimization passes in sequence.
-// Pass ordering for Full:
-//   1. clear-loop  — reduces [-] and [+] to Clear (must run before multiply-move)
-//   2. scan-loop   — reduces [>] and [<] to ScanRight/ScanLeft
-//   3. multiply-move — detects balanced decrement-move-increment loops
-//   4. error-folding — collapses consecutive ? (Propagate) nodes
-pub fn optimize(nodes: Vec<AstNode>, level: OptLevel) -> Vec<AstNode> {
+// Run all optimization passes on a node list (used per-sub and for top-level).
+fn run_passes(nodes: Vec<AstNode>, level: OptLevel) -> Vec<AstNode> {
     match level {
         OptLevel::None => nodes,
         OptLevel::Basic => {
@@ -47,12 +43,51 @@ pub fn optimize(nodes: Vec<AstNode>, level: OptLevel) -> Vec<AstNode> {
             let nodes = pass_unroll_small_loops(nodes);
             let nodes = pass_dead_code(nodes);
             let nodes = pass_inline_subs(nodes);
-            // Second fold pass — inlining + unrolling may expose new folding opportunities
             let nodes = pass_fold_constants(nodes);
             let nodes = pass_coalesce_moves(nodes);
             pass_error_folding(nodes)
         }
     }
+}
+
+// Entry point: optimizes subroutine bodies in parallel (rayon), then
+// optimizes top-level code. Each SubDef body is independent — safe to
+// parallelize. DCE and inlining run on the reassembled AST afterward.
+pub fn optimize(nodes: Vec<AstNode>, level: OptLevel) -> Vec<AstNode> {
+    if level == OptLevel::None { return nodes; }
+
+    // Split: separate SubDefs from top-level code, preserving order.
+    let mut subs: Vec<(String, Vec<AstNode>)> = Vec::new();
+    let mut top_level: Vec<AstNode> = Vec::new();
+    let mut sub_positions: Vec<(usize, String)> = Vec::new(); // (index in top_level, name)
+
+    for node in nodes {
+        match node {
+            AstNode::SubDef(name, body) => {
+                sub_positions.push((top_level.len(), name.clone()));
+                top_level.push(AstNode::SubDef(name.clone(), vec![])); // placeholder
+                subs.push((name, body));
+            }
+            other => top_level.push(other),
+        }
+    }
+
+    // Optimize sub bodies in parallel
+    let optimized_subs: Vec<(String, Vec<AstNode>)> = subs.into_par_iter()
+        .map(|(name, body)| (name, run_passes(body, level)))
+        .collect();
+
+    // Reassemble: replace placeholders with optimized bodies
+    let mut sub_map: std::collections::HashMap<String, Vec<AstNode>> =
+        optimized_subs.into_iter().collect();
+    for (idx, name) in &sub_positions {
+        if let Some(body) = sub_map.remove(name) {
+            top_level[*idx] = AstNode::SubDef(name.clone(), body);
+        }
+    }
+
+    // Optimize top-level (non-sub) code + cross-sub passes (DCE, inline)
+    run_passes(top_level, level)
 }
 
 // Clear-loop detection: replaces `[-]` and `[+]` with a single Clear node.

@@ -477,8 +477,6 @@ static void rasterize_triangle(const float screen[9],
     int stride = sw.width * 3;
 
 #ifdef __x86_64__
-    /* ── SSE4 path: evaluate 4 pixels at once ────────────────── */
-
     /* Edge equation increments for stepping +1 in X */
     float de0_dx = sy1 - sy2;
     float de1_dx = sy2 - sy0;
@@ -493,13 +491,93 @@ static void rasterize_triangle(const float screen[9],
         float e1_start = edge_func(sx2, sy2, sx0, sy0, px_start, py);
         float e2_start = edge_func(sx0, sy0, sx1, sy1, px_start, py);
 
-        /* SSE: 4 consecutive X offsets */
-        __m128 e0_base = _mm_set_ps(e0_start + 3*de0_dx, e0_start + 2*de0_dx,
-                                     e0_start + de0_dx, e0_start);
-        __m128 e1_base = _mm_set_ps(e1_start + 3*de1_dx, e1_start + 2*de1_dx,
-                                     e1_start + de1_dx, e1_start);
-        __m128 e2_base = _mm_set_ps(e2_start + 3*de2_dx, e2_start + 2*de2_dx,
-                                     e2_start + de2_dx, e2_start);
+        int x = min_x;
+
+#ifdef __AVX2__
+        /* ── AVX2 path: evaluate 8 pixels at once ────────────── */
+        {
+            __m256 e0_v = _mm256_set_ps(
+                e0_start+7*de0_dx, e0_start+6*de0_dx, e0_start+5*de0_dx, e0_start+4*de0_dx,
+                e0_start+3*de0_dx, e0_start+2*de0_dx, e0_start+de0_dx, e0_start);
+            __m256 e1_v = _mm256_set_ps(
+                e1_start+7*de1_dx, e1_start+6*de1_dx, e1_start+5*de1_dx, e1_start+4*de1_dx,
+                e1_start+3*de1_dx, e1_start+2*de1_dx, e1_start+de1_dx, e1_start);
+            __m256 e2_v = _mm256_set_ps(
+                e2_start+7*de2_dx, e2_start+6*de2_dx, e2_start+5*de2_dx, e2_start+4*de2_dx,
+                e2_start+3*de2_dx, e2_start+2*de2_dx, e2_start+de2_dx, e2_start);
+
+            __m256 eight_de0 = _mm256_set1_ps(8.0f * de0_dx);
+            __m256 eight_de1 = _mm256_set1_ps(8.0f * de1_dx);
+            __m256 eight_de2 = _mm256_set1_ps(8.0f * de2_dx);
+            __m256 vzero = _mm256_setzero_ps();
+
+            for (; x + 7 <= max_x; x += 8) {
+                __m256 inside;
+                if (area > 0) {
+                    inside = _mm256_and_ps(
+                        _mm256_cmp_ps(e0_v, vzero, _CMP_GE_OQ),
+                        _mm256_and_ps(
+                            _mm256_cmp_ps(e1_v, vzero, _CMP_GE_OQ),
+                            _mm256_cmp_ps(e2_v, vzero, _CMP_GE_OQ)));
+                } else {
+                    inside = _mm256_and_ps(
+                        _mm256_cmp_ps(e0_v, vzero, _CMP_LE_OQ),
+                        _mm256_and_ps(
+                            _mm256_cmp_ps(e1_v, vzero, _CMP_LE_OQ),
+                            _mm256_cmp_ps(e2_v, vzero, _CMP_LE_OQ)));
+                }
+
+                int mask = _mm256_movemask_ps(inside);
+                if (mask) {
+                    float e0_a[8], e1_a[8], e2_a[8];
+                    _mm256_storeu_ps(e0_a, e0_v);
+                    _mm256_storeu_ps(e1_a, e1_v);
+                    _mm256_storeu_ps(e2_a, e2_v);
+
+                    for (int k = 0; k < 8; k++) {
+                        if (!(mask & (1 << k))) continue;
+                        int px = x + k;
+                        float w0 = e0_a[k] * inv_area;
+                        float w1 = e1_a[k] * inv_area;
+                        float w2 = 1.0f - w0 - w1;
+                        float persp = 1.0f / (w0*inv_w0 + w1*inv_w1 + w2*inv_w2);
+                        float depth = w0*sz0 + w1*sz1 + w2*sz2;
+                        int zidx = y * sw.width + px;
+                        if (depth >= sw.zbuf[zidx]) continue;
+                        sw.zbuf[zidx] = depth;
+                        float pc0 = w0*inv_w0*persp, pc1 = w1*inv_w1*persp, pc2 = w2*inv_w2*persp;
+                        float norm[3] = {
+                            normals[0]*pc0+normals[3]*pc1+normals[6]*pc2,
+                            normals[1]*pc0+normals[4]*pc1+normals[7]*pc2,
+                            normals[2]*pc0+normals[5]*pc1+normals[8]*pc2};
+                        float wpos[3] = {
+                            world[0]*pc0+world[3]*pc1+world[6]*pc2,
+                            world[1]*pc0+world[4]*pc1+world[7]*pc2,
+                            world[2]*pc0+world[5]*pc1+world[8]*pc2};
+                        uint8_t r, g, b;
+                        shade_pixel(norm, wpos, &r, &g, &b);
+                        int fb_idx = y * stride + px * 3;
+                        fb[fb_idx] = r; fb[fb_idx+1] = g; fb[fb_idx+2] = b;
+                    }
+                }
+                e0_v = _mm256_add_ps(e0_v, eight_de0);
+                e1_v = _mm256_add_ps(e1_v, eight_de1);
+                e2_v = _mm256_add_ps(e2_v, eight_de2);
+            }
+        }
+#endif /* __AVX2__ */
+
+        /* ── SSE4 tail: evaluate 4 pixels at a time ──────────── */
+        {
+        __m128 e0_base = _mm_set_ps(
+            e0_start+(x-min_x+3)*de0_dx, e0_start+(x-min_x+2)*de0_dx,
+            e0_start+(x-min_x+1)*de0_dx, e0_start+(x-min_x)*de0_dx);
+        __m128 e1_base = _mm_set_ps(
+            e1_start+(x-min_x+3)*de1_dx, e1_start+(x-min_x+2)*de1_dx,
+            e1_start+(x-min_x+1)*de1_dx, e1_start+(x-min_x)*de1_dx);
+        __m128 e2_base = _mm_set_ps(
+            e2_start+(x-min_x+3)*de2_dx, e2_start+(x-min_x+2)*de2_dx,
+            e2_start+(x-min_x+1)*de2_dx, e2_start+(x-min_x)*de2_dx);
 
         __m128 four_de0 = _mm_set1_ps(4.0f * de0_dx);
         __m128 four_de1 = _mm_set1_ps(4.0f * de1_dx);
@@ -507,7 +585,6 @@ static void rasterize_triangle(const float screen[9],
 
         __m128 zero = _mm_setzero_ps();
 
-        int x = min_x;
         for (; x + 3 <= max_x; x += 4) {
             /* Inside test: all edges must have same sign as total area */
             __m128 inside;
@@ -582,6 +659,7 @@ static void rasterize_triangle(const float screen[9],
             e1_base = _mm_add_ps(e1_base, four_de1);
             e2_base = _mm_add_ps(e2_base, four_de2);
         }
+        } /* end SSE4 block */
 
         /* Scalar tail for remaining pixels */
         float e0_scalar = e0_start + (float)(x - min_x) * de0_dx;

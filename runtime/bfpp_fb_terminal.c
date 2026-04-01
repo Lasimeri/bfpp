@@ -36,6 +36,10 @@
 #include <sys/ioctl.h>
 #include <poll.h>
 
+#ifdef __x86_64__
+#include <immintrin.h>
+#endif
+
 /* ── Terminal cell ──────────────────────────────────────────── */
 
 typedef struct {
@@ -183,13 +187,61 @@ static void downsample(void)
             /* Average the pixel block */
             int sum_r = 0, sum_g = 0, sum_b = 0;
             int count = 0;
-            for (int py = py0; py < py1; py++) {
-                for (int px = px0; px < px1; px++) {
-                    int idx = (py * fw + px) * 3;
-                    sum_r += fb[idx];
-                    sum_g += fb[idx + 1];
-                    sum_b += fb[idx + 2];
-                    count++;
+            int block_w = px1 - px0;
+
+#ifdef __AVX2__
+            /* AVX2: accumulate 8 pixels at a time per row.
+             * Load 8 RGB triplets (24 bytes) as two 128-bit loads,
+             * widen bytes to 16-bit, horizontal-add R/G/B channels. */
+            if (block_w >= 8) {
+                __m256i acc_r = _mm256_setzero_si256();
+                __m256i acc_g = _mm256_setzero_si256();
+                __m256i acc_b = _mm256_setzero_si256();
+
+                for (int py = py0; py < py1; py++) {
+                    int row_off = py * fw * 3;
+                    int px = px0;
+                    for (; px + 7 < px1; px += 8) {
+                        /* Load 24 bytes (8 RGB pixels) — use unaligned load */
+                        const uint8_t *p = fb + row_off + px * 3;
+                        /* Extract R, G, B for 8 pixels manually */
+                        __m128i rvals = _mm_set_epi8(0,0,0,0,0,0,0,0,
+                            p[21],p[18],p[15],p[12],p[9],p[6],p[3],p[0]);
+                        __m128i gvals = _mm_set_epi8(0,0,0,0,0,0,0,0,
+                            p[22],p[19],p[16],p[13],p[10],p[7],p[4],p[1]);
+                        __m128i bvals = _mm_set_epi8(0,0,0,0,0,0,0,0,
+                            p[23],p[20],p[17],p[14],p[11],p[8],p[5],p[2]);
+                        /* Widen to 16-bit and accumulate */
+                        acc_r = _mm256_add_epi16(acc_r, _mm256_cvtepu8_epi16(rvals));
+                        acc_g = _mm256_add_epi16(acc_g, _mm256_cvtepu8_epi16(gvals));
+                        acc_b = _mm256_add_epi16(acc_b, _mm256_cvtepu8_epi16(bvals));
+                        count += 8;
+                    }
+                    /* Scalar tail for remaining pixels in this row */
+                    for (; px < px1; px++) {
+                        int idx = row_off + px * 3;
+                        sum_r += fb[idx]; sum_g += fb[idx+1]; sum_b += fb[idx+2];
+                        count++;
+                    }
+                }
+                /* Horizontal reduce the AVX accumulators */
+                int16_t rbuf[16], gbuf[16], bbuf[16];
+                _mm256_storeu_si256((__m256i*)rbuf, acc_r);
+                _mm256_storeu_si256((__m256i*)gbuf, acc_g);
+                _mm256_storeu_si256((__m256i*)bbuf, acc_b);
+                for (int k = 0; k < 16; k++) {
+                    sum_r += rbuf[k]; sum_g += gbuf[k]; sum_b += bbuf[k];
+                }
+            } else
+#endif /* __AVX2__ */
+            {
+                /* Scalar path */
+                for (int py = py0; py < py1; py++) {
+                    for (int px = px0; px < px1; px++) {
+                        int idx = (py * fw + px) * 3;
+                        sum_r += fb[idx]; sum_g += fb[idx+1]; sum_b += fb[idx+2];
+                        count++;
+                    }
                 }
             }
             if (count > 0) {
