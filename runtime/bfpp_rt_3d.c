@@ -29,6 +29,8 @@
 #include <math.h>
 #include <time.h>
 
+#include <pthread.h>
+
 #ifdef __x86_64__
 #include <immintrin.h>
 #endif
@@ -65,6 +67,7 @@ static struct {
     int    pbo_index;
     int    pbo_initialized;
     int    pbo_first_frame;  /* skip map on first frame — no data yet */
+    GLsync pbo_fence[2];    /* fence sync for PBO readback overlap    */
 
     /* Frame timing */
     uint64_t frame_start_ns;
@@ -175,6 +178,12 @@ static void init_pbo(int w, int h) {
 
 static void cleanup_pbo(void) {
     if (g3d.pbo_initialized) {
+        for (int i = 0; i < 2; i++) {
+            if (g3d.pbo_fence[i]) {
+                glDeleteSync(g3d.pbo_fence[i]);
+                g3d.pbo_fence[i] = NULL;
+            }
+        }
         glDeleteBuffers(2, g3d.pbo);
         g3d.pbo[0] = g3d.pbo[1] = 0;
         g3d.pbo_initialized = 0;
@@ -1002,6 +1011,45 @@ void bfpp_gl_depth_test(uint8_t *tape, int ptr)
 
 /* ── Section I: Present ──────────────────────────────────────── */
 
+/* Parallel row-flip worker for bfpp_gl_present (Change 1: Round 3) */
+typedef struct {
+    uint8_t *fb;
+    int stride, y_start, y_end, h;
+} flip_arg_t;
+
+static void *flip_worker(void *arg) {
+    flip_arg_t *a = (flip_arg_t *)arg;
+    for (int y = a->y_start; y < a->y_end; y++) {
+        uint8_t *top = a->fb + y * a->stride;
+        uint8_t *bot = a->fb + (a->h - 1 - y) * a->stride;
+#ifdef __AVX2__
+        int x;
+        for (x = 0; x + 32 <= a->stride; x += 32) {
+            __m256i t = _mm256_loadu_si256((__m256i*)(top + x));
+            __m256i b = _mm256_loadu_si256((__m256i*)(bot + x));
+            _mm256_storeu_si256((__m256i*)(top + x), b);
+            _mm256_storeu_si256((__m256i*)(bot + x), t);
+        }
+        for (; x < a->stride; x++) {
+            uint8_t tmp = top[x];
+            top[x] = bot[x];
+            bot[x] = tmp;
+        }
+#else
+        uint8_t tmp;
+        for (int x = 0; x < a->stride; x++) {
+            tmp = top[x];
+            top[x] = bot[x];
+            bot[x] = tmp;
+        }
+#endif
+    }
+    return NULL;
+}
+
+#define FLIP_THREAD_COUNT 4
+#define FLIP_MIN_HEIGHT   240
+
 /*
  * Read the rendered frame from the FBO into tape[fb_offset] and
  * trigger a flush through the FB pipeline.
@@ -1054,8 +1102,18 @@ void bfpp_gl_present(uint8_t *tape, int ptr)
         glBindFramebuffer(GL_READ_FRAMEBUFFER, g3d.fbo);
         glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, 0);
 
+        /* Fence the current PBO readback so we know when it's safe to map */
+        g3d.pbo_fence[g3d.pbo_index] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+
         /* Step 2: Map previous frame's PBO (skip on first frame) */
         if (!g3d.pbo_first_frame) {
+            /* Wait for the previous frame's readback to complete */
+            if (g3d.pbo_fence[g3d.pbo_index ^ 1]) {
+                glClientWaitSync(g3d.pbo_fence[g3d.pbo_index ^ 1],
+                                 GL_SYNC_FLUSH_COMMANDS_BIT, 5000000);
+                glDeleteSync(g3d.pbo_fence[g3d.pbo_index ^ 1]);
+                g3d.pbo_fence[g3d.pbo_index ^ 1] = NULL;
+            }
             glBindBuffer(GL_PIXEL_PACK_BUFFER, g3d.pbo[g3d.pbo_index ^ 1]);
             void *data = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, fb_size, GL_MAP_READ_BIT);
             if (data) {
@@ -1070,40 +1128,32 @@ void bfpp_gl_present(uint8_t *tape, int ptr)
         g3d.pbo_index ^= 1;
     }
 
-    /* Flip vertically — GL is bottom-up, FB pipeline expects top-down */
-#ifdef __AVX2__
-    /* AVX2 row swap — 32 bytes at a time */
-    for (int y = 0; y < h / 2; y++) {
-        uint8_t *top = fb + y * stride;
-        uint8_t *bot = fb + (h - 1 - y) * stride;
-        int x;
-        for (x = 0; x + 32 <= stride; x += 32) {
-            __m256i t = _mm256_loadu_si256((__m256i*)(top + x));
-            __m256i b = _mm256_loadu_si256((__m256i*)(bot + x));
-            _mm256_storeu_si256((__m256i*)(top + x), b);
-            _mm256_storeu_si256((__m256i*)(bot + x), t);
-        }
-        /* Handle remainder bytes */
-        for (; x < stride; x++) {
-            uint8_t tmp = top[x];
-            top[x] = bot[x];
-            bot[x] = tmp;
+    /* Flip vertically — GL is bottom-up, FB pipeline expects top-down.
+     * For h >= FLIP_MIN_HEIGHT, split across FLIP_THREAD_COUNT threads.
+     * Below that, threading overhead exceeds the work. */
+    {
+        int half = h / 2;
+        if (half >= FLIP_MIN_HEIGHT) {
+            /* Threaded flip */
+            flip_arg_t args[FLIP_THREAD_COUNT];
+            pthread_t  thr[FLIP_THREAD_COUNT];
+            int chunk = half / FLIP_THREAD_COUNT;
+            for (int i = 0; i < FLIP_THREAD_COUNT; i++) {
+                args[i].fb     = fb;
+                args[i].stride = stride;
+                args[i].h      = h;
+                args[i].y_start = i * chunk;
+                args[i].y_end   = (i == FLIP_THREAD_COUNT - 1) ? half : (i + 1) * chunk;
+                pthread_create(&thr[i], NULL, flip_worker, &args[i]);
+            }
+            for (int i = 0; i < FLIP_THREAD_COUNT; i++)
+                pthread_join(thr[i], NULL);
+        } else {
+            /* Single-threaded flip */
+            flip_arg_t a = { fb, stride, 0, half, h };
+            flip_worker(&a);
         }
     }
-#else
-    /* Scalar: memcpy swap with temp row */
-    uint8_t *row_buf = (uint8_t *)malloc((size_t)stride);
-    if (row_buf) {
-        for (int y = 0; y < h / 2; y++) {
-            uint8_t *top    = fb + y * stride;
-            uint8_t *bottom = fb + (h - 1 - y) * stride;
-            memcpy(row_buf, top,    (size_t)stride);
-            memcpy(top,     bottom, (size_t)stride);
-            memcpy(bottom,  row_buf,(size_t)stride);
-        }
-        free(row_buf);
-    }
-#endif
 
     bfpp_fb_request_flush();
 }

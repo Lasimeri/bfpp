@@ -434,6 +434,25 @@ fn compile(cli: &Cli) -> Result<(), ()> {
         }
     }
 
+    // OpenCL GPU compute runtime (loaded via dlopen — no link-time dependency)
+    if codegen_result.uses_opencl {
+        cc_cmd.arg("-ldl"); // for dlopen/dlsym
+        let runtime_paths = [
+            PathBuf::from("runtime"),
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("runtime")))
+                .unwrap_or_default(),
+        ];
+        for rt_dir in &runtime_paths {
+            if rt_dir.join("bfpp_rt_opencl.c").exists() {
+                cc_cmd.arg(format!("-I{}", rt_dir.display()));
+                cc_cmd.arg(rt_dir.join("bfpp_rt_opencl.c").to_str().unwrap());
+                break;
+            }
+        }
+    }
+
     // Threading runtime
     if codegen_result.uses_threading {
         if !codegen_result.uses_fb_pipeline {

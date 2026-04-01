@@ -263,6 +263,14 @@ static void render_delta(void)
     int last_r = -1, last_g = -1, last_b = -1;
 
     for (int y = 0; y < th; y++) {
+        /* Quick row skip: if entire row is unchanged, skip it.
+         * memcmp is SIMD-optimized by glibc — avoids per-cell overhead
+         * for static rows (common when camera moves slowly). */
+        term_cell_t *frow = &tctx.front[y * tw];
+        term_cell_t *brow = &tctx.back[y * tw];
+        if (memcmp(frow, brow, tw * sizeof(term_cell_t)) == 0)
+            continue;
+
         for (int x = 0; x < tw; x++) {
             int idx = y * tw + x;
             term_cell_t *f = &tctx.front[idx];

@@ -170,7 +170,15 @@ static struct {
     struct {
         int y_start, y_end;
     } sw_strips[8];
+
+    /* Per-triangle distribution mode (alternative to strip-parallel) */
+    atomic_int sw_next_triangle;     /* atomic work counter for per-tri mode */
+    int sw_pertri_mode;              /* 1 = per-tri, 0 = strip-parallel */
 } sw;
+
+/* ── Per-triangle distribution threshold ─────────────────────── */
+
+#define SW_PERTRI_THRESHOLD 100
 
 /* Forward declaration for strip worker thread */
 static void *sw_strip_worker(void *arg);
@@ -882,6 +890,129 @@ static void rasterize_triangle_strip(const float screen[9],
     }
 }
 
+/* ── Atomic z-buffer compare-and-swap for per-triangle mode ──── */
+
+/*
+ * zbuf_cas: atomically update z-buffer at index if new_depth is closer.
+ * Uses IEEE 754 float bit pattern comparison — valid for positive depths
+ * because IEEE 754 positive floats are ordered the same as uint32_t.
+ * Returns 1 if this thread won (wrote the depth), 0 otherwise.
+ */
+static int zbuf_cas(int idx, float new_depth)
+{
+    uint32_t *z = (uint32_t *)&sw.zbuf[idx];
+    uint32_t new_bits;
+    memcpy(&new_bits, &new_depth, sizeof(uint32_t));
+    uint32_t old_bits = atomic_load((_Atomic uint32_t *)z);
+    while (new_bits < old_bits) {  /* lower depth = closer = wins */
+        if (atomic_compare_exchange_weak((_Atomic uint32_t *)z, &old_bits, new_bits))
+            return 1;  /* we won */
+    }
+    return 0;  /* someone else is closer */
+}
+
+/* ── Triangle rasterization with atomic z-buffer (for per-tri mode) ── */
+
+/*
+ * rasterize_triangle_atomic: rasterizes a triangle to the FULL framebuffer
+ * (no strip clipping). Uses zbuf_cas for thread-safe depth writes when
+ * multiple threads may rasterize overlapping triangles concurrently.
+ */
+static void rasterize_triangle_atomic(const float screen[9],
+                                      const float normals[9],
+                                      const float world[9],
+                                      const float w_clip[3])
+{
+    float sx0 = screen[0], sy0 = screen[1], sz0 = screen[2];
+    float sx1 = screen[3], sy1 = screen[4], sz1 = screen[5];
+    float sx2 = screen[6], sy2 = screen[7], sz2 = screen[8];
+
+    /* Bounding box, clamped to viewport */
+    int min_x = maxi(0,             (int)floorf(fminf(sx0, fminf(sx1, sx2))));
+    int max_x = mini(sw.width - 1,  (int)ceilf(fmaxf(sx0, fmaxf(sx1, sx2))));
+    int min_y = maxi(0,             (int)floorf(fminf(sy0, fminf(sy1, sy2))));
+    int max_y = mini(sw.height - 1, (int)ceilf(fmaxf(sy0, fmaxf(sy1, sy2))));
+
+    if (min_x > max_x || min_y > max_y) return;
+
+    /* Total area (2x signed area of triangle) */
+    float area = edge_func(sx0, sy0, sx1, sy1, sx2, sy2);
+    if (fabsf(area) < 1e-6f) return;   /* degenerate triangle */
+    float inv_area = 1.0f / area;
+
+    /* Reciprocal W for perspective-correct interpolation */
+    float inv_w0 = 1.0f / w_clip[0];
+    float inv_w1 = 1.0f / w_clip[1];
+    float inv_w2 = 1.0f / w_clip[2];
+
+    uint8_t *fb = sw.tape + sw.fb_offset;
+    int stride = sw.width * 3;
+
+    /* Edge equation increments for stepping +1 in X */
+    float de0_dx = sy1 - sy2;
+    float de1_dx = sy2 - sy0;
+    float de2_dx = sy0 - sy1;
+
+    for (int y = min_y; y <= max_y; y++) {
+        float py = (float)y + 0.5f;
+        float px_start = (float)min_x + 0.5f;
+
+        float e0 = edge_func(sx1, sy1, sx2, sy2, px_start, py);
+        float e1 = edge_func(sx2, sy2, sx0, sy0, px_start, py);
+        float e2 = edge_func(sx0, sy0, sx1, sy1, px_start, py);
+
+        for (int x = min_x; x <= max_x; x++) {
+            int inside;
+            if (area > 0)
+                inside = (e0 >= 0 && e1 >= 0 && e2 >= 0);
+            else
+                inside = (e0 <= 0 && e1 <= 0 && e2 <= 0);
+
+            if (inside) {
+                float w0 = e0 * inv_area;
+                float w1 = e1 * inv_area;
+                float w2 = 1.0f - w0 - w1;
+
+                float persp = 1.0f / (w0*inv_w0 + w1*inv_w1 + w2*inv_w2);
+                float depth = w0*sz0 + w1*sz1 + w2*sz2;
+
+                int zidx = y * sw.width + x;
+                /* Atomic z-test: only proceed if we win the CAS */
+                if (!zbuf_cas(zidx, depth)) goto next_pixel;
+
+                {
+                    float pc0 = w0 * inv_w0 * persp;
+                    float pc1 = w1 * inv_w1 * persp;
+                    float pc2 = w2 * inv_w2 * persp;
+
+                    float norm[3] = {
+                        normals[0]*pc0 + normals[3]*pc1 + normals[6]*pc2,
+                        normals[1]*pc0 + normals[4]*pc1 + normals[7]*pc2,
+                        normals[2]*pc0 + normals[5]*pc1 + normals[8]*pc2
+                    };
+                    float wpos[3] = {
+                        world[0]*pc0 + world[3]*pc1 + world[6]*pc2,
+                        world[1]*pc0 + world[4]*pc1 + world[7]*pc2,
+                        world[2]*pc0 + world[5]*pc1 + world[8]*pc2
+                    };
+
+                    uint8_t r, g, b;
+                    shade_pixel(norm, wpos, &r, &g, &b);
+                    int fb_idx = y * stride + x * 3;
+                    fb[fb_idx + 0] = r;
+                    fb[fb_idx + 1] = g;
+                    fb[fb_idx + 2] = b;
+                }
+            }
+
+            next_pixel:
+            e0 += de0_dx;
+            e1 += de1_dx;
+            e2 += de2_dx;
+        }
+    }
+}
+
 /* ── Strip worker thread ─────────────────────────────────────── */
 
 static void *sw_strip_worker(void *arg)
@@ -897,16 +1028,29 @@ static void *sw_strip_worker(void *arg)
 
         if (!atomic_load(&sw.sw_running)) break;
 
-        int y0 = sw.sw_strips[strip_id].y_start;
-        int y1 = sw.sw_strips[strip_id].y_end;
+        if (sw.sw_pertri_mode) {
+            /* ── Per-triangle mode: grab triangles via atomic counter ── */
+            int tri_count = sw.sw_tri_count;
+            int t;
+            while ((t = atomic_fetch_add(&sw.sw_next_triangle, 1)) < tri_count) {
+                const float *scr = &sw.sw_screen[t * 9];
+                const float *nrm = &sw.sw_wnormals[t * 9];
+                const float *wps = &sw.sw_wpos[t * 9];
+                const float *wcl = &sw.sw_w_clip[t * 3];
+                rasterize_triangle_atomic(scr, nrm, wps, wcl);
+            }
+        } else {
+            /* ── Strip-parallel mode: each thread owns a row range ── */
+            int y0 = sw.sw_strips[strip_id].y_start;
+            int y1 = sw.sw_strips[strip_id].y_end;
 
-        /* Rasterize all triangles, clipped to this strip */
-        for (int t = 0; t < sw.sw_tri_count; t++) {
-            const float *scr = &sw.sw_screen[t * 9];
-            const float *nrm = &sw.sw_wnormals[t * 9];
-            const float *wps = &sw.sw_wpos[t * 9];
-            const float *wcl = &sw.sw_w_clip[t * 3];
-            rasterize_triangle_strip(scr, nrm, wps, wcl, y0, y1);
+            for (int t = 0; t < sw.sw_tri_count; t++) {
+                const float *scr = &sw.sw_screen[t * 9];
+                const float *nrm = &sw.sw_wnormals[t * 9];
+                const float *wps = &sw.sw_wpos[t * 9];
+                const float *wcl = &sw.sw_w_clip[t * 3];
+                rasterize_triangle_strip(scr, nrm, wps, wcl, y0, y1);
+            }
         }
 
         /* Signal completion */
@@ -1054,7 +1198,7 @@ void bfpp_sw_draw_triangles(uint8_t *tape, int ptr)
         return;
     }
 
-    /* ── Phase 2: Dispatch to strip workers ───────────────────── */
+    /* ── Phase 2: Dispatch to worker threads ──────────────────── */
 
     sw.sw_screen   = t_screen;
     sw.sw_wnormals = t_wnormals;
@@ -1062,7 +1206,20 @@ void bfpp_sw_draw_triangles(uint8_t *tape, int ptr)
     sw.sw_w_clip   = t_w_clip;
     sw.sw_tri_count = tri_out;
 
-    /* Signal all strip workers */
+    /* Select distribution mode:
+     * - Few triangles (<100): strip-parallel — each thread processes all
+     *   triangles but only writes its row range. Good for small batches
+     *   where per-triangle overhead dominates.
+     * - Many triangles (>=100): per-triangle — threads grab individual
+     *   triangles via atomic counter and rasterize to full framebuffer
+     *   with atomic z-buffer CAS. Better load balancing for large batches
+     *   with non-uniform triangle sizes. */
+    sw.sw_pertri_mode = (tri_out >= SW_PERTRI_THRESHOLD) ? 1 : 0;
+    if (sw.sw_pertri_mode) {
+        atomic_store(&sw.sw_next_triangle, 0);
+    }
+
+    /* Signal all workers */
     pthread_mutex_lock(&sw.sw_mutex);
     atomic_store(&sw.sw_strips_remaining, sw.sw_thread_count);
     pthread_cond_broadcast(&sw.sw_frame_cv);

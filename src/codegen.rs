@@ -53,6 +53,8 @@ pub struct CodegenResult {
     pub uses_3d: bool,
     /// True if multi-GPU/oracle intrinsics used — triggers bfpp_rt_3d_multigpu/oracle + EGL
     pub uses_multigpu: bool,
+    /// True if GPU compute intrinsics used — triggers bfpp_rt_opencl + dlopen(libOpenCL)
+    pub uses_opencl: bool,
 }
 
 /// Split sources for parallel C compilation.
@@ -78,8 +80,9 @@ pub fn generate(program: &Program, opts: &CodegenOptions) -> CodegenResult {
     let uses_threading = intrinsics.threading;
     let uses_3d = intrinsics.gl3d;
     let uses_multigpu = intrinsics.multigpu;
+    let uses_opencl = intrinsics.opencl;
     let (c_source, split) = generate_c(program, opts, uses_ffi, &intrinsics);
-    CodegenResult { c_source, split, uses_ffi, uses_tui_runtime, uses_fb_pipeline, uses_threading, uses_3d, uses_multigpu }
+    CodegenResult { c_source, split, uses_ffi, uses_tui_runtime, uses_fb_pipeline, uses_threading, uses_3d, uses_multigpu, uses_opencl }
 }
 
 // Recursively checks whether any node in the AST uses \ffi calls.
@@ -360,9 +363,11 @@ fn emit_header(opts: &CodegenOptions, uses_ffi: bool, intrinsics: &IntrinsicUsag
         h.push_str("#include \"bfpp_rt_3d.h\"\n");
     }
     if intrinsics.multigpu {
-        // Multi-GPU + Scene Oracle: EGL multi-context, SFR/AFR, lock-free triple buffer.
         h.push_str("#include \"bfpp_rt_3d_multigpu.h\"\n");
         h.push_str("#include \"bfpp_rt_3d_oracle.h\"\n");
+    }
+    if intrinsics.opencl {
+        h.push_str("#include \"bfpp_rt_opencl.h\"\n");
     }
     h.push('\n');
 
@@ -1789,6 +1794,56 @@ fn emit_intrinsic(out: &mut String, name: &str, ctx: &mut GenCtx) {
             out.push_str("bfpp_gl_input_key_held(tape, ptr);\n");
         }
 
+        // ── GPU compute (OpenCL) intrinsics ─────────────────
+        "__gpu_init" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gpu_init(tape, ptr);\n");
+        }
+        "__gpu_count" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gpu_count(tape, ptr);\n");
+        }
+        "__gpu_memset" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gpu_memset(tape, ptr);\n");
+        }
+        "__gpu_memcpy" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gpu_memcpy(tape, ptr);\n");
+        }
+        "__gpu_sort" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gpu_sort(tape, ptr);\n");
+        }
+        "__gpu_reduce" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gpu_reduce(tape, ptr);\n");
+        }
+        "__gpu_transform" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gpu_transform(tape, ptr);\n");
+        }
+        "__gpu_rasterize" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gpu_rasterize(tape, ptr);\n");
+        }
+        "__gpu_blur" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gpu_blur(tape, ptr);\n");
+        }
+        "__gpu_poll" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gpu_poll(tape, ptr);\n");
+        }
+        "__gpu_wait" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gpu_wait(tape, ptr);\n");
+        }
+        "__gpu_dispatch" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gpu_dispatch(tape, ptr);\n");
+        }
+
         // ── Threading intrinsics ────────────────────────────
         "__spawn" => {
             // Input: tape[ptr]=subroutine_index, tape[ptr+8]=start_ptr
@@ -1889,6 +1944,7 @@ struct IntrinsicUsage {
     gl3d: bool,      // __gl_*, __fp_*, __mat4_*, __mesh_* — requires bfpp_rt_3d + OpenGL/GLEW + math
     multigpu: bool,  // __gl_multi_gpu, __gl_gpu_count, __gl_frame_time, __scene_* — requires bfpp_rt_3d_multigpu + bfpp_rt_3d_oracle + EGL
     indirect_call: bool, // __call — needs bfpp_sub_table (same as threading)
+    opencl: bool,        // __gpu_* — requires bfpp_rt_opencl + dlopen(libOpenCL)
 }
 
 // Pre-scan the entire AST for intrinsic calls and return a summary of
@@ -1955,6 +2011,11 @@ fn scan_intrinsics(nodes: &[AstNode], usage: &mut IntrinsicUsage) {
                     "__hashmap_init" | "__hashmap_get" | "__hashmap_set" => {}
                     // Indirect call — needs sub_table
                     "__call" => { usage.indirect_call = true; }
+                    // GPU compute (OpenCL) — needs bfpp_rt_opencl + dlopen
+                    "__gpu_init" | "__gpu_count" | "__gpu_memset" | "__gpu_memcpy" |
+                    "__gpu_sort" | "__gpu_reduce" | "__gpu_transform" |
+                    "__gpu_rasterize" | "__gpu_blur" | "__gpu_poll" |
+                    "__gpu_wait" | "__gpu_dispatch" => { usage.opencl = true; }
                     _ => {}
                 }
             }
