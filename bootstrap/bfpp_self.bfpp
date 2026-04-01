@@ -2,7 +2,7 @@
 ; ║  BF++ Self-Hosting Compiler (Bootstrap)                     ║
 ; ║                                                              ║
 ; ║  Compiles core BF from stdin → C on stdout.                  ║
-; ║  Supports: > < + - . , [ ] $ ~ ^ E e ; (comments)           ║
+; ║  Supports: > < + - . , [ ] $ ~ ^ E e @ * T F | & x s r n ?  ║
 ; ║                                                              ║
 ; ║  GPU: uses __gpu_init to detect compute devices at startup.  ║
 ; ║  Multithread: compiled with parallel CC (>3 subroutines).    ║
@@ -35,6 +35,17 @@
     ?= #94  [ [-] #11 ^ ]
     ?= #69  [ [-] #12 ^ ]
     ?= #101 [ [-] #13 ^ ]
+    ?= #64  [ [-] #14 ^ ]
+    ?= #42  [ [-] #15 ^ ]
+    ?= #84  [ [-] #16 ^ ]
+    ?= #70  [ [-] #17 ^ ]
+    ?= #124 [ [-] #18 ^ ]
+    ?= #38  [ [-] #19 ^ ]
+    ?= #120 [ [-] #20 ^ ]
+    ?= #115 [ [-] #21 ^ ]
+    ?= #114 [ [-] #22 ^ ]
+    ?= #110 [ [-] #23 ^ ]
+    ?= #63  [ [-] #24 ^ ]
     [-] #0 ^
 }
 
@@ -54,6 +65,17 @@
     ?= #11 [ #POOL @ "return 0;\n\0" #0 @ !#pr [-] ^ ]
     ?= #12 [ #POOL @ "bfpp_set(ptr,(uint64_t)bfpp_err);\n\0" #0 @ !#pr [-] ^ ]
     ?= #13 [ #POOL @ "bfpp_err=(int)bfpp_get(ptr);\n\0" #0 @ !#pr [-] ^ ]
+    ?= #14 [ #POOL @ "ptr=bfpp_get(ptr)&TAPE_MASK;\n\0" #0 @ !#pr [-] ^ ]
+    ?= #15 [ #POOL @ "{int _s=ptr;ptr=bfpp_get(ptr)&TAPE_MASK;\n\0" #0 @ !#pr [-] ^ ]
+    ?= #16 [ #POOL @ "bfpp_push((uint64_t)(uintptr_t)&tape[ptr]);\n\0" #0 @ !#pr [-] ^ ]
+    ?= #17 [ #POOL @ "/* F: framebuffer flush (no-op in bootstrap) */\n\0" #0 @ !#pr [-] ^ ]
+    ?= #18 [ #POOL @ "bfpp_set(ptr,bfpp_get(ptr)|bfpp_get(ptr+1));\n\0" #0 @ !#pr [-] ^ ]
+    ?= #19 [ #POOL @ "bfpp_set(ptr,bfpp_get(ptr)&bfpp_get(ptr+1));\n\0" #0 @ !#pr [-] ^ ]
+    ?= #20 [ #POOL @ "bfpp_set(ptr,bfpp_get(ptr)^bfpp_get(ptr+1));\n\0" #0 @ !#pr [-] ^ ]
+    ?= #21 [ #POOL @ "bfpp_set(ptr,bfpp_get(ptr)<<bfpp_get(ptr+1));\n\0" #0 @ !#pr [-] ^ ]
+    ?= #22 [ #POOL @ "bfpp_set(ptr,bfpp_get(ptr)>>bfpp_get(ptr+1));\n\0" #0 @ !#pr [-] ^ ]
+    ?= #23 [ #POOL @ "bfpp_set(ptr,~bfpp_get(ptr));\n\0" #0 @ !#pr [-] ^ ]
+    ?= #24 [ #POOL @ "if(bfpp_err)return 0;\n\0" #0 @ !#pr [-] ^ ]
     [-] ^
 }
 
@@ -81,12 +103,18 @@ $ #GPU_COUNT @ ~ #0 @ %1
 #POOL @ "int main(void){\n\0" #0 @ !#pr
 
 ; ── Single-pass transpiler: stdin → C ──
-; Note: comments (;) not supported in bootstrap. Strip before piping.
 ,                                 ; read first char
 [
-    !#cl                          ; classify → code
-    !#em                          ; emit C for code
-    ,                             ; read next char
+    ; Skip comments: ; to end of line
+    ?= #59 [
+        [-] , [ ?= #10 [ [-] ] [ [-] , ] ]
+        ,
+    ]
+    ; Skip newlines (just ignore)
+    ?= #10 [ [-] ]
+    ; Process remaining chars
+    [ !#cl !#em ]
+    ,
 ]
 
 ; ── Emit main close ──

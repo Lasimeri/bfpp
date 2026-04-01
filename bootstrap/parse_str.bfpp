@@ -1,0 +1,75 @@
+; parse_str.bfpp — String literal parser for bootstrap compiler
+;
+; Called from main loop when '"' (34) is detected.
+; Reads chars from stdin until closing '"', emits C code that
+; writes the string bytes to tape and advances ptr.
+;
+; Emits:
+;   { static const uint8_t _s[] = {b0,b1,...,0};
+;     memcpy(&tape[ptr], _s, sizeof(_s)-1);
+;     ptr = (ptr + sizeof(_s)-1) & TAPE_MASK; }
+;
+; Escape handling: \n → 10, \0 → 0, \\ → 92, \" → 34
+; All other chars taken literally.
+
+!define POOL 3000000
+
+!#ps{
+    ; Emit opening
+    #POOL @ "{static const uint8_t _s[]={" #0 @ !#pr
+
+    ; Track byte count at cell 2
+    > > [-] < < ; P+2 = 0 (count)
+
+    ; Read chars until closing "
+    ,                      ; read first string char
+    [
+        ?= #34 [ [-] ]    ; '"' → end of string, clear char
+
+        ; Check for backslash escape
+        ?= #92 [           ; '\' (92)
+            [-]            ; clear backslash
+            ,              ; read escape char
+            ?= #110 [ [-] #10 ]  ; 'n' → newline (10)
+            ?= #48  [ [-] #0  ]  ; '0' → null (0)
+            ?= #92  [ ]          ; '\' → keep as 92
+            ?= #34  [ ]          ; '"' → keep as 34
+            ; P+0 = resolved byte value
+        ]
+
+        ; If P+0 still has a value, it's a string byte to emit
+        [
+            ; Emit the byte value as decimal, followed by comma
+            ; Save the byte
+            $
+            ; Print comma separator if not first byte
+            >> [                   ; if count > 0
+                #POOL @ ",\0" #0 @ !#pr
+            ] <<
+            ; Print byte value
+            ~                      ; restore byte
+            ; Use io.bfpp's print_int
+            !#.+
+            [-]
+            ; Increment count
+            >> + <<
+        ]
+
+        ; If char was closing quote (cleared to 0), the [..] above didn't execute.
+        ; Read next char only if we're still inside the string.
+        >> [                       ; if count was incremented (we printed a byte)
+            << ,                   ; read next char
+            >>
+        ] <<
+        ; If count wasn't incremented AND char is 0, we hit closing quote → exit
+    ]
+
+    ; Emit closing: ,0}; memcpy(...); ptr advance;
+    ; But we need the count to emit sizeof.
+    ; SIMPLER: emit with sizeof(_s)-1 which C handles automatically.
+    #POOL @ ",0};memcpy(&tape[ptr],_s,sizeof(_s)-1);ptr=(ptr+sizeof(_s)-1)&TAPE_MASK;}\n\0" #0 @ !#pr
+
+    ; Clean up
+    [-] > [-] > [-] < <
+    ^
+}
