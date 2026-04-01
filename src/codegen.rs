@@ -863,7 +863,7 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
             ctx.indent += 1;
             for (i, val) in values.iter().enumerate() {
                 indent(out, ctx.indent);
-                out.push_str(&format!("bfpp_set((ptr + {}) & TAPE_MASK, {}ULL);\n", i, val));
+                out.push_str(&format!("bfpp_set(ptr + {}, {}ULL);\n", i, val));
             }
             ctx.indent -= 1;
             indent(out, ctx.indent);
@@ -911,6 +911,33 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
             out.push_str(&format!("if (bfpp_get(ptr) > {}ULL) {{\n", val));
             ctx.indent += 1;
             emit_nodes(out, body, ctx);
+            ctx.indent -= 1;
+            indent(out, ctx.indent);
+            out.push_str("}\n");
+        }
+
+        // ?{true}:{false} — destructive truthiness test.
+        // Reads cell value, zeroes it, branches on the saved value.
+        AstNode::IfElse(true_body, false_body) => {
+            indent(out, ctx.indent);
+            out.push_str("{\n");
+            ctx.indent += 1;
+            indent(out, ctx.indent);
+            out.push_str("uint64_t _cond = bfpp_get(ptr);\n");
+            indent(out, ctx.indent);
+            out.push_str("bfpp_set(ptr, 0);\n");
+            indent(out, ctx.indent);
+            out.push_str("if (_cond) {\n");
+            ctx.indent += 1;
+            emit_nodes(out, true_body, ctx);
+            ctx.indent -= 1;
+            indent(out, ctx.indent);
+            out.push_str("} else {\n");
+            ctx.indent += 1;
+            emit_nodes(out, false_body, ctx);
+            ctx.indent -= 1;
+            indent(out, ctx.indent);
+            out.push_str("}\n");
             ctx.indent -= 1;
             indent(out, ctx.indent);
             out.push_str("}\n");
@@ -1120,7 +1147,7 @@ fn emit_intrinsic(out: &mut String, name: &str, ctx: &mut GenCtx) {
         // Output: tape[ptr]=cols, tape[ptr+1]=rows
         "__term_size" => {
             indent(out, ctx.indent);
-            out.push_str("{ struct winsize ws; if (ioctl(0, TIOCGWINSZ, &ws) == 0) { bfpp_set(ptr, ws.ws_col); bfpp_set((ptr+1) & TAPE_MASK, ws.ws_row); } else { bfpp_err = BFPP_ERR_IO; } }\n");
+            out.push_str("{ struct winsize ws; if (ioctl(0, TIOCGWINSZ, &ws) == 0) { bfpp_set(ptr, ws.ws_col); bfpp_set(ptr+1, ws.ws_row); } else { bfpp_err = BFPP_ERR_IO; } }\n");
         }
         // __term_alt_on: switch to the alternate screen buffer (xterm ?1049h).
         // Used by TUI apps so they don't clobber the user's scrollback.
@@ -1190,18 +1217,18 @@ fn emit_intrinsic(out: &mut String, name: &str, ctx: &mut GenCtx) {
             // Input: tape[ptr]=dst, tape[ptr+1]=src, tape[ptr+2]=count
             // Uses memmove (handles overlapping regions)
             indent(out, ctx.indent);
-            out.push_str("{ int dst = (int)bfpp_get(ptr) & TAPE_MASK; int src = (int)bfpp_get((ptr+1) & TAPE_MASK) & TAPE_MASK; int cnt = (int)bfpp_get((ptr+2) & TAPE_MASK); if (cnt > 0 && dst + cnt <= TAPE_SIZE && src + cnt <= TAPE_SIZE) memmove(&tape[dst], &tape[src], cnt); }\n");
+            out.push_str("{ int dst = (int)bfpp_get(ptr) & TAPE_MASK; int src = (int)bfpp_get(ptr+1) & TAPE_MASK; int cnt = (int)bfpp_get(ptr+2); if (cnt > 0 && dst + cnt <= TAPE_SIZE && src + cnt <= TAPE_SIZE) memmove(&tape[dst], &tape[src], cnt); }\n");
         }
         "__memset" => {
             // Input: tape[ptr]=addr, tape[ptr+1]=value, tape[ptr+2]=count
             indent(out, ctx.indent);
-            out.push_str("{ int addr = (int)bfpp_get(ptr) & TAPE_MASK; uint8_t val = (uint8_t)bfpp_get((ptr+1) & TAPE_MASK); int cnt = (int)bfpp_get((ptr+2) & TAPE_MASK); if (cnt > 0 && addr + cnt <= TAPE_SIZE) memset(&tape[addr], val, cnt); }\n");
+            out.push_str("{ int addr = (int)bfpp_get(ptr) & TAPE_MASK; uint8_t val = (uint8_t)bfpp_get(ptr+1); int cnt = (int)bfpp_get(ptr+2); if (cnt > 0 && addr + cnt <= TAPE_SIZE) memset(&tape[addr], val, cnt); }\n");
         }
         "__memchr" => {
             // Input: tape[ptr]=start_addr, tape[ptr+1]=byte, tape[ptr+2]=max_count
             // Output: tape[ptr]=found_addr (or 0 if not found)
             indent(out, ctx.indent);
-            out.push_str("{ int start = (int)bfpp_get(ptr) & TAPE_MASK; uint8_t needle = (uint8_t)bfpp_get((ptr+1) & TAPE_MASK); int maxn = (int)bfpp_get((ptr+2) & TAPE_MASK); if (maxn > TAPE_SIZE - start) maxn = TAPE_SIZE - start; uint8_t *found = memchr(&tape[start], needle, maxn); bfpp_set(ptr, found ? (uint64_t)(found - tape) : 0); }\n");
+            out.push_str("{ int start = (int)bfpp_get(ptr) & TAPE_MASK; uint8_t needle = (uint8_t)bfpp_get(ptr+1); int maxn = (int)bfpp_get(ptr+2); if (maxn > TAPE_SIZE - start) maxn = TAPE_SIZE - start; uint8_t *found = memchr(&tape[start], needle, maxn); bfpp_set(ptr, found ? (uint64_t)(found - tape) : 0); }\n");
         }
 
         // ── TUI Runtime ──────────────────────────────────────────
@@ -1227,7 +1254,7 @@ fn emit_intrinsic(out: &mut String, name: &str, ctx: &mut GenCtx) {
         // Output: tape[ptr]=cols, tape[ptr+1]=rows
         "__tui_size" => {
             indent(out, ctx.indent);
-            out.push_str("{ int c,r; bfpp_tui_get_size(&c,&r); bfpp_set(ptr,c); bfpp_set((ptr+1)&TAPE_MASK,r); }\n");
+            out.push_str("{ int c,r; bfpp_tui_get_size(&c,&r); bfpp_set(ptr,c); bfpp_set(ptr+1,r); }\n");
         }
         // __tui_begin: start a new frame. Marks the front buffer as "drawing"
         // so changes accumulate without flushing to the terminal.
@@ -1247,7 +1274,7 @@ fn emit_intrinsic(out: &mut String, name: &str, ctx: &mut GenCtx) {
         // and -1 means "default/no change".
         "__tui_put" => {
             indent(out, ctx.indent);
-            out.push_str("bfpp_tui_put((int)bfpp_get(ptr), (int)bfpp_get((ptr+1)&TAPE_MASK), (uint8_t)bfpp_get((ptr+2)&TAPE_MASK), (int)(int8_t)bfpp_get((ptr+3)&TAPE_MASK), (int)(int8_t)bfpp_get((ptr+4)&TAPE_MASK));\n");
+            out.push_str("bfpp_tui_put((int)bfpp_get(ptr), (int)bfpp_get(ptr+1), (uint8_t)bfpp_get(ptr+2), (int)(int8_t)bfpp_get(ptr+3), (int)(int8_t)bfpp_get(ptr+4));\n");
         }
         // __tui_puts: write a null-terminated string at a position with color.
         // Input: tape[ptr]=row, [ptr+1]=col, null-terminated string at ptr+2,
@@ -1255,21 +1282,21 @@ fn emit_intrinsic(out: &mut String, name: &str, ctx: &mut GenCtx) {
         // This layout lets the caller pack position+text+color contiguously.
         "__tui_puts" => {
             indent(out, ctx.indent);
-            out.push_str("{ int r=(int)bfpp_get(ptr), c=(int)bfpp_get((ptr+1)&TAPE_MASK); char *s=(char*)&tape[(ptr+2)&TAPE_MASK]; int sl=strlen(s); int fg=(int)(int8_t)tape[(ptr+2+sl+1)&TAPE_MASK]; int bg=(int)(int8_t)tape[(ptr+2+sl+2)&TAPE_MASK]; bfpp_tui_puts(r,c,s,fg,bg); }\n");
+            out.push_str("{ int r=(int)bfpp_get(ptr), c=(int)bfpp_get(ptr+1); char *s=(char*)&tape[(ptr+2)&TAPE_MASK]; int sl=strlen(s); int fg=(int)(int8_t)tape[(ptr+2+sl+1)&TAPE_MASK]; int bg=(int)(int8_t)tape[(ptr+2+sl+2)&TAPE_MASK]; bfpp_tui_puts(r,c,s,fg,bg); }\n");
         }
         // __tui_fill: fill a rectangular region with a character and color.
         // Input: tape[ptr]=row,[ptr+1]=col,[ptr+2]=width,[ptr+3]=height,
         //        [ptr+4]=char,[ptr+5]=fg,[ptr+6]=bg
         "__tui_fill" => {
             indent(out, ctx.indent);
-            out.push_str("bfpp_tui_fill((int)bfpp_get(ptr), (int)bfpp_get((ptr+1)&TAPE_MASK), (int)bfpp_get((ptr+2)&TAPE_MASK), (int)bfpp_get((ptr+3)&TAPE_MASK), (uint8_t)bfpp_get((ptr+4)&TAPE_MASK), (int)(int8_t)bfpp_get((ptr+5)&TAPE_MASK), (int)(int8_t)bfpp_get((ptr+6)&TAPE_MASK));\n");
+            out.push_str("bfpp_tui_fill((int)bfpp_get(ptr), (int)bfpp_get(ptr+1), (int)bfpp_get(ptr+2), (int)bfpp_get(ptr+3), (uint8_t)bfpp_get(ptr+4), (int)(int8_t)bfpp_get(ptr+5), (int)(int8_t)bfpp_get(ptr+6));\n");
         }
         // __tui_box: draw a box with border characters (single/double line).
         // Input: tape[ptr]=row,[ptr+1]=col,[ptr+2]=width,[ptr+3]=height,
         //        [ptr+4]=style (0=single, 1=double)
         "__tui_box" => {
             indent(out, ctx.indent);
-            out.push_str("bfpp_tui_box((int)bfpp_get(ptr), (int)bfpp_get((ptr+1)&TAPE_MASK), (int)bfpp_get((ptr+2)&TAPE_MASK), (int)bfpp_get((ptr+3)&TAPE_MASK), (int)bfpp_get((ptr+4)&TAPE_MASK));\n");
+            out.push_str("bfpp_tui_box((int)bfpp_get(ptr), (int)bfpp_get(ptr+1), (int)bfpp_get(ptr+2), (int)bfpp_get(ptr+3), (int)bfpp_get(ptr+4));\n");
         }
         // __tui_key: poll for a keypress with timeout.
         // Input: tape[ptr]=timeout in milliseconds (0 = non-blocking)
@@ -1295,7 +1322,7 @@ fn emit_intrinsic(out: &mut String, name: &str, ctx: &mut GenCtx) {
             indent(out, ctx.indent);
             out.push_str("#ifdef BFPP_FRAMEBUFFER\n");
             indent(out, ctx.indent);
-            out.push_str("bfpp_fb_write_pixel_nt(tape, BFPP_FB_OFFSET, (int)bfpp_get(ptr), (int)bfpp_get((ptr+1)&TAPE_MASK), BFPP_FB_WIDTH, (uint8_t)bfpp_get((ptr+2)&TAPE_MASK), (uint8_t)bfpp_get((ptr+3)&TAPE_MASK), (uint8_t)bfpp_get((ptr+4)&TAPE_MASK));\n");
+            out.push_str("bfpp_fb_write_pixel_nt(tape, BFPP_FB_OFFSET, (int)bfpp_get(ptr), (int)bfpp_get(ptr+1), BFPP_FB_WIDTH, (uint8_t)bfpp_get(ptr+2), (uint8_t)bfpp_get(ptr+3), (uint8_t)bfpp_get(ptr+4));\n");
             indent(out, ctx.indent);
             out.push_str("#endif\n");
         }
@@ -1436,6 +1463,28 @@ fn emit_intrinsic(out: &mut String, name: &str, ctx: &mut GenCtx) {
             indent(out, ctx.indent);
             out.push_str("bfpp_gl_shadow_quality(tape, ptr);\n");
         }
+        // Textures
+        "__gl_create_texture" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_create_texture(tape, ptr);\n");
+        }
+        "__gl_texture_data" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_texture_data(tape, ptr);\n");
+        }
+        "__gl_bind_texture" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_bind_texture(tape, ptr);\n");
+        }
+        "__gl_delete_texture" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_delete_texture(tape, ptr);\n");
+        }
+        // Image loading (BMP via SDL2)
+        "__img_load" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_img_load(tape, ptr);\n");
+        }
         // Fixed-point math (Tier 2)
         "__fp_mul" => {
             indent(out, ctx.indent);
@@ -1526,6 +1575,20 @@ fn emit_intrinsic(out: &mut String, name: &str, ctx: &mut GenCtx) {
             out.push_str("bfpp_scene_extrap_ms_intrinsic(tape, ptr);\n");
         }
 
+        // ── Input event intrinsics ────────────────────────────
+        "__input_poll" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_input_poll(tape, ptr);\n");
+        }
+        "__input_mouse_pos" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_input_mouse_pos(tape, ptr);\n");
+        }
+        "__input_key_held" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_gl_input_key_held(tape, ptr);\n");
+        }
+
         // ── Threading intrinsics ────────────────────────────
         "__spawn" => {
             // Input: tape[ptr]=subroutine_index, tape[ptr+8]=start_ptr
@@ -1533,7 +1596,7 @@ fn emit_intrinsic(out: &mut String, name: &str, ctx: &mut GenCtx) {
             indent(out, ctx.indent);
             out.push_str("{ bfpp_thread_arg_t *_a = malloc(sizeof(bfpp_thread_arg_t)); ");
             out.push_str("_a->func = bfpp_sub_table[(int)bfpp_get(ptr)]; ");
-            out.push_str("_a->start_ptr = (int)bfpp_get((ptr+8)&TAPE_MASK); ");
+            out.push_str("_a->start_ptr = (int)bfpp_get(ptr+8); ");
             out.push_str("_a->index = atomic_fetch_add(&bfpp_next_thread_index, 1); ");
             out.push_str("_a->tape_size = TAPE_SIZE; ");
             out.push_str("pthread_t _tid; pthread_create(&_tid, NULL, bfpp_thread_entry, _a); ");
@@ -1576,23 +1639,23 @@ fn emit_intrinsic(out: &mut String, name: &str, ctx: &mut GenCtx) {
         "__atomic_store" => {
             // Input: tape[ptr]=value, tape[ptr+1]=addr
             indent(out, ctx.indent);
-            out.push_str("bfpp_atomic_store(tape, (int)bfpp_get((ptr+1)&TAPE_MASK), bfpp_get(ptr), cell_width[(int)bfpp_get((ptr+1)&TAPE_MASK) & TAPE_MASK]);\n");
+            out.push_str("bfpp_atomic_store(tape, (int)bfpp_get(ptr+1), bfpp_get(ptr), cell_width[(int)bfpp_get(ptr+1) & TAPE_MASK]);\n");
         }
         "__atomic_add" => {
             // Input: tape[ptr]=value, tape[ptr+1]=addr. Output: tape[ptr]=old_value
             indent(out, ctx.indent);
-            out.push_str("bfpp_set(ptr, bfpp_atomic_add(tape, (int)bfpp_get((ptr+1)&TAPE_MASK), bfpp_get(ptr), cell_width[(int)bfpp_get((ptr+1)&TAPE_MASK) & TAPE_MASK]));\n");
+            out.push_str("bfpp_set(ptr, bfpp_atomic_add(tape, (int)bfpp_get(ptr+1), bfpp_get(ptr), cell_width[(int)bfpp_get(ptr+1) & TAPE_MASK]));\n");
         }
         "__atomic_cas" => {
             // Input: tape[ptr]=expected, tape[ptr+1]=desired, tape[ptr+2]=addr
             // Output: tape[ptr]=success (1/0)
             indent(out, ctx.indent);
-            out.push_str("bfpp_set(ptr, (uint64_t)bfpp_atomic_cas(tape, (int)bfpp_get((ptr+2)&TAPE_MASK), bfpp_get(ptr), bfpp_get((ptr+1)&TAPE_MASK), cell_width[(int)bfpp_get((ptr+2)&TAPE_MASK) & TAPE_MASK]));\n");
+            out.push_str("bfpp_set(ptr, (uint64_t)bfpp_atomic_cas(tape, (int)bfpp_get(ptr+2), bfpp_get(ptr), bfpp_get(ptr+1), cell_width[(int)bfpp_get(ptr+2) & TAPE_MASK]));\n");
         }
         "__barrier_init" => {
             // Input: tape[ptr]=barrier_id, tape[ptr+1]=count
             indent(out, ctx.indent);
-            out.push_str("bfpp_barrier_init((int)bfpp_get(ptr), (int)bfpp_get((ptr+1)&TAPE_MASK));\n");
+            out.push_str("bfpp_barrier_init((int)bfpp_get(ptr), (int)bfpp_get(ptr+1));\n");
         }
         "__barrier_wait" => {
             indent(out, ctx.indent);
@@ -1671,11 +1734,14 @@ fn scan_intrinsics(nodes: &[AstNode], usage: &mut IntrinsicUsage) {
                     "__gl_clear" | "__gl_draw_arrays" | "__gl_draw_elements" |
                     "__gl_viewport" | "__gl_depth_test" | "__gl_present" |
                     "__gl_shadow_enable" | "__gl_shadow_disable" | "__gl_shadow_quality" |
+                    "__gl_create_texture" | "__gl_texture_data" | "__gl_bind_texture" |
+                    "__gl_delete_texture" | "__img_load" |
                     "__fp_mul" | "__fp_div" | "__fp_sin" | "__fp_cos" | "__fp_sqrt" |
                     "__mat4_identity" | "__mat4_multiply" | "__mat4_rotate" |
                     "__mat4_translate" | "__mat4_perspective" |
                     "__mesh_cube" | "__mesh_sphere" | "__mesh_torus" |
-                    "__mesh_plane" | "__mesh_cylinder" => usage.gl3d = true,
+                    "__mesh_plane" | "__mesh_cylinder" |
+                    "__input_poll" | "__input_mouse_pos" | "__input_key_held" => usage.gl3d = true,
                     "__gl_multi_gpu" | "__gl_gpu_count" | "__gl_frame_time" |
                     "__scene_publish" | "__scene_mode" | "__scene_extrap_ms" => {
                         usage.gl3d = true;
@@ -1856,9 +1922,9 @@ mod tests {
         let tokens = lex("#{65, 66, 67}").unwrap();
         let program = parse(&tokens).unwrap();
         let result = generate(&program, &CodegenOptions::default());
-        assert!(result.c_source.contains("bfpp_set((ptr + 0)"));
+        assert!(result.c_source.contains("bfpp_set(ptr + 0"));
         assert!(result.c_source.contains("65ULL"));
-        assert!(result.c_source.contains("bfpp_set((ptr + 2)"));
+        assert!(result.c_source.contains("bfpp_set(ptr + 2"));
         assert!(result.c_source.contains("67ULL"));
     }
 

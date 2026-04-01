@@ -249,9 +249,6 @@
 ;   5. Sliding-window fill: copy rgb template to next 3 bytes each iteration,
 ;      slide counter forward by 3.
 ;
-; LIMITATION: First pixel at fb_offset[0..3] is used as scratch (counter +
-;   template). These 4 bytes are overwritten during the fill. At 320x200
-;   this affects ~1.3 pixels — invisible at typical resolutions.
 !#gc{
     ; Compute total_pixels = w * h → P+6
     ; Copy w (P+1) → P+6 using P+7
@@ -271,63 +268,52 @@
     ; m* at P+6: P+6 = w*h (ws P+7, P+8, P+9)
     >>>>>> !#m* <<<<<<          ; P+6=total, P+7=0
 
-    ; Push to stack: r(P+3), g(P+4), b(P+5), counter(P+6)
-    ; Pop order will be: counter, b, g, r
-    >>>$>$>$>$<<<<<<            ; push r, g, b, counter; ptr=P+0
-    ; Stack bottom→top: r, g, b, counter
+    ; Push to stack (bottom→top): b, g, r, counter, b, g, r
+    ; First pixel values (popped first) and sliding-window values (popped second).
+    ; Pop order: r, g, b, counter, r, g, b
+    >>>>>$<$<$                  ; push b(P+5), g(P+4), r(P+3); ptr=P+3
+    >>>$                        ; push counter(P+6); ptr=P+6
+    <$<$<$                      ; push b(P+5), g(P+4), r(P+3); ptr=P+3
+    <<<                         ; ptr=P+0
 
     ; @ jump to fb_offset
     @                           ; ptr = fb_offset
 
-    ; Pop: counter → [0], b → [1], g → [2], r → [3]
-    ~>~>~>~                     ; [0]=counter, [1]=b, [2]=g, [3]=r
+    ; Pop first pixel: r → [0], g → [1], b → [2]
+    ~>~>~                       ; [0]=r, [1]=g, [2]=b — first pixel correct
 
-    ; Rearrange to [0]=counter, [1]=r, [2]=g, [3]=b
-    ; Currently at cell [3]. Swap [1]↔[3]:
-    ; Move [3] → [4]
-    [->+<]                      ; [4]=r, [3]=0; ptr=[3]
-    ; Move [1] → [3]
-    <<[->>+<<]                  ; [3]=b, [1]=0; ptr=[1]
-    ; Move [4] → [1]
-    >>>[-<<<+>>>]               ; [1]=r, [4]=0; ptr=[4]
-    <<<<                        ; ptr=[0] (counter)
-    ; Layout: [0]=counter, [1]=r, [2]=g, [3]=b ✓
+    ; Pop sliding-window setup: counter → [3], r → [4], g → [5], b → [6]
+    >~>~>~>~                    ; [3]=counter, [4]=r, [5]=g, [6]=b
 
-    ; Sliding-window fill loop
-    ; Pattern: a 4-cell window [counter, R, G, B] slides forward by 3 each
-    ; iteration. Each step copies R,G,B to the 3 cells immediately after B,
-    ; then moves the counter 3 cells forward. The RGB template stays adjacent
-    ; to the counter, so the window advances through the framebuffer linearly.
-    ; This avoids needing to return to a fixed origin — the working set moves.
+    ; Decrement counter (first pixel already written)
+    <<<-                        ; ptr=[3], counter -= 1
+
+    ; Sliding-window fill loop starting at [3]
+    ; Window layout: [counter, R, G, B] at positions [3],[4],[5],[6]
+    ; Each iteration copies R,G,B to the 3 cells after B, then moves
+    ; the counter 3 cells forward. The window slides through the framebuffer.
     [                           ; while counter > 0
         -                       ; dec counter
 
         ; Copy r (ctr+1) → ctr+4 using ctr+7 as temp
-        ; From ctr: > to ctr+1. Distance ctr+1 to ctr+4 = 3. Distance ctr+1 to ctr+7 = 6.
         >[->>>+>>>+<<<<<<]      ; ctr+1→0, ctr+4+=r, ctr+7+=r
         >>>>>>[-<<<<<<+>>>>>>]  ; ctr+7→ctr+1 (restore)
         <<<<<<                  ; ptr=ctr+1
         <                       ; ptr=ctr
 
         ; Copy g (ctr+2) → ctr+5 using ctr+7 as temp
-        ; Distance ctr+2 to ctr+5 = 3. Distance ctr+2 to ctr+7 = 5.
         >>[->>>+>>+<<<<<]       ; ctr+2→0, ctr+5+=g, ctr+7+=g
         >>>>>[-<<<<<+>>>>>]     ; ctr+7→ctr+2 (restore)
         <<<<<                   ; ptr=ctr+2
         <<                      ; ptr=ctr
 
         ; Copy b (ctr+3) → ctr+6 using ctr+7 as temp
-        ; Distance ctr+3 to ctr+6 = 3. Distance ctr+3 to ctr+7 = 4.
         >>>[->>>+>+<<<<]        ; ctr+3→0, ctr+6+=b, ctr+7+=b
         >>>>[-<<<<+>>>>]        ; ctr+7→ctr+3 (restore)
         <<<<                    ; ptr=ctr+3
         <<<                     ; ptr=ctr
 
-        ; Clear ctr+3 (b_template) so counter can be moved there
-        ; (b is already copied to ctr+6, and will be restored from ctr+7... wait,
-        ;  we restored b to ctr+3 above. We need to DESTRUCTIVELY copy b instead.)
-        ; Actually: the restore step moved ctr+7 back to ctr+3, so ctr+3=b again.
-        ; We need ctr+3 clear for the counter. Clear it — the b value is at ctr+6.
+        ; Clear ctr+3 (b restored there, but we need room for counter)
         >>>[-]<<<               ; ctr+3=0
 
         ; Move counter from ctr+0 to ctr+3
@@ -335,7 +321,6 @@
 
         ; Advance by 3: new counter is at old ctr+3
         >>>                     ; ptr = new counter
-        ; New layout: [ctr]=counter, [ctr+1]=R(written), [ctr+2]=G, [ctr+3]=B ✓
     ]
     ^
 }
@@ -430,23 +415,24 @@
     ; m* at P+12: P+12 = rw*rh (ws P+13, P+14, P+15)
     >>>>>>>>>>>> !#m* <<<<<<<<<<<<  ; P+12=total, P+13=0
 
-    ; Push: r(P+6), g(P+7), b(P+8), counter(P+12)
-    >>>>>>$>$>$                 ; push r(P+6), g(P+7), b(P+8); ptr=P+8
-    >>>>$                       ; push counter(P+12); ptr=P+12
-    <<<<<<<<<<<<                ; ptr=P+0
-    ; Stack bottom→top: r, g, b, counter
+    ; Push to stack (bottom→top): b, g, r, counter, b, g, r
+    ; First pixel (popped first) + sliding-window (popped second).
+    >>>>>>>>$<$<$               ; push b(P+8), g(P+7), r(P+6); ptr=P+6
+    >>>>>>$                     ; push counter(P+12); ptr=P+12
+    <<<<$<$<$                   ; push b(P+8), g(P+7), r(P+6); ptr=P+6
+    <<<<<<                      ; ptr=P+0
 
     ; @ jump to start address (P+10)
     >>>>>>>>>>@                 ; ptr = start address in framebuffer
 
-    ; Pop: counter, b, g, r → [0], [1], [2], [3]
-    ~>~>~>~                     ; [0]=counter, [1]=b, [2]=g, [3]=r
+    ; Pop first pixel: r → [0], g → [1], b → [2]
+    ~>~>~                       ; [0]=r, [1]=g, [2]=b — first pixel correct
 
-    ; Swap [1]↔[3] for [0]=counter, [1]=r, [2]=g, [3]=b
-    [->+<]                      ; [4]=r, [3]=0; ptr=[3]
-    <<[->>+<<]                  ; [3]=b, [1]=0; ptr=[1]
-    >>>[-<<<+>>>]               ; [1]=r, [4]=0; ptr=[4]
-    <<<<                        ; ptr=[0]
+    ; Pop sliding-window setup: counter → [3], r → [4], g → [5], b → [6]
+    >~>~>~>~                    ; [3]=counter, [4]=r, [5]=g, [6]=b
+
+    ; Decrement counter (first pixel already written)
+    <<<-                        ; ptr=[3], counter -= 1
 
     ; Fill loop (same sliding-window pattern as !#gc — see its comments)
     [

@@ -94,6 +94,18 @@ static struct {
 /* Global quit flag — set by presenter thread on SDL_QUIT */
 atomic_int bfpp_fb_quit = 0;
 
+/* ── Input event ring buffer (SPSC: presenter writes, main thread reads) ── */
+
+#define BFPP_INPUT_QUEUE_SIZE 128
+
+static struct {
+    bfpp_input_event_t events[BFPP_INPUT_QUEUE_SIZE];
+    atomic_int head;    /* next write position (presenter thread) */
+    atomic_int tail;    /* next read position  (main thread)      */
+    int mouse_x, mouse_y;
+    uint8_t keys_held[512];  /* indexed by SDL_SCANCODE */
+} bfpp_input;
+
 /* ── Huge-page buffer allocation ─────────────────────────────── */
 
 /*
@@ -246,6 +258,19 @@ static void *render_thread_func(void *arg)
     return NULL;
 }
 
+/* ── Input event push (presenter thread only) ────────────────── */
+
+static void bfpp_input_push(bfpp_input_event_t evt)
+{
+    int head = atomic_load_explicit(&bfpp_input.head, memory_order_relaxed);
+    int next = (head + 1) % BFPP_INPUT_QUEUE_SIZE;
+    /* Drop event if queue is full (tail == next) */
+    if (next == atomic_load_explicit(&bfpp_input.tail, memory_order_acquire))
+        return;
+    bfpp_input.events[head] = evt;
+    atomic_store_explicit(&bfpp_input.head, next, memory_order_release);
+}
+
 /* ── Presenter thread ────────────────────────────────────────── */
 
 /*
@@ -324,13 +349,56 @@ static void *presenter_thread_func(void *arg)
 
     /* ── Render loop ────────────────────────────────────────── */
     while (atomic_load(&fb.running)) {
-        /* Poll SDL events */
+        /* Poll SDL events — capture input into ring buffer */
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) {
                 atomic_store(&bfpp_fb_quit, 1);
                 atomic_store(&fb.running, 0);
                 goto cleanup_sdl;
+            }
+            bfpp_input_event_t ievt = {0};
+            switch (e.type) {
+            case SDL_KEYDOWN:
+                ievt.type = BFPP_EVT_KEY_DOWN;
+                ievt.key  = (int32_t)e.key.keysym.scancode;
+                bfpp_input.keys_held[e.key.keysym.scancode & 511] = 1;
+                bfpp_input_push(ievt);
+                break;
+            case SDL_KEYUP:
+                ievt.type = BFPP_EVT_KEY_UP;
+                ievt.key  = (int32_t)e.key.keysym.scancode;
+                bfpp_input.keys_held[e.key.keysym.scancode & 511] = 0;
+                bfpp_input_push(ievt);
+                break;
+            case SDL_MOUSEMOTION:
+                ievt.type = BFPP_EVT_MOUSE_MOVE;
+                ievt.x    = (int32_t)e.motion.x;
+                ievt.y    = (int32_t)e.motion.y;
+                bfpp_input.mouse_x = e.motion.x;
+                bfpp_input.mouse_y = e.motion.y;
+                bfpp_input_push(ievt);
+                break;
+            case SDL_MOUSEBUTTONDOWN:
+                ievt.type = BFPP_EVT_MOUSE_DOWN;
+                ievt.key  = (int32_t)e.button.button;
+                ievt.x    = (int32_t)e.button.x;
+                ievt.y    = (int32_t)e.button.y;
+                bfpp_input.mouse_x = e.button.x;
+                bfpp_input.mouse_y = e.button.y;
+                bfpp_input_push(ievt);
+                break;
+            case SDL_MOUSEBUTTONUP:
+                ievt.type = BFPP_EVT_MOUSE_UP;
+                ievt.key  = (int32_t)e.button.button;
+                ievt.x    = (int32_t)e.button.x;
+                ievt.y    = (int32_t)e.button.y;
+                bfpp_input.mouse_x = e.button.x;
+                bfpp_input.mouse_y = e.button.y;
+                bfpp_input_push(ievt);
+                break;
+            default:
+                break;
             }
         }
 
@@ -402,6 +470,7 @@ cleanup_sdl:
 void bfpp_fb_pipeline_init(int w, int h, uint8_t *tape, int fb_offset)
 {
     memset(&fb, 0, sizeof(fb));
+    memset(&bfpp_input, 0, sizeof(bfpp_input));
 
     fb.width     = w;
     fb.height    = h;
@@ -554,6 +623,40 @@ void bfpp_fb_write_pixel_nt(uint8_t *tape, int fb_offset,
     dst[0] = r;
     dst[1] = g;
     dst[2] = b;
+}
+
+/* ── Input event API ─────────────────────────────────────────── */
+
+/*
+ * Poll next event from the SPSC ring buffer.
+ * Returns 1 and fills *out if an event is available, 0 if empty.
+ */
+int bfpp_input_poll(bfpp_input_event_t *out)
+{
+    int tail = atomic_load_explicit(&bfpp_input.tail, memory_order_relaxed);
+    if (tail == atomic_load_explicit(&bfpp_input.head, memory_order_acquire))
+        return 0;
+    *out = bfpp_input.events[tail];
+    atomic_store_explicit(&bfpp_input.tail, (tail + 1) % BFPP_INPUT_QUEUE_SIZE, memory_order_release);
+    return 1;
+}
+
+/*
+ * Query current mouse position (cached by presenter thread).
+ */
+void bfpp_input_mouse_pos(int *x, int *y)
+{
+    *x = bfpp_input.mouse_x;
+    *y = bfpp_input.mouse_y;
+}
+
+/*
+ * Query if a specific key is currently held down.
+ */
+int bfpp_input_key_held(int scancode)
+{
+    if (scancode < 0 || scancode >= 512) return 0;
+    return bfpp_input.keys_held[scancode];
 }
 
 /*

@@ -76,6 +76,15 @@ void bfpp_gl_shadow_enable(uint8_t *tape, int ptr);
 void bfpp_gl_shadow_disable(uint8_t *tape, int ptr);
 void bfpp_gl_shadow_quality(uint8_t *tape, int ptr);
 
+/* Textures */
+void bfpp_gl_create_texture(uint8_t *tape, int ptr);
+void bfpp_gl_texture_data(uint8_t *tape, int ptr);
+void bfpp_gl_bind_texture(uint8_t *tape, int ptr);
+void bfpp_gl_delete_texture(uint8_t *tape, int ptr);
+
+/* Image loading (BMP via SDL2, no extra deps) */
+void bfpp_gl_img_load(uint8_t *tape, int ptr);
+
 /* ── Tier 2: Fixed-point math ────────────────────────────────── */
 /* Defined in bfpp_rt_3d_math.c. All operate on Q16.16 values    */
 /* stored on the BF++ tape. Parameters read from tape[ptr+N*4].  */
@@ -126,5 +135,12 @@ void bfpp_gl_frame_time(uint8_t *tape, int ptr);
 void bfpp_scene_publish_intrinsic(uint8_t *tape, int ptr);
 void bfpp_scene_mode_intrinsic(uint8_t *tape, int ptr);
 void bfpp_scene_extrap_ms_intrinsic(uint8_t *tape, int ptr);
+
+/* ── Input events ───────────────────────────────────────────── */
+/* Defined in bfpp_rt_3d.c. Bridge FB pipeline input queue to tape. */
+
+void bfpp_gl_input_poll(uint8_t *tape, int ptr);
+void bfpp_gl_input_mouse_pos(uint8_t *tape, int ptr);
+void bfpp_gl_input_key_held(uint8_t *tape, int ptr);
 
 #endif /* BFPP_RT_3D_H */

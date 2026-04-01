@@ -100,6 +100,17 @@ fn collect_subs(nodes: &[AstNode], defs: &mut HashSet<String>, calls: &mut HashS
                 // Deref wraps a single node — unbox and check it
                 collect_subs(&[*inner.clone()], defs, calls);
             }
+            AstNode::IfElse(t, f) => {
+                collect_subs(t, defs, calls);
+                collect_subs(f, defs, calls);
+            }
+            AstNode::IfEqual(_, body, else_body) => {
+                collect_subs(body, defs, calls);
+                if let Some(eb) = else_body { collect_subs(eb, defs, calls); }
+            }
+            AstNode::IfNotEqual(_, body) | AstNode::IfLess(_, body) | AstNode::IfGreater(_, body) => {
+                collect_subs(body, defs, calls);
+            }
             AstNode::FfiCall(_, _) => {
                 // FFI calls don't define or call BF++ subroutines
             }
@@ -158,6 +169,17 @@ fn check_return_context(nodes: &[AstNode], in_sub: bool) {
                 check_return_context(r, in_sub);
                 check_return_context(k, in_sub);
             }
+            AstNode::IfElse(t, f) => {
+                check_return_context(t, in_sub);
+                check_return_context(f, in_sub);
+            }
+            AstNode::IfEqual(_, body, else_body) => {
+                check_return_context(body, in_sub);
+                if let Some(eb) = else_body { check_return_context(eb, in_sub); }
+            }
+            AstNode::IfNotEqual(_, body) | AstNode::IfLess(_, body) | AstNode::IfGreater(_, body) => {
+                check_return_context(body, in_sub);
+            }
             _ => {}
         }
     }
@@ -189,6 +211,17 @@ fn check_ffi_names(nodes: &[AstNode], errors: &mut Vec<AnalysisError>) {
             AstNode::ResultBlock(r, k) => {
                 check_ffi_names(r, errors);
                 check_ffi_names(k, errors);
+            }
+            AstNode::IfElse(t, f) => {
+                check_ffi_names(t, errors);
+                check_ffi_names(f, errors);
+            }
+            AstNode::IfEqual(_, body, else_body) => {
+                check_ffi_names(body, errors);
+                if let Some(eb) = else_body { check_ffi_names(eb, errors); }
+            }
+            AstNode::IfNotEqual(_, body) | AstNode::IfLess(_, body) | AstNode::IfGreater(_, body) => {
+                check_ffi_names(body, errors);
             }
             AstNode::Deref(inner) => {
                 check_ffi_names(&[*inner.clone()], errors);

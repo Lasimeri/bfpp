@@ -65,4 +65,29 @@ void bfpp_fb_write_pixel_nt(uint8_t *tape, int fb_offset,
 // Convenience wrapper around `atomic_load(&bfpp_fb_quit)`.
 int bfpp_fb_should_quit(void);
 
+/* ── Input events ────────────────────────────────────────────── */
+
+// Event types stored in the queue
+#define BFPP_EVT_NONE       0
+#define BFPP_EVT_KEY_DOWN   1
+#define BFPP_EVT_KEY_UP     2
+#define BFPP_EVT_MOUSE_MOVE 3
+#define BFPP_EVT_MOUSE_DOWN 4
+#define BFPP_EVT_MOUSE_UP   5
+
+typedef struct {
+    uint8_t type;       // BFPP_EVT_*
+    int32_t key;        // SDL scancode for key events, button for mouse
+    int32_t x, y;       // mouse position (for mouse events)
+} bfpp_input_event_t;
+
+// Poll next event from the queue. Returns 1 if event available, 0 if empty.
+int bfpp_input_poll(bfpp_input_event_t *out);
+
+// Query current mouse position (non-blocking, reads cached state).
+void bfpp_input_mouse_pos(int *x, int *y);
+
+// Query if a specific key is currently held down.
+int bfpp_input_key_held(int scancode);
+
 #endif /* BFPP_FB_PIPELINE_H */

@@ -33,10 +33,12 @@ pub fn optimize(nodes: Vec<AstNode>, level: OptLevel) -> Vec<AstNode> {
         OptLevel::None => nodes,
         OptLevel::Basic => {
             let nodes = pass_clear_loop(nodes);
+            let nodes = pass_fold_constants(nodes);
             pass_error_folding(nodes)
         }
         OptLevel::Full => {
             let nodes = pass_clear_loop(nodes);
+            let nodes = pass_fold_constants(nodes);
             let nodes = pass_scan_loop(nodes);
             let nodes = pass_multiply_move(nodes);
             pass_error_folding(nodes)
@@ -202,6 +204,114 @@ fn detect_multiply_pattern(body: &[AstNode]) -> Option<Vec<(isize, usize)>> {
     Some(pairs)
 }
 
+// Constant folding: peephole pass that simplifies adjacent arithmetic/set operations.
+//
+// Optimizations:
+//   - Dead store elimination: adjacent SetValue/Clear → keep only the last one
+//   - Arithmetic folding: SetValue(N) + Increment(M) → SetValue(N+M) (same for Decrement)
+//   - Clear + Increment(N) → SetValue(N)
+//   - No-op removal: Increment(0), Decrement(0), MoveRight(0), MoveLeft(0)
+//
+// Runs to a fixed point — one pass may expose new folding opportunities (e.g.,
+// SetValue(3) + SetValue(7) + Inc(2) → SetValue(7) + Inc(2) → SetValue(9)).
+fn pass_fold_constants(nodes: Vec<AstNode>) -> Vec<AstNode> {
+    
+    fold_constants_once(nodes)
+}
+
+fn fold_constants_once(nodes: Vec<AstNode>) -> Vec<AstNode> {
+    let mut result: Vec<AstNode> = Vec::with_capacity(nodes.len());
+
+    for node in nodes {
+        // Recurse into container nodes first
+        let node = match node {
+            AstNode::Loop(body) => AstNode::Loop(fold_constants_once(body)),
+            AstNode::SubDef(name, body) => AstNode::SubDef(name, fold_constants_once(body)),
+            AstNode::ResultBlock(r, k) => {
+                AstNode::ResultBlock(fold_constants_once(r), fold_constants_once(k))
+            }
+            AstNode::IfEqual(v, body, el) => AstNode::IfEqual(
+                v,
+                fold_constants_once(body),
+                el.map(fold_constants_once),
+            ),
+            AstNode::IfNotEqual(v, body) => {
+                AstNode::IfNotEqual(v, fold_constants_once(body))
+            }
+            AstNode::IfLess(v, body) => AstNode::IfLess(v, fold_constants_once(body)),
+            AstNode::IfGreater(v, body) => {
+                AstNode::IfGreater(v, fold_constants_once(body))
+            }
+            other => other,
+        };
+
+        // Remove no-ops
+        match &node {
+            AstNode::Increment(0)
+            | AstNode::Decrement(0)
+            | AstNode::MoveRight(0)
+            | AstNode::MoveLeft(0) => continue,
+            _ => {}
+        }
+
+        // Peephole: check last emitted node for folding opportunities
+        if let Some(prev) = result.last() {
+            match (prev, &node) {
+                // Adjacent SetValue: dead store — drop the earlier one
+                (AstNode::SetValue(_), AstNode::SetValue(_)) => {
+                    result.pop();
+                }
+                // Clear followed by SetValue: Clear is dead
+                (AstNode::Clear, AstNode::SetValue(_)) => {
+                    result.pop();
+                }
+                // SetValue followed by Increment: fold into SetValue
+                (AstNode::SetValue(base), AstNode::Increment(n)) => {
+                    let folded = AstNode::SetValue(base.wrapping_add(*n as u64));
+                    result.pop();
+                    result.push(folded);
+                    continue;
+                }
+                // SetValue followed by Decrement: fold into SetValue
+                (AstNode::SetValue(base), AstNode::Decrement(n)) => {
+                    let folded = AstNode::SetValue(base.wrapping_sub(*n as u64));
+                    result.pop();
+                    result.push(folded);
+                    continue;
+                }
+                // Clear followed by Increment: SetValue(N)
+                (AstNode::Clear, AstNode::Increment(n)) => {
+                    let folded = AstNode::SetValue(*n as u64);
+                    result.pop();
+                    result.push(folded);
+                    continue;
+                }
+                // Clear followed by Decrement: SetValue(wrapping)
+                (AstNode::Clear, AstNode::Decrement(n)) => {
+                    let folded = AstNode::SetValue(0u64.wrapping_sub(*n as u64));
+                    result.pop();
+                    result.push(folded);
+                    continue;
+                }
+                // Adjacent Clear: redundant
+                (AstNode::Clear, AstNode::Clear) => {
+                    // Already have Clear, skip the duplicate
+                    continue;
+                }
+                // SetValue followed by Clear: SetValue is dead
+                (AstNode::SetValue(_), AstNode::Clear) => {
+                    result.pop();
+                }
+                _ => {}
+            }
+        }
+
+        result.push(node);
+    }
+
+    result
+}
+
 // Error folding: collapses runs of consecutive `?` (Propagate) nodes into one.
 //
 // The `?` operator checks the error register and returns/propagates if set.
@@ -311,5 +421,90 @@ mod tests {
         let input = vec![AstNode::Increment(3), AstNode::Output];
         let output = optimize(input.clone(), OptLevel::None);
         assert_eq!(output, input);
+    }
+
+    // ── Constant folding tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_fold_adjacent_set_values() {
+        // SetValue(3) then SetValue(7) → SetValue(7) (dead store)
+        let input = vec![AstNode::SetValue(3), AstNode::SetValue(7)];
+        let output = optimize(input, OptLevel::Basic);
+        assert_eq!(output, vec![AstNode::SetValue(7)]);
+    }
+
+    #[test]
+    fn test_fold_set_value_increment() {
+        // SetValue(0) then Increment(5) → SetValue(5)
+        let input = vec![AstNode::SetValue(0), AstNode::Increment(5)];
+        let output = optimize(input, OptLevel::Basic);
+        assert_eq!(output, vec![AstNode::SetValue(5)]);
+    }
+
+    #[test]
+    fn test_fold_set_value_decrement() {
+        // SetValue(10) then Decrement(3) → SetValue(7)
+        let input = vec![AstNode::SetValue(10), AstNode::Decrement(3)];
+        let output = optimize(input, OptLevel::Basic);
+        assert_eq!(output, vec![AstNode::SetValue(7)]);
+    }
+
+    #[test]
+    fn test_fold_clear_then_increment() {
+        // Clear then Increment(42) → SetValue(42)
+        // (Clear is produced by pass_clear_loop from [-])
+        let input = vec![
+            AstNode::Loop(vec![AstNode::Decrement(1)]),
+            AstNode::Increment(42),
+        ];
+        let output = optimize(input, OptLevel::Basic);
+        assert_eq!(output, vec![AstNode::SetValue(42)]);
+    }
+
+    #[test]
+    fn test_fold_clear_then_set_value() {
+        // Clear then SetValue(99) → SetValue(99)
+        let input = vec![AstNode::Clear, AstNode::SetValue(99)];
+        let output = optimize(input, OptLevel::Basic);
+        assert_eq!(output, vec![AstNode::SetValue(99)]);
+    }
+
+    #[test]
+    fn test_fold_remove_noop_increment() {
+        // Increment(0) is a no-op — removed
+        let input = vec![AstNode::Increment(0), AstNode::Output];
+        let output = optimize(input, OptLevel::Basic);
+        assert_eq!(output, vec![AstNode::Output]);
+    }
+
+    #[test]
+    fn test_fold_remove_noop_move() {
+        // MoveRight(0) is a no-op — removed
+        let input = vec![AstNode::MoveRight(0), AstNode::Output];
+        let output = optimize(input, OptLevel::Basic);
+        assert_eq!(output, vec![AstNode::Output]);
+    }
+
+    #[test]
+    fn test_fold_set_value_then_clear() {
+        // SetValue(5) then Clear → Clear (SetValue is dead)
+        let input = vec![AstNode::SetValue(5), AstNode::Clear];
+        let output = optimize(input, OptLevel::Basic);
+        assert_eq!(output, vec![AstNode::Clear]);
+    }
+
+    #[test]
+    fn test_fold_nested_in_loop() {
+        // Folding applies inside loop bodies too
+        let input = vec![AstNode::Loop(vec![
+            AstNode::SetValue(10),
+            AstNode::Increment(5),
+            AstNode::Output,
+        ])];
+        let output = optimize(input, OptLevel::Basic);
+        assert_eq!(
+            output,
+            vec![AstNode::Loop(vec![AstNode::SetValue(15), AstNode::Output])]
+        );
     }
 }

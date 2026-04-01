@@ -13,7 +13,7 @@
  *   Tier 1 functions read params from tape[ptr + N*4].
  *
  * Resource limits:
- *   16 GL buffers, 16 VAOs, 16 shaders, 8 programs, 4 shadow FBOs.
+ *   16 GL buffers, 16 VAOs, 16 shaders, 8 programs, 16 textures, 4 shadow FBOs.
  */
 
 #include "bfpp_rt_3d.h"
@@ -77,6 +77,10 @@ static struct {
     int    shader_count;
     GLuint programs[8];
     int    program_count;
+
+    /* Texture tracking */
+    GLuint textures[16];
+    int    texture_count;
 
     /* Shadow mapping */
     int    shadow_enabled;
@@ -355,6 +359,12 @@ void bfpp_3d_cleanup(void)
         for (int i = 0; i < g3d.program_count; i++) {
             if (g3d.programs[i])
                 glDeleteProgram(g3d.programs[i]);
+        }
+
+        /* Delete tracked textures */
+        for (int i = 0; i < g3d.texture_count; i++) {
+            if (g3d.textures[i])
+                glDeleteTextures(1, &g3d.textures[i]);
         }
 
         /* Delete default program */
@@ -1081,6 +1091,48 @@ void bfpp_gl_frame_time(uint8_t *tape, int ptr)
     tape_set_u32(tape, ptr, (uint32_t)g3d.last_frame_us);
 }
 
+/* ── Section I2: Input event intrinsics ──────────────────────── */
+
+/*
+ * __input_poll: poll next input event from the FB pipeline queue.
+ * Output: tape[ptr]=type, tape[ptr+4]=key/button, tape[ptr+8]=x, tape[ptr+12]=y
+ * Returns 0 in type if no event available.
+ */
+void bfpp_gl_input_poll(uint8_t *tape, int ptr)
+{
+    bfpp_input_event_t evt;
+    if (bfpp_input_poll(&evt)) {
+        tape_set_u32(tape, ptr,      evt.type);
+        tape_set_q16(tape, ptr + 4,  evt.key);
+        tape_set_q16(tape, ptr + 8,  evt.x);
+        tape_set_q16(tape, ptr + 12, evt.y);
+    } else {
+        tape_set_u32(tape, ptr, 0);
+    }
+}
+
+/*
+ * __input_mouse_pos: get current mouse position.
+ * Output: tape[ptr]=x, tape[ptr+4]=y
+ */
+void bfpp_gl_input_mouse_pos(uint8_t *tape, int ptr)
+{
+    int x, y;
+    bfpp_input_mouse_pos(&x, &y);
+    tape_set_q16(tape, ptr,     x);
+    tape_set_q16(tape, ptr + 4, y);
+}
+
+/*
+ * __input_key_held: check if a key is held.
+ * Input: tape[ptr]=scancode. Output: tape[ptr]=1 if held, 0 if not.
+ */
+void bfpp_gl_input_key_held(uint8_t *tape, int ptr)
+{
+    int scancode = tape_q16(tape, ptr);
+    tape_set_u32(tape, ptr, bfpp_input_key_held(scancode) ? 1 : 0);
+}
+
 /* ── Section J: Shadow mapping ───────────────────────────────── */
 
 /*
@@ -1200,6 +1252,109 @@ void bfpp_gl_shadow_quality(uint8_t *tape, int ptr)
             }
         }
     }
+}
+
+/* ── Section J.5: Textures + image loading ──────────────────── */
+
+/* __gl_create_texture: create a texture, write ID to tape[ptr].
+ * Output: tape[ptr] = texture_id */
+void bfpp_gl_create_texture(uint8_t *tape, int ptr)
+{
+    if (!g3d.gpu_mode) { return; }
+    if (g3d.texture_count >= 16) { bfpp_err = BFPP_ERR_GENERIC; return; }
+    GLuint tex;
+    glGenTextures(1, &tex);
+    g3d.textures[g3d.texture_count++] = tex;
+    tape_set_u32(tape, ptr, (uint32_t)tex);
+}
+
+/* __gl_texture_data: upload pixel data from tape to texture.
+ * Input: tape[ptr]=tex_id, tape[ptr+4]=width, tape[ptr+8]=height,
+ *        tape[ptr+12]=format (0=RGB, 1=RGBA), tape[ptr+16]=data_addr (tape offset) */
+void bfpp_gl_texture_data(uint8_t *tape, int ptr)
+{
+    if (!g3d.gpu_mode) { return; }
+
+    uint32_t tex_id    = tape_u32(tape, ptr);
+    int w              = (int)tape_u32(tape, ptr + 4);
+    int h              = (int)tape_u32(tape, ptr + 8);
+    int fmt            = (int)tape_u32(tape, ptr + 12);
+    int data_addr      = (int)tape_u32(tape, ptr + 16);
+
+    glBindTexture(GL_TEXTURE_2D, tex_id);
+    GLenum gl_fmt = (fmt == 1) ? GL_RGBA : GL_RGB;
+    glTexImage2D(GL_TEXTURE_2D, 0, gl_fmt, w, h, 0, gl_fmt,
+                 GL_UNSIGNED_BYTE, &tape[data_addr]);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+}
+
+/* __gl_bind_texture: bind texture to a texture unit.
+ * Input: tape[ptr]=unit (0-15), tape[ptr+4]=tex_id */
+void bfpp_gl_bind_texture(uint8_t *tape, int ptr)
+{
+    if (!g3d.gpu_mode) { return; }
+
+    int unit       = (int)tape_u32(tape, ptr);
+    uint32_t tex_id = tape_u32(tape, ptr + 4);
+    glActiveTexture(GL_TEXTURE0 + unit);
+    glBindTexture(GL_TEXTURE_2D, tex_id);
+}
+
+/* __gl_delete_texture: delete a texture.
+ * Input: tape[ptr]=tex_id */
+void bfpp_gl_delete_texture(uint8_t *tape, int ptr)
+{
+    if (!g3d.gpu_mode) { return; }
+
+    uint32_t tex_id = tape_u32(tape, ptr);
+    glDeleteTextures(1, &tex_id);
+    /* Swap-remove from tracking array */
+    for (int i = 0; i < g3d.texture_count; i++) {
+        if (g3d.textures[i] == tex_id) {
+            g3d.textures[i] = g3d.textures[--g3d.texture_count];
+            break;
+        }
+    }
+}
+
+/* __img_load: load a BMP image file from tape path into tape pixel data.
+ * Input: tape[ptr]=tape_addr of null-terminated file path,
+ *        tape[ptr+4]=dest_addr (where to write pixel data)
+ * Output: tape[ptr+8]=width, tape[ptr+12]=height, tape[ptr+16]=channels (3=RGB)
+ * Uses SDL_LoadBMP (no extra dependencies). */
+void bfpp_gl_img_load(uint8_t *tape, int ptr)
+{
+    int path_addr = (int)tape_u32(tape, ptr);
+    int dest_addr = (int)tape_u32(tape, ptr + 4);
+    const char *path = (const char *)&tape[path_addr];
+
+    SDL_Surface *surf = SDL_LoadBMP(path);
+    if (!surf) {
+        bfpp_err = BFPP_ERR_GENERIC;
+        return;
+    }
+
+    /* Convert to RGB24 */
+    SDL_Surface *rgb = SDL_ConvertSurfaceFormat(surf, SDL_PIXELFORMAT_RGB24, 0);
+    SDL_FreeSurface(surf);
+    if (!rgb) {
+        bfpp_err = BFPP_ERR_GENERIC;
+        return;
+    }
+
+    int w    = rgb->w;
+    int h    = rgb->h;
+    int size = w * h * 3;
+
+    memcpy(&tape[dest_addr], rgb->pixels, size);
+    tape_set_u32(tape, ptr + 8,  (uint32_t)w);
+    tape_set_u32(tape, ptr + 12, (uint32_t)h);
+    tape_set_u32(tape, ptr + 16, 3); /* RGB */
+
+    SDL_FreeSurface(rgb);
 }
 
 /* ── Section K: Software dispatch layer ──────────────────────── */

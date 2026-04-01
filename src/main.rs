@@ -75,6 +75,10 @@ struct Cli {
     /// EOF value for input operations (0 = default, 255 = classic BF)
     #[arg(long, default_value = "0")]
     eof: u8,
+
+    /// Watch input file for changes and recompile automatically
+    #[arg(long)]
+    watch: bool,
 }
 
 fn main() {
@@ -88,52 +92,64 @@ fn main() {
         std::process::exit(1);
     }
 
-    // --- Stage 1: Read source file ---
-    let raw_source = match std::fs::read_to_string(&cli.input) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: cannot read '{}': {}", cli.input.display(), e);
-            std::process::exit(1);
-        }
-    };
-
-    // --- Stage 2: Preprocess (expand !include directives, resolve paths) ---
-    let source = match preprocess::preprocess(&raw_source, &cli.input, &cli.include_paths) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("{}", e);
-            std::process::exit(1);
-        }
-    };
-
-    // --- Stage 3: Lex (tokenize the preprocessed source) ---
-    let tokens = match lexer::lex(&source) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("{}:{}", cli.input.display(), e);
-            std::process::exit(1);
-        }
-    };
-
-    // --- Stage 4: Parse (tokens → AST with coalesced counts) ---
-    let program = match parser::parse(&tokens) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("{}:{}", cli.input.display(), e);
-            std::process::exit(1);
-        }
-    };
-
-    // --- Stage 5: Static analysis (undefined sub calls, nesting errors, etc.) ---
-    if let Err(errors) = analyzer::analyze(&program.nodes) {
-        for e in &errors {
-            eprintln!("{}: {}", cli.input.display(), e);
-        }
+    // Run the compilation pipeline once
+    if compile(&cli).is_err() && !cli.watch {
         std::process::exit(1);
     }
 
+    // --watch: poll the input file for changes and recompile on modification
+    if cli.watch {
+        let mut last_modified = std::fs::metadata(&cli.input)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let current = match std::fs::metadata(&cli.input).and_then(|m| m.modified()) {
+                Ok(t) => t,
+                Err(_) => continue, // file temporarily unavailable — retry
+            };
+            if current != last_modified {
+                last_modified = current;
+                eprintln!("Recompiling {}...", cli.input.display());
+                let _ = compile(&cli); // errors are printed but don't exit in watch mode
+            }
+        }
+    }
+}
+
+/// Run the full compilation pipeline: read → preprocess → lex → parse → analyze →
+/// optimize → codegen → C compile. Returns Err(()) on any stage failure (errors
+/// already printed to stderr). Separated from main() to enable --watch recompilation.
+fn compile(cli: &Cli) -> Result<(), ()> {
+    // --- Stage 1: Read source file ---
+    let raw_source = std::fs::read_to_string(&cli.input).map_err(|e| {
+        eprintln!("error: cannot read '{}': {}", cli.input.display(), e);
+    })?;
+
+    // --- Stage 2: Preprocess (expand !include directives, !define macros) ---
+    let source = preprocess::preprocess(&raw_source, &cli.input, &cli.include_paths).map_err(|e| {
+        eprintln!("{}", e);
+    })?;
+
+    // --- Stage 3: Lex (tokenize the preprocessed source) ---
+    let tokens = lexer::lex(&source).map_err(|e| {
+        eprintln!("{}:{}", cli.input.display(), e);
+    })?;
+
+    // --- Stage 4: Parse (tokens → AST with coalesced counts) ---
+    let program = parser::parse(&tokens).map_err(|e| {
+        eprintln!("{}:{}", cli.input.display(), e);
+    })?;
+
+    // --- Stage 5: Static analysis (undefined sub calls, nesting errors, etc.) ---
+    analyzer::analyze(&program.nodes).map_err(|errors| {
+        for e in &errors {
+            eprintln!("{}: {}", cli.input.display(), e);
+        }
+    })?;
+
     // --- Stage 6: Optimize (peephole passes on the AST) ---
-    // --no-optimize forces None regardless of -O flag.
     let opt_level = if cli.no_optimize {
         optimizer::OptLevel::None
     } else {
@@ -165,15 +181,13 @@ fn main() {
         (w, h)
     });
 
-    // Framebuffer bounds check: the framebuffer is mapped into the tape as W*H*3
-    // bytes (RGB pixels). The tape must have room for the framebuffer PLUS at least
-    // 256 bytes of working space for the program itself.
+    // Framebuffer bounds check
     if let Some((w, h)) = framebuffer {
         let fb_bytes = (w as usize) * (h as usize) * 3;
         if cli.tape_size < fb_bytes + 256 {
             eprintln!("error: tape size {} too small for {}x{} framebuffer (need at least {})",
                 cli.tape_size, w, h, fb_bytes + 256);
-            std::process::exit(1);
+            return Err(());
         }
     }
 
@@ -191,8 +205,6 @@ fn main() {
     let c_source = codegen_result.c_source;
 
     // Derive output paths from input stem or explicit -o flag.
-    // C path: used for --emit-c output or as the temp file base.
-    // Bin path: final binary name.
     let stem = cli.input.file_stem().unwrap().to_string_lossy().to_string();
     let c_path = cli.output.as_ref()
         .map(|o| o.with_extension("c"))
@@ -202,30 +214,19 @@ fn main() {
         .unwrap_or_else(|| PathBuf::from(&stem));
 
     if cli.emit_c {
-        // --emit-c: write the generated C source to disk and exit without compiling
-        if let Err(e) = std::fs::write(&c_path, &c_source) {
+        std::fs::write(&c_path, &c_source).map_err(|e| {
             eprintln!("error: cannot write '{}': {}", c_path.display(), e);
-            std::process::exit(1);
-        }
+        })?;
         println!("{}", c_path.display());
-        return;
+        return Ok(());
     }
 
     // --- Stage 8: C compilation ---
-    // Write to a PID-namespaced temp file in /tmp to avoid clobbering parallel builds
-    // and to keep the working directory clean. Cleaned up after compilation regardless
-    // of success or failure.
     let tmp_c = PathBuf::from(format!("/tmp/bfpp_{}.c", std::process::id()));
-    if let Err(e) = std::fs::write(&tmp_c, &c_source) {
+    std::fs::write(&tmp_c, &c_source).map_err(|e| {
         eprintln!("error: cannot write temp file: {}", e);
-        std::process::exit(1);
-    }
+    })?;
 
-    // Invoke the C compiler. Flags:
-    //   -O2    — optimize the generated C (complements BF++ AST-level optimizations)
-    //   -Wall  — catch codegen bugs early via compiler warnings
-    //   -Wno-unused-variable / -Wno-unused-function — the codegen emits helper
-    //     functions and variables unconditionally; not all programs use them
     let mut cc_cmd = Command::new(&cli.cc);
     cc_cmd.args([
         tmp_c.to_str().unwrap(),
@@ -236,11 +237,9 @@ fn main() {
         "-Wno-unused-function",
     ]);
 
-    // -lSDL2 + pipeline runtime: when framebuffer mode is active, link SDL2
-    // and compile the tiled render pipeline (8-thread strip-parallel processing).
+    // -lSDL2 + pipeline runtime
     if codegen_result.uses_fb_pipeline {
         cc_cmd.args(["-lSDL2", "-pthread", "-msse4.1"]);
-        // Search for pipeline runtime in ./runtime/ or <exe_dir>/runtime/
         let runtime_paths = [
             PathBuf::from("runtime"),
             std::env::current_exe()
@@ -257,17 +256,15 @@ fn main() {
         }
     }
 
-    // -ldl: needed for dlopen/dlsym when the program uses FFI calls (\ffi)
+    // -ldl for FFI
     if codegen_result.uses_ffi {
         cc_cmd.args(["-ldl"]);
     }
 
-    // 3D rendering runtime: when any __gl_*/__fp_*/__mat4_*/__mesh_* intrinsic is used,
-    // link OpenGL + GLEW + math and compile the 3D runtime files.
+    // 3D rendering runtime
     if codegen_result.uses_3d {
         cc_cmd.args(["-lGL", "-lGLEW", "-lm"]);
         if !codegen_result.uses_fb_pipeline {
-            // 3D requires SDL2 + pthread even without explicit --framebuffer
             cc_cmd.args(["-lSDL2", "-pthread", "-msse4.1"]);
         }
         let runtime_paths = [
@@ -297,8 +294,7 @@ fn main() {
         }
     }
 
-    // Multi-GPU + Scene Oracle runtime: when __gl_multi_gpu/__gl_gpu_count/__scene_*
-    // intrinsics are used, link EGL and compile the multi-GPU and oracle runtime files.
+    // Multi-GPU + Scene Oracle runtime
     if codegen_result.uses_multigpu {
         cc_cmd.arg("-lEGL");
         let runtime_paths = [
@@ -326,11 +322,9 @@ fn main() {
         }
     }
 
-    // Threading runtime: when any __spawn/__join/__mutex_*/__atomic_*/__barrier_*
-    // intrinsic is used, link pthread and compile the parallel runtime.
+    // Threading runtime
     if codegen_result.uses_threading {
         if !codegen_result.uses_fb_pipeline {
-            // -pthread already added if framebuffer pipeline is active
             cc_cmd.arg("-pthread");
         }
         let runtime_paths = [
@@ -349,12 +343,7 @@ fn main() {
         }
     }
 
-    // TUI runtime: when any __tui_* intrinsic is used, the generated C calls
-    // functions defined in bfpp_rt.c (double-buffered cell grid, box drawing,
-    // key polling). We need to:
-    //   1. Add -I<dir> so the compiler finds bfpp_rt.h
-    //   2. Compile bfpp_rt.c as an additional source file
-    // Search order: ./runtime/ (development), then <exe_dir>/runtime/ (installed).
+    // TUI runtime
     if codegen_result.uses_tui_runtime {
         let runtime_paths = [
             PathBuf::from("runtime"),
@@ -376,16 +365,17 @@ fn main() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: cannot run '{}': {}", cli.cc, e);
-            let _ = std::fs::remove_file(&tmp_c); // clean up temp file on CC launch failure
-            std::process::exit(1);
+            let _ = std::fs::remove_file(&tmp_c);
+            return Err(());
         }
     };
 
-    // Always remove the temp file — the binary (if produced) is the only artifact
     let _ = std::fs::remove_file(&tmp_c);
 
     if !status.success() {
         eprintln!("error: C compilation failed");
-        std::process::exit(1);
+        return Err(());
     }
+
+    Ok(())
 }

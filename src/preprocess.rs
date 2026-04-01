@@ -14,7 +14,7 @@
 // Re-including an already-visited file is silently skipped (not an error),
 // which allows diamond-shaped include graphs to work correctly.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 // Guard against runaway include chains (mutual recursion through many files)
@@ -41,12 +41,13 @@ pub fn preprocess(
     include_paths: &[PathBuf],
 ) -> Result<String, PreprocessError> {
     let mut visited = HashSet::new();
+    let mut defines = HashMap::new();
     // Canonicalize to resolve symlinks — ensures two paths to the same file are deduplicated.
     // Falls back to the raw path if canonicalize fails (e.g., the path doesn't exist on disk
     // because we're processing an in-memory source with a synthetic path, as in tests).
     let canonical = source_path.canonicalize().unwrap_or_else(|_| source_path.to_path_buf());
     visited.insert(canonical.clone());
-    expand(source, source_path, include_paths, &mut visited, 0)
+    expand(source, source_path, include_paths, &mut visited, &mut defines, 0)
 }
 
 // Recursive expansion workhorse. Processes one source text, line by line:
@@ -60,6 +61,7 @@ fn expand(
     source_path: &Path,
     include_paths: &[PathBuf],
     visited: &mut HashSet<PathBuf>,
+    defines: &mut HashMap<String, String>,
     depth: usize,
 ) -> Result<String, PreprocessError> {
     if depth > MAX_INCLUDE_DEPTH {
@@ -73,63 +75,92 @@ fn expand(
     let source_dir = source_path.parent().unwrap_or(Path::new("."));
     let mut result = String::new();
     // Tracks whether we're currently inside a multi-line string literal.
-    // When true, !include directives are treated as string content, not expanded.
+    // When true, preprocessor directives are treated as string content, not expanded.
     let mut in_string = false;
 
     for (line_num, line) in source.lines().enumerate() {
         let trimmed = line.trim();
 
-        // Only process !include if we're not inside a string literal
-        if !in_string && trimmed.starts_with("!include ") {
-            let rest = trimmed.strip_prefix("!include ").unwrap().trim();
-            if rest.starts_with('"') && rest.ends_with('"') && rest.len() >= 2 {
-                let filename = &rest[1..rest.len() - 1];
-                let resolved = resolve_include(filename, source_dir, include_paths)
-                    .ok_or_else(|| PreprocessError {
-                        message: format!("Cannot find include file '{}'", filename),
+        // Skip all directives inside string literals
+        if !in_string {
+            // !define NAME VALUE — text substitution macro (like C #define without params)
+            if trimmed.starts_with("!define ") {
+                let rest = trimmed.strip_prefix("!define ").unwrap().trim();
+                let mut parts = rest.splitn(2, char::is_whitespace);
+                let name = parts.next().unwrap_or("").to_string();
+                let value = parts.next().unwrap_or("").trim().to_string();
+                if name.is_empty() {
+                    return Err(PreprocessError {
+                        message: "!define requires a name: !define NAME VALUE".into(),
                         file: source_path.to_path_buf(),
                         line: line_num + 1,
-                    })?;
-
-                let canonical = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
-                if !visited.insert(canonical.clone()) {
-                    // Already included — silently skip to support diamond-shaped include graphs.
-                    // e.g., A includes B and C, both of which include D — D is only expanded once.
-                    result.push('\n');
-                    continue;
+                    });
                 }
-
-                let included_source = std::fs::read_to_string(&resolved)
-                    .map_err(|e| PreprocessError {
-                        message: format!("Cannot read '{}': {}", resolved.display(), e),
-                        file: source_path.to_path_buf(),
-                        line: line_num + 1,
-                    })?;
-
-                let expanded = expand(&included_source, &resolved, include_paths, visited, depth + 1)?;
-                result.push_str(&expanded);
+                defines.insert(name, value);
                 result.push('\n');
                 continue;
-            } else {
-                return Err(PreprocessError {
-                    message: "!include requires a quoted filename: !include \"file.bfpp\"".into(),
-                    file: source_path.to_path_buf(),
-                    line: line_num + 1,
-                });
+            }
+
+            // !undef NAME — remove a previously defined macro
+            if trimmed.starts_with("!undef ") {
+                let name = trimmed.strip_prefix("!undef ").unwrap().trim().to_string();
+                if name.is_empty() {
+                    return Err(PreprocessError {
+                        message: "!undef requires a name: !undef NAME".into(),
+                        file: source_path.to_path_buf(),
+                        line: line_num + 1,
+                    });
+                }
+                defines.remove(&name);
+                result.push('\n');
+                continue;
+            }
+
+            // !include "filename" — expand included file
+            if trimmed.starts_with("!include ") {
+                let rest = trimmed.strip_prefix("!include ").unwrap().trim();
+                if rest.starts_with('"') && rest.ends_with('"') && rest.len() >= 2 {
+                    let filename = &rest[1..rest.len() - 1];
+                    let resolved = resolve_include(filename, source_dir, include_paths)
+                        .ok_or_else(|| PreprocessError {
+                            message: format!("Cannot find include file '{}'", filename),
+                            file: source_path.to_path_buf(),
+                            line: line_num + 1,
+                        })?;
+
+                    let canonical = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
+                    if !visited.insert(canonical.clone()) {
+                        result.push('\n');
+                        continue;
+                    }
+
+                    let included_source = std::fs::read_to_string(&resolved)
+                        .map_err(|e| PreprocessError {
+                            message: format!("Cannot read '{}': {}", resolved.display(), e),
+                            file: source_path.to_path_buf(),
+                            line: line_num + 1,
+                        })?;
+
+                    // Included files see parent defines and can add their own
+                    let expanded = expand(&included_source, &resolved, include_paths, visited, defines, depth + 1)?;
+                    result.push_str(&expanded);
+                    result.push('\n');
+                    continue;
+                } else {
+                    return Err(PreprocessError {
+                        message: "!include requires a quoted filename: !include \"file.bfpp\"".into(),
+                        file: source_path.to_path_buf(),
+                        line: line_num + 1,
+                    });
+                }
             }
         }
 
-        // Track string-literal state across lines so that !include directives
+        // Track string-literal state across lines so that preprocessor directives
         // inside multi-line strings are not expanded. We scan every line for
         // unescaped quote characters and toggle in_string accordingly.
         for (i, ch) in line.chars().enumerate() {
             if ch == '"' {
-                // Determine if this quote is escaped by counting consecutive
-                // backslashes immediately preceding it. The key insight:
-                //   \"    → 1 backslash (odd)  → quote IS escaped (backslash escapes the quote)
-                //   \\"   → 2 backslashes (even) → quote is NOT escaped (first \ escapes second \)
-                //   \\\"  → 3 backslashes (odd)  → quote IS escaped (\\ + \")
-                // So: odd count = escaped quote, even count = real quote.
                 let mut backslash_count = 0;
                 let bytes = line.as_bytes();
                 let mut j = i;
@@ -143,11 +174,40 @@ fn expand(
             }
         }
 
-        result.push_str(line);
+        // Apply macro expansion to non-directive, non-string lines.
+        // Single pass: replace all defined names with their values.
+        let output_line = if !in_string && !defines.is_empty() {
+            expand_defines(line, defines)
+        } else {
+            line.to_string()
+        };
+
+        result.push_str(&output_line);
         result.push('\n');
     }
 
     Ok(result)
+}
+
+/// Expand all defined macros in a single line. Single-pass text replacement.
+/// Replaces occurrences of each defined name with its value, longest-name-first
+/// to prevent partial matches (e.g., "FOOBAR" shouldn't match "FOO" first).
+fn expand_defines(line: &str, defines: &HashMap<String, String>) -> String {
+    if defines.is_empty() {
+        return line.to_string();
+    }
+
+    // Sort names longest-first so longer names match before their prefixes
+    let mut names: Vec<&String> = defines.keys().collect();
+    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+
+    let mut result = line.to_string();
+    for name in names {
+        if let Some(value) = defines.get(name) {
+            result = result.replace(name.as_str(), value.as_str());
+        }
+    }
+    result
 }
 
 // Resolve an include filename to an actual filesystem path.

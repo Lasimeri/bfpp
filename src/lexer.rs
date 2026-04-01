@@ -89,6 +89,9 @@ pub enum Token {
 
     // Named variable declaration
     LetDecl(String, u64), // let name N — compile-time alias for tape position
+
+    // If/else on cell truthiness — destructive (zeroes cell after test)
+    IfElseStart, // ?{ — begins a ?{true_body}:{false_body} block
 }
 
 // File descriptor specifier for fd-directed I/O (.{N} and ,{N} syntax).
@@ -299,12 +302,15 @@ pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
             // Error handling
             '?' => {
                 chars.next(); col += 1;
-                // Check for conditional operators: ?= ?! ?< ?>
+                // Check for conditional operators: ?= ?! ?< ?> ?{
                 match chars.peek() {
                     Some('=') => { chars.next(); col += 1; tokens.push(Token::IfEqual); }
                     Some('!') => { chars.next(); col += 1; tokens.push(Token::IfNotEqual); }
                     Some('<') => { chars.next(); col += 1; tokens.push(Token::IfLess); }
                     Some('>') => { chars.next(); col += 1; tokens.push(Token::IfGreater); }
+                    // ?{ — if/else on cell truthiness (destructive: zeroes cell after test).
+                    // Consumes the { so the parser sees IfElseStart and parses body until }.
+                    Some('{') => { chars.next(); col += 1; tokens.push(Token::IfElseStart); }
                     _ => { tokens.push(Token::Propagate); }
                 }
             }

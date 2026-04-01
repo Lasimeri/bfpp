@@ -102,6 +102,9 @@ pub enum AstNode {
     IfNotEqual(u64, Vec<AstNode>),                       // ?! #N { body }
     IfLess(u64, Vec<AstNode>),                           // ?< #N { body }
     IfGreater(u64, Vec<AstNode>),                        // ?> #N { body }
+    IfElse(Vec<AstNode>, Vec<AstNode>),                  // ?{true_body}:{false_body}
+                            // Destructive truthiness test: if cell != 0 run true_body,
+                            // else run false_body. Cell is zeroed after reading.
 
     // ── Optimizer synthetic nodes ───────────────────────────────────
     // These never appear in parser output. The optimizer rewrites certain

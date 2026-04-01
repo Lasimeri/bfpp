@@ -288,6 +288,59 @@
 }
 
 ; ============================================================================
+; TEXTURES
+; ============================================================================
+
+; !#g3tc — create_texture()
+; Output: P+0 ← texture_id
+!#g3tc{
+    !#__gl_create_texture
+    ^
+}
+
+; !#g3td — texture_data(tex_id, w, h, fmt, data_addr)
+; Input: P+0=tex_id, P+4=width, P+8=height, P+12=fmt(0=RGB,1=RGBA), P+16=data_addr
+!#g3td{
+    !#__gl_texture_data
+    ^
+}
+
+; !#g3tb — bind_texture(unit, tex_id)
+; Input: P+0=unit(0-15), P+4=tex_id
+!#g3tb{
+    !#__gl_bind_texture
+    ^
+}
+
+; !#g3tx — delete_texture(tex_id)
+; Input: P+0=tex_id
+!#g3tx{
+    !#__gl_delete_texture
+    ^
+}
+
+; !#g3il — img_load(path_addr, dest_addr)
+; Input: P+0=path_addr, P+4=dest_addr
+; Output: P+8=width, P+12=height, P+16=channels(3=RGB)
+; Loads a BMP file via SDL2 (no extra deps).
+!#g3il{
+    !#__img_load
+    ^
+}
+
+; ── Texture shorthand aliases ──────────────────────────────────
+; Create texture. Output: P+0 ← texture_id
+\gtc{ !#__gl_create_texture }
+; Upload pixel data. Input: P+0=tex_id, P+4=w, P+8=h, P+12=fmt(0=RGB,1=RGBA), P+16=data_addr
+\gtd{ !#__gl_texture_data }
+; Bind texture to unit. Input: P+0=unit, P+4=tex_id
+\gtb{ !#__gl_bind_texture }
+; Delete texture. Input: P+0=tex_id
+\gtx{ !#__gl_delete_texture }
+; Load BMP image. Input: P+0=path_addr, P+4=dest_addr. Output: P+8=w, P+12=h, P+16=channels
+\iml{ !#__img_load }
+
+; ============================================================================
 ; FIXED-POINT MATH (Q16.16)
 ; ============================================================================
 
@@ -485,3 +538,13 @@
 
 ; Set max extrapolation lookahead. Input: P+0 = ms (Q16.16)
 \sext{ !#__scene_extrap_ms }
+
+; ── Input ──────────────────────────────────────────────────────
+; Poll next event. Output: P+0=type, P+4=key, P+8=x, P+12=y
+\ipol{ !#__input_poll }
+
+; Get mouse position. Output: P+0=x, P+4=y
+\imou{ !#__input_mouse_pos }
+
+; Check if key held. Input: P+0=scancode. Output: P+0=1/0
+\ikey{ !#__input_key_held }

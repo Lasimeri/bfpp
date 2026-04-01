@@ -286,6 +286,31 @@ fn parse_single(tokens: &[Token], pos: &mut usize) -> Result<AstNode, ParseError
             Ok(AstNode::IfGreater(val, body))
         }
 
+        // ?{true_body}:{false_body} — destructive truthiness if/else.
+        // The lexer already consumed ?{, so we parse the true body until }.
+        // Then expect : followed by { for the false body.
+        Token::IfElseStart => {
+            let true_body = parse_block(tokens, pos, BlockEnd::BraceClose)?;
+            // Require : separator
+            if *pos >= tokens.len() || tokens[*pos] != Token::Colon {
+                return Err(ParseError {
+                    message: "Expected ':' after ?{...} true body for else clause".into(),
+                    token_index: *pos,
+                });
+            }
+            *pos += 1; // consume :
+            // Require { to start false body (lexer emits ReadTape for standalone {)
+            if *pos >= tokens.len() || tokens[*pos] != Token::ReadTape {
+                return Err(ParseError {
+                    message: "Expected '{' after ':' for ?{...}:{...} else body".into(),
+                    token_index: *pos,
+                });
+            }
+            *pos += 1; // consume {
+            let false_body = parse_block(tokens, pos, BlockEnd::BraceClose)?;
+            Ok(AstNode::IfElse(true_body, false_body))
+        }
+
         // Colon outside conditional — error
         Token::Colon => Err(ParseError {
             message: "':' (else) outside of a conditional block".into(),
