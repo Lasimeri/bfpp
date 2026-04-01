@@ -29,6 +29,10 @@
 #include <math.h>
 #include <time.h>
 
+#ifdef __x86_64__
+#include <immintrin.h>
+#endif
+
 /* ── Error codes ─────────────────────────────────────────────── */
 
 /* When threading is active, bfpp_err is _Thread_local. Otherwise it's a plain int.
@@ -1067,6 +1071,27 @@ void bfpp_gl_present(uint8_t *tape, int ptr)
     }
 
     /* Flip vertically — GL is bottom-up, FB pipeline expects top-down */
+#ifdef __AVX2__
+    /* AVX2 row swap — 32 bytes at a time */
+    for (int y = 0; y < h / 2; y++) {
+        uint8_t *top = fb + y * stride;
+        uint8_t *bot = fb + (h - 1 - y) * stride;
+        int x;
+        for (x = 0; x + 32 <= stride; x += 32) {
+            __m256i t = _mm256_loadu_si256((__m256i*)(top + x));
+            __m256i b = _mm256_loadu_si256((__m256i*)(bot + x));
+            _mm256_storeu_si256((__m256i*)(top + x), b);
+            _mm256_storeu_si256((__m256i*)(bot + x), t);
+        }
+        /* Handle remainder bytes */
+        for (; x < stride; x++) {
+            uint8_t tmp = top[x];
+            top[x] = bot[x];
+            bot[x] = tmp;
+        }
+    }
+#else
+    /* Scalar: memcpy swap with temp row */
     uint8_t *row_buf = (uint8_t *)malloc((size_t)stride);
     if (row_buf) {
         for (int y = 0; y < h / 2; y++) {
@@ -1078,6 +1103,7 @@ void bfpp_gl_present(uint8_t *tape, int ptr)
         }
         free(row_buf);
     }
+#endif
 
     bfpp_fb_request_flush();
 }

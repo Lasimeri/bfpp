@@ -36,6 +36,11 @@ impl Default for CodegenOptions {
 /// libraries to link and which runtime files to compile alongside.
 pub struct CodegenResult {
     pub c_source: String,
+    /// Split sources for parallel compilation. Only populated when >3 subroutines.
+    /// header: shared declarations + helper functions (include in every TU)
+    /// sub_sources: vec of (mangled_name, full .c source including header)
+    /// main_source: main() as a separate .c (including header)
+    pub split: Option<SplitSources>,
     /// True if the program contains any \ffi calls — triggers -ldl linking
     pub uses_ffi: bool,
     /// True if any __tui_* intrinsics are used — triggers bfpp_rt.c compilation
@@ -50,6 +55,17 @@ pub struct CodegenResult {
     pub uses_multigpu: bool,
 }
 
+/// Split sources for parallel C compilation.
+pub struct SplitSources {
+    /// Shared header: #includes, #defines, extern declarations, helper functions.
+    /// Every TU #includes this.
+    pub header: String,
+    /// Per-subroutine .c files (mangled_name, source).
+    pub subs: Vec<(String, String)>,
+    /// main() .c file.
+    pub main_source: String,
+}
+
 pub fn generate(program: &Program, opts: &CodegenOptions) -> CodegenResult {
     // Pre-scan for FFI usage so we know whether to #include <dlfcn.h>
     let uses_ffi = program_uses_ffi(&program.nodes);
@@ -62,8 +78,8 @@ pub fn generate(program: &Program, opts: &CodegenOptions) -> CodegenResult {
     let uses_threading = intrinsics.threading;
     let uses_3d = intrinsics.gl3d;
     let uses_multigpu = intrinsics.multigpu;
-    let c_source = generate_c(program, opts, uses_ffi, &intrinsics);
-    CodegenResult { c_source, uses_ffi, uses_tui_runtime, uses_fb_pipeline, uses_threading, uses_3d, uses_multigpu }
+    let (c_source, split) = generate_c(program, opts, uses_ffi, &intrinsics);
+    CodegenResult { c_source, split, uses_ffi, uses_tui_runtime, uses_fb_pipeline, uses_threading, uses_3d, uses_multigpu }
 }
 
 // Recursively checks whether any node in the AST uses \ffi calls.
@@ -89,8 +105,9 @@ fn program_uses_ffi(nodes: &[AstNode]) -> bool {
 }
 
 // Main C generation pipeline: header → forward decls → subroutine bodies → main().
-fn generate_c(program: &Program, opts: &CodegenOptions, uses_ffi: bool, intrinsics: &IntrinsicUsage) -> String {
-    let mut out = String::new();
+// Returns (single_file_source, optional_split_sources).
+// Split sources are generated when there are >3 subroutines, enabling parallel CC.
+fn generate_c(program: &Program, opts: &CodegenOptions, uses_ffi: bool, intrinsics: &IntrinsicUsage) -> (String, Option<SplitSources>) {
     let mut ctx = GenCtx {
         indent: 1,
         subroutines: Vec::new(),
@@ -99,84 +116,162 @@ fn generate_c(program: &Program, opts: &CodegenOptions, uses_ffi: bool, intrinsi
         in_result_block: false,
     };
 
-    // First pass: collect subroutine names for forward declarations.
-    // Only scans top-level nodes — BF++ subroutine defs are always top-level.
     collect_subroutines(&program.nodes, &mut ctx.subroutines);
+    let do_split = ctx.subroutines.len() > 3;
 
-    // Emit the C runtime header: includes, #defines, static globals,
-    // helper functions (bfpp_get/set/push/pop/cycle_width, errno mapping,
-    // syscall wrapper, constructor, and optional SDL framebuffer).
-    out.push_str(&emit_header(opts, uses_ffi, intrinsics));
+    // ── Header section (shared by all TUs) ──
+    let header = emit_header(opts, uses_ffi, intrinsics);
 
-    // Forward-declare all subroutines so they can call each other
-    // regardless of definition order (mutual recursion).
+    // ── Forward declarations ──
+    let mut fwd_decls = String::new();
     for name in &ctx.subroutines {
-        out.push_str(&format!("void bfpp_sub_{}(void);\n", mangle_name(name)));
+        fwd_decls.push_str(&format!("void bfpp_sub_{}(void);\n", mangle_name(name)));
     }
     if !ctx.subroutines.is_empty() {
-        out.push('\n');
+        fwd_decls.push('\n');
     }
 
-    // Subroutine table: static array of function pointers indexed by position.
-    // Used by __spawn to look up subroutine entry points at runtime.
+    // ── Subroutine table ──
+    let mut sub_table = String::new();
     if (intrinsics.threading || intrinsics.indirect_call) && !ctx.subroutines.is_empty() {
-        out.push_str("static void (*bfpp_sub_table[])(void) = {\n");
+        // In split mode, sub_table must have external linkage (not static)
+        // so subroutines in other TUs can reference it via __spawn/__call.
+        let linkage = if do_split { "" } else { "static " };
+        sub_table.push_str(&format!("{}void (*bfpp_sub_table[])(void) = {{\n", linkage));
         for name in &ctx.subroutines {
-            out.push_str(&format!("    bfpp_sub_{},\n", mangle_name(name)));
+            sub_table.push_str(&format!("    bfpp_sub_{},\n", mangle_name(name)));
         }
-        out.push_str("};\n\n");
+        sub_table.push_str("};\n\n");
     }
 
-    // Emit subroutine bodies. Each gets a call-depth guard (prologue/epilogue)
-    // to enforce the CALL_DEPTH limit and prevent unbounded recursion from
-    // blowing the C stack. The prologue increments+checks; the epilogue decrements.
-    // Return (^) inside a subroutine also decrements before returning.
+    // ── Subroutine bodies (each as a separate string for split mode) ──
+    let mut sub_bodies: Vec<(String, String)> = Vec::new();
     for node in &program.nodes {
         if let AstNode::SubDef(name, body) = node {
-            out.push_str(&format!("void bfpp_sub_{}(void) {{\n", mangle_name(name)));
+            let mangled = mangle_name(name);
+            let mut sub_out = String::new();
+            sub_out.push_str(&format!("void bfpp_sub_{}(void) {{\n", mangled));
             ctx.indent = 1;
             ctx.in_subroutine = true;
-            // Prologue: increment call depth and abort on overflow
-            indent(&mut out, ctx.indent);
-            out.push_str("if (++bfpp_call_depth > CALL_DEPTH) { fprintf(stderr, \"bfpp: call stack overflow\\n\"); exit(1); }\n");
-            emit_nodes(&mut out, body, &mut ctx);
-            // Epilogue: decrement call depth on normal fall-through
-            indent(&mut out, ctx.indent);
-            out.push_str("bfpp_call_depth--;\n");
-            out.push_str("}\n\n");
+            indent(&mut sub_out, ctx.indent);
+            sub_out.push_str("if (++bfpp_call_depth > CALL_DEPTH) { fprintf(stderr, \"bfpp: call stack overflow\\n\"); exit(1); }\n");
+            emit_nodes(&mut sub_out, body, &mut ctx);
+            indent(&mut sub_out, ctx.indent);
+            sub_out.push_str("bfpp_call_depth--;\n");
+            sub_out.push_str("}\n\n");
+            sub_bodies.push((mangled, sub_out));
         }
     }
     ctx.in_subroutine = false;
 
-    // Emit main
-    out.push_str("int main(void) {\n");
+    // ── Main function ──
+    let mut main_out = String::new();
+    main_out.push_str("int main(void) {\n");
     ctx.indent = 1;
 
     if opts.framebuffer.is_some() {
-        indent(&mut out, ctx.indent);
-        out.push_str("#ifdef BFPP_FRAMEBUFFER\n");
-        indent(&mut out, ctx.indent);
-        out.push_str("bfpp_fb_pipeline_init(BFPP_FB_WIDTH, BFPP_FB_HEIGHT, tape, BFPP_FB_OFFSET);\n");
-        indent(&mut out, ctx.indent);
-        out.push_str("#endif\n");
+        indent(&mut main_out, ctx.indent);
+        main_out.push_str("#ifdef BFPP_FRAMEBUFFER\n");
+        indent(&mut main_out, ctx.indent);
+        main_out.push_str("bfpp_fb_pipeline_init(BFPP_FB_WIDTH, BFPP_FB_HEIGHT, tape, BFPP_FB_OFFSET);\n");
+        indent(&mut main_out, ctx.indent);
+        main_out.push_str("#endif\n");
     }
 
-    emit_nodes_skip_subdefs(&mut out, &program.nodes, &mut ctx);
+    emit_nodes_skip_subdefs(&mut main_out, &program.nodes, &mut ctx);
 
     if opts.framebuffer.is_some() {
-        indent(&mut out, ctx.indent);
-        out.push_str("#ifdef BFPP_FRAMEBUFFER\n");
-        indent(&mut out, ctx.indent);
-        out.push_str("bfpp_fb_pipeline_cleanup();\n");
-        indent(&mut out, ctx.indent);
-        out.push_str("#endif\n");
+        indent(&mut main_out, ctx.indent);
+        main_out.push_str("#ifdef BFPP_FRAMEBUFFER\n");
+        indent(&mut main_out, ctx.indent);
+        main_out.push_str("bfpp_fb_pipeline_cleanup();\n");
+        indent(&mut main_out, ctx.indent);
+        main_out.push_str("#endif\n");
     }
 
-    indent(&mut out, ctx.indent);
-    out.push_str("return 0;\n");
-    out.push_str("}\n");
+    indent(&mut main_out, ctx.indent);
+    main_out.push_str("return 0;\n");
+    main_out.push_str("}\n");
 
-    out
+    // ── Assemble single-file output (always produced) ──
+    let mut single = String::new();
+    single.push_str(&header);
+    single.push_str(&fwd_decls);
+    single.push_str(&sub_table);
+    for (_, body) in &sub_bodies {
+        single.push_str(body);
+    }
+    single.push_str(&main_out);
+
+    // ── Split output (for parallel CC) ──
+    let split = if do_split {
+        // The shared header for split mode: header + forward decls + sub table.
+        // Variables that are `static` in single-file mode need to be handled:
+        // - The header already emits extern linkage when threading/gl3d is active.
+        // - For split mode, we need ALL variables to have extern linkage.
+        // - The definitions go in a separate "defs" TU, declarations in the header.
+        //
+        // APPROACH: The header as emitted already works for multi-TU when
+        // threading or gl3d is active (variables are non-static). For pure BF
+        // programs without these, variables are static — split mode won't work.
+        // This is fine: pure BF programs are small and don't benefit from splitting.
+        //
+        // For split mode, each sub .c file = header_include + sub body.
+        // Main .c file = header_include + sub_table + main body.
+        // The header file itself contains everything: includes, defines, variable
+        // declarations (extern when multi-TU), helper functions (static inline).
+        //
+        // Variable definitions (the actual storage) go in main.c only.
+
+        // In split mode, bfpp_sub_table is defined in main.c but referenced
+        // by subroutines that use __spawn or __call. Declare it extern in header.
+        let sub_table_extern = if !sub_table.is_empty() {
+            "extern void (*bfpp_sub_table[])(void);\n"
+        } else {
+            ""
+        };
+
+        // Header does NOT set BFPP_DECL_ONLY — the caller does (or doesn't).
+        // Sub TUs: #define BFPP_DECL_ONLY before #include → get extern declarations.
+        // Main TU: no #define → gets actual definitions.
+        let split_header = format!(
+            "/* BF++ generated header — shared across translation units */\n\
+             #ifndef BFPP_GENERATED_H\n\
+             #define BFPP_GENERATED_H\n\
+             {header}\
+             {fwd_decls}\
+             {sub_table_extern}\
+             #endif /* BFPP_GENERATED_H */\n"
+        );
+
+        let split_subs: Vec<(String, String)> = sub_bodies.iter().map(|(name, body)| {
+            let src = format!(
+                "/* BF++ generated — subroutine {name} */\n\
+                 #define BFPP_DECL_ONLY 1\n\
+                 #include \"bfpp_gen.h\"\n\n\
+                 {body}"
+            );
+            (name.clone(), src)
+        }).collect();
+
+        // main.c: NO BFPP_DECL_ONLY → gets variable definitions + constructor
+        let split_main = format!(
+            "/* BF++ generated — main + variable definitions */\n\
+             #include \"bfpp_gen.h\"\n\n\
+             {sub_table}\
+             {main_out}"
+        );
+
+        Some(SplitSources {
+            header: split_header,
+            subs: split_subs,
+            main_source: split_main,
+        })
+    } else {
+        None
+    };
+
+    (single, split)
 }
 
 // Codegen context — threaded through all emit_* functions.
@@ -333,10 +428,32 @@ fn emit_header(opts: &CodegenOptions, uses_ffi: bool, intrinsics: &IntrinsicUsag
     //     so bfpp_rt_parallel.c's thread entry wrapper can reset them via extern.
     //   - `static` is dropped — the runtime needs to see these symbols.
     // When threading is NOT active: everything is `static` (internal linkage, single TU).
-    h.push_str("static uint8_t tape[TAPE_SIZE];\n");
-
+    // Variable declarations/definitions.
+    // In split mode (BFPP_DECL_ONLY defined), emit extern declarations.
+    // In single-file or definitions TU, emit actual definitions.
+    // Threading mode always uses external linkage (_Thread_local without static).
+    h.push_str("#ifdef BFPP_DECL_ONLY\n");
+    // Declarations only — for sub TUs in parallel compile
+    h.push_str("extern uint8_t tape[];\n");
     if intrinsics.threading {
-        // External linkage _Thread_local: runtime's bfpp_thread_entry() references these
+        h.push_str("extern _Thread_local int ptr;\n");
+        h.push_str("extern _Thread_local int bfpp_err;\n");
+        h.push_str("extern _Thread_local uint64_t stack[];\n");
+        h.push_str("extern _Thread_local int sp;\n");
+        h.push_str("extern _Thread_local int bfpp_call_depth;\n");
+        h.push_str("extern _Thread_local uint8_t cell_width[];\n");
+    } else {
+        h.push_str("extern int ptr;\n");
+        h.push_str("extern int bfpp_err;\n");
+        h.push_str("extern uint64_t stack[];\n");
+        h.push_str("extern int sp;\n");
+        h.push_str("extern int bfpp_call_depth;\n");
+        h.push_str("extern uint8_t cell_width[];\n");
+    }
+    h.push_str("#else\n");
+    // Definitions — for single-file mode or the main TU in parallel compile
+    h.push_str("uint8_t tape[TAPE_SIZE];\n");
+    if intrinsics.threading {
         h.push_str("_Thread_local int ptr = 0;\n");
         h.push_str("_Thread_local int bfpp_err = 0;\n");
         h.push_str("_Thread_local uint64_t stack[STACK_SIZE];\n");
@@ -344,39 +461,35 @@ fn emit_header(opts: &CodegenOptions, uses_ffi: bool, intrinsics: &IntrinsicUsag
         h.push_str("_Thread_local int bfpp_call_depth = 0;\n");
         h.push_str("_Thread_local uint8_t cell_width[TAPE_SIZE];\n");
     } else if intrinsics.gl3d {
-        // 3D runtime references bfpp_err via extern — give it external linkage.
-        // Other variables stay static (no threading, only bfpp_err crosses TU boundary).
-        h.push_str("static int ptr = 0;\n");
+        h.push_str("int ptr = 0;\n");
         h.push_str("int bfpp_err = 0;\n");
-        h.push_str("static uint64_t stack[STACK_SIZE];\n");
-        h.push_str("static int sp = 0;\n");
-        h.push_str("static int bfpp_call_depth = 0;\n");
-        h.push_str("static uint8_t cell_width[TAPE_SIZE]; /* 0=continuation, 1,2,4,8 */\n");
+        h.push_str("uint64_t stack[STACK_SIZE];\n");
+        h.push_str("int sp = 0;\n");
+        h.push_str("int bfpp_call_depth = 0;\n");
+        h.push_str("uint8_t cell_width[TAPE_SIZE];\n");
     } else {
         h.push_str("static int ptr = 0;\n");
         h.push_str("static int bfpp_err = 0;\n");
         h.push_str("static uint64_t stack[STACK_SIZE];\n");
         h.push_str("static int sp = 0;\n");
         h.push_str("static int bfpp_call_depth = 0;\n");
-        h.push_str("static uint8_t cell_width[TAPE_SIZE]; /* 0=continuation, 1,2,4,8 */\n");
+        h.push_str("static uint8_t cell_width[TAPE_SIZE];\n");
     }
+    h.push_str("#endif /* BFPP_DECL_ONLY */\n");
 
-    // Dual-tape state: separate read/write tapes for data transformation.
-    // Always static — thread entry doesn't reset these (each subroutine manages its own).
+    // Dual-tape, terminal state, constructor — only in definitions TU
+    h.push_str("#ifndef BFPP_DECL_ONLY\n");
     h.push_str("static uint8_t rtape[TAPE_SIZE];\n");
     h.push_str("static uint8_t wtape[TAPE_SIZE];\n");
     h.push_str("static int rptr = 0;\n");
     h.push_str("static int wptr = 0;\n");
     h.push_str("static uint8_t rcell_width[TAPE_SIZE];\n");
     h.push_str("static uint8_t wcell_width[TAPE_SIZE];\n");
-    // Terminal intrinsic state: saved_termios captures the original terminal
-    // settings before __term_raw modifies them, so __term_restore can revert.
-    // bfpp_term_raw tracks whether we're currently in raw mode to avoid
-    // double-restoring (which would be harmless but wasteful).
     if intrinsics.terminal {
         h.push_str("static struct termios bfpp_saved_termios;\n");
         h.push_str("static int bfpp_term_raw = 0;\n");
     }
+    h.push_str("#endif /* BFPP_DECL_ONLY */\n");
     h.push('\n');
 
     // Cell-width-aware accessors. All tape reads/writes go through bfpp_get/set
@@ -454,7 +567,8 @@ static void bfpp_cycle_width(int p) {
 
 "#);
 
-    // errno→bfpp_err mapping function (generated from error_codes.rs)
+    // errno mapping, syscall wrapper, constructor — only in definitions TU
+    h.push_str("#ifndef BFPP_DECL_ONLY\n");
     h.push_str(crate::error_codes::errno_mapping_c_source());
     h.push('\n');
 
@@ -490,14 +604,13 @@ static void __attribute__((constructor)) bfpp_init(void) {
 
 "#);
 
-    // Terminal intrinsics: save initial termios in a separate constructor
-    // that runs after bfpp_init. This captures the terminal state before
-    // any raw-mode changes so __term_restore can revert cleanly.
     if intrinsics.terminal {
         h.push_str("static void __attribute__((constructor)) bfpp_term_init(void) {\n");
         h.push_str("    tcgetattr(0, &bfpp_saved_termios);\n");
         h.push_str("}\n\n");
     }
+
+    h.push_str("#endif /* BFPP_DECL_ONLY — end of definitions section */\n\n");
 
     // SDL2 framebuffer system. Uses the tiled render pipeline (bfpp_fb_pipeline.h/c)
     // for parallel strip processing with triple buffering and cache management.

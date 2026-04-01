@@ -241,12 +241,30 @@ static void *render_thread_func(void *arg)
 #endif
 
             /* Dirty detection + copy at 64-byte granularity */
+#ifdef __AVX2__
+            /* AVX2: compare 32 bytes at a time, 2 per cache line */
+            for (int x = 0; x < row_bytes; x += 64) {
+                __m256i s0 = _mm256_loadu_si256((__m256i*)(src + x));
+                __m256i p0 = _mm256_loadu_si256((__m256i*)(prev + x));
+                __m256i s1 = _mm256_loadu_si256((__m256i*)(src + x + 32));
+                __m256i p1 = _mm256_loadu_si256((__m256i*)(prev + x + 32));
+                int eq0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(s0, p0));
+                int eq1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(s1, p1));
+                if (eq0 != -1 || eq1 != -1) {
+                    /* Dirty — copy this cache line */
+                    _mm256_storeu_si256((__m256i*)(dst + x), s0);
+                    _mm256_storeu_si256((__m256i*)(dst + x + 32), s1);
+                }
+            }
+#else
+            /* Scalar: memcmp path */
             for (int x = 0; x < row_bytes; x += 64) {
                 int chunk = (row_bytes - x < 64) ? (row_bytes - x) : 64;
                 if (memcmp(src + x, prev + x, (size_t)chunk) != 0) {
                     memcpy(dst + x, src + x, (size_t)chunk);
                 }
             }
+#endif
         }
 
         /* Signal completion — last thread to finish wakes the presenter */

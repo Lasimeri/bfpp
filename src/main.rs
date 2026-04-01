@@ -222,20 +222,119 @@ fn compile(cli: &Cli) -> Result<(), ()> {
     }
 
     // --- Stage 8: C compilation ---
-    let tmp_c = PathBuf::from(format!("/tmp/bfpp_{}.c", std::process::id()));
-    std::fs::write(&tmp_c, &c_source).map_err(|e| {
-        eprintln!("error: cannot write temp file: {}", e);
-    })?;
+    let pid = std::process::id();
+    let tmp_dir = PathBuf::from(format!("/tmp/bfpp_{}", pid));
+    let parallel = codegen_result.split.is_some();
 
-    let mut cc_cmd = Command::new(&cli.cc);
-    cc_cmd.args([
-        tmp_c.to_str().unwrap(),
-        "-o", bin_path.to_str().unwrap(),
-        "-O2",
-        "-Wall",
-        "-Wno-unused-variable",
-        "-Wno-unused-function",
-    ]);
+    // Build the cc command. In parallel mode: link .o files + runtime .c files.
+    // In single mode: compile one .c file directly.
+    let mut cc_cmd;
+    let tmp_c; // single-file temp path (used for cleanup)
+
+    if let Some(ref split) = codegen_result.split {
+        // ── Parallel mode: compile subroutines in parallel, then link ──
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        tmp_c = tmp_dir.join("_unused.c");
+
+        // Write shared header
+        std::fs::write(tmp_dir.join("bfpp_gen.h"), &split.header).map_err(|e| {
+            eprintln!("error: cannot write header: {}", e);
+        })?;
+
+        // Write sub .c files + main .c file
+        let mut c_files: Vec<PathBuf> = Vec::new();
+        for (i, (name, src)) in split.subs.iter().enumerate() {
+            let path = tmp_dir.join(format!("sub_{}_{}.c", i, name));
+            std::fs::write(&path, src).map_err(|e| {
+                eprintln!("error: cannot write sub file: {}", e);
+            })?;
+            c_files.push(path);
+        }
+        let main_path = tmp_dir.join("main.c");
+        std::fs::write(&main_path, &split.main_source).map_err(|e| {
+            eprintln!("error: cannot write main file: {}", e);
+        })?;
+        c_files.push(main_path);
+
+        // Find runtime include dir (needed for compile step)
+        let rt_inc = ["runtime", "."]
+            .iter()
+            .map(PathBuf::from)
+            .chain(std::env::current_exe().ok()
+                .and_then(|p| p.parent().map(|d| d.join("runtime"))))
+            .find(|d| d.join("bfpp_fb_pipeline.h").exists() || d.join("bfpp_rt.h").exists())
+            .unwrap_or_default();
+        let rt_inc_str = format!("-I{}", rt_inc.display());
+
+        // Compile each .c → .o in parallel
+        let cc_name = cli.cc.clone();
+        let inc_dir = format!("-I{}", tmp_dir.display());
+        let rt_inc_flag = rt_inc_str.clone();
+
+        let handles: Vec<_> = c_files.iter().map(|c_file| {
+            let c_file = c_file.clone();
+            let cc = cc_name.clone();
+            let inc = inc_dir.clone();
+            let rt_inc = rt_inc_flag.clone();
+            std::thread::spawn(move || {
+                let obj = c_file.with_extension("o");
+                let status = Command::new(&cc)
+                    .args([
+                        c_file.to_str().unwrap(),
+                        "-c", "-o", obj.to_str().unwrap(),
+                        "-O2", "-Wall",
+                        "-Wno-unused-variable", "-Wno-unused-function",
+                        &inc, &rt_inc, "-msse4.1",
+                    ])
+                    .status();
+                (obj, status)
+            })
+        }).collect();
+
+        let mut obj_files: Vec<PathBuf> = Vec::new();
+        let mut compile_failed = false;
+        for h in handles {
+            let (obj, status) = h.join().unwrap();
+            match status {
+                Ok(s) if s.success() => obj_files.push(obj),
+                _ => { compile_failed = true; }
+            }
+        }
+
+        if compile_failed {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            eprintln!("error: parallel C compilation failed");
+            return Err(());
+        }
+
+        // Link: cc *.o -o output + library flags + runtime .c files
+        cc_cmd = Command::new(&cli.cc);
+        for obj in &obj_files {
+            cc_cmd.arg(obj.to_str().unwrap());
+        }
+        cc_cmd.args(["-o", bin_path.to_str().unwrap()]);
+
+        eprintln!("bfpp: parallel compile ({} TUs on {} threads)",
+                  split.subs.len() + 1,
+                  split.subs.len() + 1);
+    } else {
+        // ── Single-file mode (existing behavior) ──
+        tmp_c = PathBuf::from(format!("/tmp/bfpp_{}.c", pid));
+        std::fs::write(&tmp_c, &c_source).map_err(|e| {
+            eprintln!("error: cannot write temp file: {}", e);
+        })?;
+
+        cc_cmd = Command::new(&cli.cc);
+        cc_cmd.args([
+            tmp_c.to_str().unwrap(),
+            "-o", bin_path.to_str().unwrap(),
+            "-O2", "-Wall",
+            "-Wno-unused-variable", "-Wno-unused-function",
+        ]);
+    }
+
+    // ── Shared flags: library linking + runtime .c files ──
+    // These apply to BOTH parallel (link step) and single-file (compile+link step).
 
     // -lSDL2 + pipeline runtime
     if codegen_result.uses_fb_pipeline {
@@ -378,12 +477,18 @@ fn compile(cli: &Cli) -> Result<(), ()> {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: cannot run '{}': {}", cli.cc, e);
-            let _ = std::fs::remove_file(&tmp_c);
+            if parallel { let _ = std::fs::remove_dir_all(&tmp_dir); }
+            else { let _ = std::fs::remove_file(&tmp_c); }
             return Err(());
         }
     };
 
-    let _ = std::fs::remove_file(&tmp_c);
+    // Cleanup temp files
+    if parallel {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    } else {
+        let _ = std::fs::remove_file(&tmp_c);
+    }
 
     if !status.success() {
         eprintln!("error: C compilation failed");

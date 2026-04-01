@@ -7,10 +7,14 @@
  *   (RGB24, row-major), then the existing 8-thread FB pipeline presents it.
  *
  *   Rendering pipeline:
- *     1. Vertex transform (MVP matrix multiply)
- *     2. Perspective divide → NDC
- *     3. Viewport transform → screen coords
- *     4. Edge-function triangle rasterization with bounding box clipping
+ *     1. Vertex transform (MVP matrix multiply)          — single-threaded
+ *     2. Perspective divide → NDC                        — single-threaded
+ *     3. Viewport transform → screen coords              — single-threaded
+ *     4. Strip-parallel rasterization (N worker threads)  — multi-threaded
+ *        Each thread owns a horizontal strip of the framebuffer + z-buffer.
+ *        Every triangle is submitted to all strip threads; each clips the
+ *        bounding box to its row range. Non-overlapping writes — no atomics.
+ *        Thread count = min(sysconf(_SC_NPROCESSORS_ONLN), 8).
  *     5. Per-pixel Blinn-Phong shading with interpolated normals
  *     6. Depth test against float z-buffer
  *
@@ -29,6 +33,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <unistd.h>
 
 #ifdef __x86_64__
 #include <immintrin.h>
@@ -142,7 +149,31 @@ static struct {
     /* Material */
     float color[3];         /* object color */
     float ambient[3];       /* ambient color */
+
+    /* Strip-parallel threading */
+    pthread_t sw_threads[8];
+    int sw_thread_count;
+    atomic_int sw_strips_remaining;
+    atomic_int sw_running;
+    pthread_mutex_t sw_mutex;
+    pthread_cond_t sw_frame_cv;
+    pthread_cond_t sw_done_cv;
+
+    /* Per-strip triangle data (shared, read-only during rasterization) */
+    float *sw_screen;       /* transformed screen coords: 3 floats per vertex */
+    float *sw_wnormals;     /* world-space normals: 3 floats per vertex */
+    float *sw_wpos;         /* world-space positions: 3 floats per vertex */
+    float *sw_w_clip;       /* clip-space W per vertex */
+    int sw_tri_count;       /* number of triangles to rasterize */
+
+    /* Per-strip bounds */
+    struct {
+        int y_start, y_end;
+    } sw_strips[8];
 } sw;
+
+/* Forward declaration for strip worker thread */
+static void *sw_strip_worker(void *arg);
 
 /* ── Init / Cleanup ──────────────────────────────────────────── */
 
@@ -179,10 +210,52 @@ void bfpp_sw_init(int width, int height, uint8_t *tape, int fb_offset)
     sw.lights[0].intensity = 1.0f;
     sw.lights[0].active    = 1;
     sw.num_lights = 1;
+
+    /* Strip-parallel threading: determine thread count, compute strip bounds */
+    int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu < 1) ncpu = 1;
+    if (ncpu > 8) ncpu = 8;
+    sw.sw_thread_count = ncpu;
+
+    int rows_per_strip = height / ncpu;
+    for (int i = 0; i < ncpu; i++) {
+        sw.sw_strips[i].y_start = i * rows_per_strip;
+        sw.sw_strips[i].y_end   = (i == ncpu - 1) ? height : (i + 1) * rows_per_strip;
+    }
+
+    atomic_init(&sw.sw_running, 1);
+    atomic_init(&sw.sw_strips_remaining, 0);
+    pthread_mutex_init(&sw.sw_mutex, NULL);
+    pthread_cond_init(&sw.sw_frame_cv, NULL);
+    pthread_cond_init(&sw.sw_done_cv, NULL);
+
+    sw.sw_screen   = NULL;
+    sw.sw_wnormals = NULL;
+    sw.sw_wpos     = NULL;
+    sw.sw_w_clip   = NULL;
+    sw.sw_tri_count = 0;
+
+    for (int i = 0; i < ncpu; i++) {
+        pthread_create(&sw.sw_threads[i], NULL, sw_strip_worker, (void *)(intptr_t)i);
+    }
 }
 
 void bfpp_sw_cleanup(void)
 {
+    /* Signal strip workers to exit */
+    atomic_store(&sw.sw_running, 0);
+    pthread_mutex_lock(&sw.sw_mutex);
+    pthread_cond_broadcast(&sw.sw_frame_cv);
+    pthread_mutex_unlock(&sw.sw_mutex);
+
+    for (int i = 0; i < sw.sw_thread_count; i++) {
+        pthread_join(sw.sw_threads[i], NULL);
+    }
+
+    pthread_mutex_destroy(&sw.sw_mutex);
+    pthread_cond_destroy(&sw.sw_frame_cv);
+    pthread_cond_destroy(&sw.sw_done_cv);
+
     free(sw.zbuf);
     sw.zbuf = NULL;
 }
@@ -630,6 +703,144 @@ static void rasterize_triangle(const float screen[9],
 #endif
 }
 
+/* ── Strip-clamped triangle rasterization ────────────────────── */
+
+/*
+ * rasterize_triangle_strip: same as rasterize_triangle but clamps the
+ * bounding box to [y_clip_min, y_clip_max). Each strip thread calls this
+ * with its own row range, guaranteeing non-overlapping framebuffer writes.
+ */
+static void rasterize_triangle_strip(const float screen[9],
+                                     const float normals[9],
+                                     const float world[9],
+                                     const float w_clip[3],
+                                     int y_clip_min, int y_clip_max)
+{
+    float sx0 = screen[0], sy0 = screen[1], sz0 = screen[2];
+    float sx1 = screen[3], sy1 = screen[4], sz1 = screen[5];
+    float sx2 = screen[6], sy2 = screen[7], sz2 = screen[8];
+
+    /* Bounding box, clamped to viewport AND strip range */
+    int min_x = maxi(0,             (int)floorf(fminf(sx0, fminf(sx1, sx2))));
+    int max_x = mini(sw.width - 1,  (int)ceilf(fmaxf(sx0, fmaxf(sx1, sx2))));
+    int min_y = maxi(y_clip_min,    (int)floorf(fminf(sy0, fminf(sy1, sy2))));
+    int max_y = mini(y_clip_max - 1,(int)ceilf(fmaxf(sy0, fmaxf(sy1, sy2))));
+
+    if (min_x > max_x || min_y > max_y) return;
+
+    /* Total area (2x signed area of triangle) */
+    float area = edge_func(sx0, sy0, sx1, sy1, sx2, sy2);
+    if (fabsf(area) < 1e-6f) return;   /* degenerate triangle */
+    float inv_area = 1.0f / area;
+
+    /* Reciprocal W for perspective-correct interpolation */
+    float inv_w0 = 1.0f / w_clip[0];
+    float inv_w1 = 1.0f / w_clip[1];
+    float inv_w2 = 1.0f / w_clip[2];
+
+    uint8_t *fb = sw.tape + sw.fb_offset;
+    int stride = sw.width * 3;
+
+    /* Edge equation increments for stepping +1 in X */
+    float de0_dx = sy1 - sy2;
+    float de1_dx = sy2 - sy0;
+    float de2_dx = sy0 - sy1;
+
+    for (int y = min_y; y <= max_y; y++) {
+        float py = (float)y + 0.5f;
+        float px_start = (float)min_x + 0.5f;
+
+        float e0 = edge_func(sx1, sy1, sx2, sy2, px_start, py);
+        float e1 = edge_func(sx2, sy2, sx0, sy0, px_start, py);
+        float e2 = edge_func(sx0, sy0, sx1, sy1, px_start, py);
+
+        for (int x = min_x; x <= max_x; x++) {
+            int inside;
+            if (area > 0)
+                inside = (e0 >= 0 && e1 >= 0 && e2 >= 0);
+            else
+                inside = (e0 <= 0 && e1 <= 0 && e2 <= 0);
+
+            if (inside) {
+                float w0 = e0 * inv_area;
+                float w1 = e1 * inv_area;
+                float w2 = 1.0f - w0 - w1;
+
+                float persp = 1.0f / (w0*inv_w0 + w1*inv_w1 + w2*inv_w2);
+                float depth = w0*sz0 + w1*sz1 + w2*sz2;
+
+                int zidx = y * sw.width + x;
+                if (depth < sw.zbuf[zidx]) {
+                    sw.zbuf[zidx] = depth;
+
+                    float pc0 = w0 * inv_w0 * persp;
+                    float pc1 = w1 * inv_w1 * persp;
+                    float pc2 = w2 * inv_w2 * persp;
+
+                    float norm[3] = {
+                        normals[0]*pc0 + normals[3]*pc1 + normals[6]*pc2,
+                        normals[1]*pc0 + normals[4]*pc1 + normals[7]*pc2,
+                        normals[2]*pc0 + normals[5]*pc1 + normals[8]*pc2
+                    };
+                    float wpos[3] = {
+                        world[0]*pc0 + world[3]*pc1 + world[6]*pc2,
+                        world[1]*pc0 + world[4]*pc1 + world[7]*pc2,
+                        world[2]*pc0 + world[5]*pc1 + world[8]*pc2
+                    };
+
+                    uint8_t r, g, b;
+                    shade_pixel(norm, wpos, &r, &g, &b);
+                    int fb_idx = y * stride + x * 3;
+                    fb[fb_idx + 0] = r;
+                    fb[fb_idx + 1] = g;
+                    fb[fb_idx + 2] = b;
+                }
+            }
+
+            e0 += de0_dx;
+            e1 += de1_dx;
+            e2 += de2_dx;
+        }
+    }
+}
+
+/* ── Strip worker thread ─────────────────────────────────────── */
+
+static void *sw_strip_worker(void *arg)
+{
+    int strip_id = (int)(intptr_t)arg;
+
+    while (atomic_load(&sw.sw_running)) {
+        /* Wait for frame signal */
+        pthread_mutex_lock(&sw.sw_mutex);
+        while (atomic_load(&sw.sw_strips_remaining) == 0 && atomic_load(&sw.sw_running))
+            pthread_cond_wait(&sw.sw_frame_cv, &sw.sw_mutex);
+        pthread_mutex_unlock(&sw.sw_mutex);
+
+        if (!atomic_load(&sw.sw_running)) break;
+
+        int y0 = sw.sw_strips[strip_id].y_start;
+        int y1 = sw.sw_strips[strip_id].y_end;
+
+        /* Rasterize all triangles, clipped to this strip */
+        for (int t = 0; t < sw.sw_tri_count; t++) {
+            const float *scr = &sw.sw_screen[t * 9];
+            const float *nrm = &sw.sw_wnormals[t * 9];
+            const float *wps = &sw.sw_wpos[t * 9];
+            const float *wcl = &sw.sw_w_clip[t * 3];
+            rasterize_triangle_strip(scr, nrm, wps, wcl, y0, y1);
+        }
+
+        /* Signal completion */
+        if (atomic_fetch_sub(&sw.sw_strips_remaining, 1) == 1) {
+            pthread_mutex_lock(&sw.sw_mutex);
+            pthread_cond_signal(&sw.sw_done_cv);
+            pthread_mutex_unlock(&sw.sw_mutex);
+        }
+    }
+    return NULL;
+}
+
 /* ── Triangle draw: public API ───────────────────────────────── */
 
 /*
@@ -681,7 +892,20 @@ void bfpp_sw_draw_triangles(uint8_t *tape, int ptr)
     float half_w = (float)sw.width  * 0.5f;
     float half_h = (float)sw.height * 0.5f;
 
-    /* Process each triangle */
+    /* ── Phase 1: Transform all vertices → build per-triangle arrays ── */
+
+    uint32_t max_tris = index_count / 3;
+    float *t_screen   = (float *)malloc((size_t)max_tris * 9 * sizeof(float));
+    float *t_wnormals = (float *)malloc((size_t)max_tris * 9 * sizeof(float));
+    float *t_wpos     = (float *)malloc((size_t)max_tris * 9 * sizeof(float));
+    float *t_w_clip   = (float *)malloc((size_t)max_tris * 3 * sizeof(float));
+    if (!t_screen || !t_wnormals || !t_wpos || !t_w_clip) {
+        free(t_screen); free(t_wnormals); free(t_wpos); free(t_w_clip);
+        free(verts); free(indices);
+        return;
+    }
+
+    int tri_out = 0;
     for (uint32_t t = 0; t + 2 < index_count; t += 3) {
         uint32_t i0 = indices[t + 0];
         uint32_t i1 = indices[t + 1];
@@ -718,9 +942,7 @@ void bfpp_sw_draw_triangles(uint8_t *tape, int ptr)
             float ndc_y = clip[1] * inv_w;
             float ndc_z = clip[2] * inv_w;
 
-            /* Viewport transform: NDC → screen
-             * x: [-1,1] → [0, width]
-             * y: [-1,1] → [height, 0]  (flip Y: NDC +Y is up, screen +Y is down) */
+            /* Viewport transform: NDC → screen */
             screen[v*3 + 0] = (ndc_x + 1.0f) * half_w;
             screen[v*3 + 1] = (1.0f - ndc_y) * half_h;
             screen[v*3 + 2] = ndc_z;
@@ -738,11 +960,52 @@ void bfpp_sw_draw_triangles(uint8_t *tape, int ptr)
 
         if (clipped) continue;
 
-        rasterize_triangle(screen, wnormals, wpos, w_clip);
+        /* Store transformed triangle for strip workers */
+        memcpy(&t_screen[tri_out * 9],   screen,   9 * sizeof(float));
+        memcpy(&t_wnormals[tri_out * 9], wnormals, 9 * sizeof(float));
+        memcpy(&t_wpos[tri_out * 9],     wpos,     9 * sizeof(float));
+        memcpy(&t_w_clip[tri_out * 3],   w_clip,   3 * sizeof(float));
+        tri_out++;
     }
 
     free(verts);
     free(indices);
+
+    if (tri_out == 0) {
+        free(t_screen); free(t_wnormals); free(t_wpos); free(t_w_clip);
+        return;
+    }
+
+    /* ── Phase 2: Dispatch to strip workers ───────────────────── */
+
+    sw.sw_screen   = t_screen;
+    sw.sw_wnormals = t_wnormals;
+    sw.sw_wpos     = t_wpos;
+    sw.sw_w_clip   = t_w_clip;
+    sw.sw_tri_count = tri_out;
+
+    /* Signal all strip workers */
+    pthread_mutex_lock(&sw.sw_mutex);
+    atomic_store(&sw.sw_strips_remaining, sw.sw_thread_count);
+    pthread_cond_broadcast(&sw.sw_frame_cv);
+    pthread_mutex_unlock(&sw.sw_mutex);
+
+    /* Wait for all strips to complete */
+    pthread_mutex_lock(&sw.sw_mutex);
+    while (atomic_load(&sw.sw_strips_remaining) > 0)
+        pthread_cond_wait(&sw.sw_done_cv, &sw.sw_mutex);
+    pthread_mutex_unlock(&sw.sw_mutex);
+
+    /* Cleanup per-frame buffers */
+    free(t_screen);
+    free(t_wnormals);
+    free(t_wpos);
+    free(t_w_clip);
+    sw.sw_screen   = NULL;
+    sw.sw_wnormals = NULL;
+    sw.sw_wpos     = NULL;
+    sw.sw_w_clip   = NULL;
+    sw.sw_tri_count = 0;
 }
 
 /* ── Present ─────────────────────────────────────────────────── */
