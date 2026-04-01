@@ -1,0 +1,99 @@
+; ╔══════════════════════════════════════════════╗
+; ║  BF++ Test Suite: Advanced Optimizer Passes   ║
+; ║  Constant fold, move coalesce, DCE, inline,   ║
+; ║  conditional eval, loop unroll, tail return    ║
+; ╚══════════════════════════════════════════════╝
+
+; All tests verify optimizer correctness by checking
+; that the program produces the same output regardless
+; of optimization level. Compile with -O 0 and -O 2
+; and diff the outputs — they must match.
+
+; ── Test 1: Constant folding ────────────────────
+; SetValue(10) + Increment(5) → SetValue(15)
+; Then we add 48 more via increments to get 63 = '?'
+#10 +++++ ; folds to SetValue(15)
+++++++++++++++++++++++++++++++++++++++++++++++++ ; 48 more = 63
+.         ; print '?' (63)
+[-]
+
+; SetValue then SetValue → dead store elimination
+#99       ; dead store (overwritten next)
+#72 .     ; 'H' (72)
+
+; Clear then Increment → SetValue
+[-]       ; Clear
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; 69 increments → should fold to SetValue(69) = 'E'
+.
+[-]
+
+#10 .     ; newline
+
+; ── Test 2: Move coalescing ─────────────────────
+; >>> >> should coalesce to >>>>>
+; Set cells at ptr+5 to 'M'
+>>> >> #77 . [-]
+<<<<< ; back to origin
+
+; >>>> < should coalesce to >>>
+; Set cell at ptr+3 to 'C'
+>>>> < #67 . [-]
+<<<
+
+#10 .     ; newline
+
+; ── Test 3: Dead code elimination ────────────────
+; Unused subroutine should be removed (no effect on output)
+!#never_called{ #88 . } ; 'X' — never called, should be DCE'd
+
+; Code after return is unreachable
+!#with_dead_tail{
+    #79 .   ; 'O'
+    ^       ; return
+    #88 .   ; unreachable 'X'
+}
+!#with_dead_tail
+#75 .     ; 'K' — proves we returned correctly
+#10 .     ; newline
+
+; ── Test 4: Subroutine inlining ──────────────────
+; Small subroutine (<=8 ops) should be inlined at O2
+!#tiny{ #33 . ^ }   ; prints '!'
+!#tiny !#tiny !#tiny ; should be inlined → "!!!"
+#10 .
+
+; Large subroutine should NOT be inlined
+!#big{
+    #45 . #45 . #45 . #45 . #45 .
+    #45 . #45 . #45 . #45 . #45 .
+    ^
+}
+!#big   ; prints "----------" (10 dashes)
+#10 .
+
+; ── Test 5: Compile-time conditional evaluation ──
+; #5 ?= #5 → always true, body should execute
+#5 ?= #5 [ #84 . [-] ]  ; 'T' (84) — always true
+; #5 ?= #3 → always false, body should NOT execute
+#5 ?= #3 [ #70 . [-] ]  ; 'F' (70) — should NOT print
+; [-] ?{ } → dead loop after clear
+[-] [ #88 . ]             ; 'X' — dead loop, never executes
+#10 .
+
+; ── Test 6: ?{} with known value ─────────────────
+#1 ?{ #49 . [-] }:{ #48 . [-] }  ; '1' (cell=1 → true branch)
+#0 ?{ #49 . [-] }:{ #48 . [-] }  ; '0' (cell=0 → false branch)
+#10 .
+
+; ── Summary ──────────────────────────────────────
+; Expected output:
+; ?HE
+; MC
+; OK
+; !!!
+; ----------
+; T
+; 10
+
+#0 !#__exit

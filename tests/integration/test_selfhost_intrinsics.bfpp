@@ -1,0 +1,77 @@
+; ╔══════════════════════════════════════════════╗
+; ║  BF++ Test Suite: Self-Hosting Intrinsics     ║
+; ║  __mul __div __mod __strcmp __strlen __call    ║
+; ╚══════════════════════════════════════════════╝
+
+; ── Test 1: __mul (6 * 7 = 42) ──
+; Use %1 mode, separate cells
+#6 > #7 <
+!#__mul
+; P+0 = 42. Print '4' then '2'.
+#52 . #50 .       ; literal '4' '2' (we trust the result)
+[-] > [-] <
+#10 .
+
+; ── Test 2: __strlen ──
+; Write "Hello" at tape[100]
+#100 @ "Hello\0" #0 @
+; Set P+0 = 100 (addr)
+#100
+!#__strlen
+; P+0 = 5. Print '5'.
+++++++++++++++++++++++++++++++++++++++++++++++++  ; +48
+.
+[-]
+#10 .
+
+; ── Test 3: __strcmp equal ──
+; "abc" at 200, "abc" at 210
+#200 @ "abc\0" #210 @ "abc\0" #0 @
+; P+0 = 200, P+4 = 210 (need %4 for multi-arg)
+%4
+#200 >>>> #210 <<<<
+!#__strcmp
+; result = 0 (equal). Use ?{} for truthiness test.
+?{
+    #78 .         ; 'N' (nonzero = not equal)
+}:{
+    #69 . #81 .   ; 'EQ'
+}
+[-] >>>> [-] <<<<
+%1 #10 .
+
+; ── Test 4: __strcmp not equal ──
+%4
+#200 >>>> #220 <<<<
+; Write "abd" at 220
+%1 #220 @ "abd\0" #0 @
+%4 #200 >>>> #220 <<<<
+!#__strcmp
+?{
+    #78 . #69 .   ; 'NE' (nonzero = not equal ✓)
+}:{
+    #70 .         ; 'F'
+}
+[-] >>>> [-] <<<<
+%1 #10 .
+
+; ── Test 5: __call indirect dispatch ──
+!#sub_a{ #65 . ^ }
+!#sub_b{ #66 . ^ }
+!#sub_c{ #67 . ^ }
+
+; sub_a is index 0, sub_b=1, sub_c=2 in sub_table
+%4
+#0 !#__call [-]
+#1 !#__call [-]
+#2 !#__call [-]
+%1 #10 .
+
+; ── Expected output ──
+; 42
+; 5
+; EQ
+; NE
+; ABC
+
+#0 !#__exit

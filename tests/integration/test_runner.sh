@@ -146,6 +146,28 @@ run_test "optimizer" \
     "$SCRIPT_DIR/test_optimizer.bfpp" \
     "$SCRIPT_DIR/expected_optimizer.txt"
 
+# === v0.4.0 feature tests ===
+
+# Preprocessor macros (!define/!undef) and if/else (?{...}:{...})
+run_test "macros_ifelse" \
+    "$SCRIPT_DIR/test_macros_ifelse.bfpp" \
+    "$SCRIPT_DIR/expected_macros_ifelse.txt"
+
+# Self-hosting intrinsics (__mul, __div, __strcmp, __strlen, __call)
+run_test "selfhost_intrinsics" \
+    "$SCRIPT_DIR/test_selfhost_intrinsics.bfpp" \
+    "$SCRIPT_DIR/expected_selfhost_intrinsics.txt"
+
+# Advanced optimizer passes (constant fold, DCE, inline, conditional eval)
+run_test "optimizer_advanced" \
+    "$SCRIPT_DIR/test_optimizer_advanced.bfpp" \
+    "$SCRIPT_DIR/expected_optimizer_advanced.txt"
+
+# Comprehensive multi-feature test
+run_test "comprehensive" \
+    "$SCRIPT_DIR/test_comprehensive.bfpp" \
+    "$SCRIPT_DIR/expected_comprehensive.txt"
+
 # Classic BF tests (if any exist)
 for bf_file in "$SCRIPT_DIR/classic_bf/"*.bfpp; do
     [ -f "$bf_file" ] || continue
