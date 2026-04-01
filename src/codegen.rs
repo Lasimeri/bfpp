@@ -119,7 +119,7 @@ fn generate_c(program: &Program, opts: &CodegenOptions, uses_ffi: bool, intrinsi
 
     // Subroutine table: static array of function pointers indexed by position.
     // Used by __spawn to look up subroutine entry points at runtime.
-    if intrinsics.threading && !ctx.subroutines.is_empty() {
+    if (intrinsics.threading || intrinsics.indirect_call) && !ctx.subroutines.is_empty() {
         out.push_str("static void (*bfpp_sub_table[])(void) = {\n");
         for name in &ctx.subroutines {
             out.push_str(&format!("    bfpp_sub_{},\n", mangle_name(name)));
@@ -1231,6 +1231,92 @@ fn emit_intrinsic(out: &mut String, name: &str, ctx: &mut GenCtx) {
             out.push_str("{ int start = (int)bfpp_get(ptr) & TAPE_MASK; uint8_t needle = (uint8_t)bfpp_get(ptr+1); int maxn = (int)bfpp_get(ptr+2); if (maxn > TAPE_SIZE - start) maxn = TAPE_SIZE - start; uint8_t *found = memchr(&tape[start], needle, maxn); bfpp_set(ptr, found ? (uint64_t)(found - tape) : 0); }\n");
         }
 
+        // ── Integer arithmetic (raw, not Q16.16) ────────────────
+        // These operate on raw integers in tape cells, NOT fixed-point.
+        // Essential for offset calculations, index math, and self-hosting.
+        "__mul" => {
+            // Input: tape[ptr]=a, tape[ptr+1]=b. Output: tape[ptr]=a*b
+            indent(out, ctx.indent);
+            out.push_str("bfpp_set(ptr, bfpp_get(ptr) * bfpp_get(ptr+1));\n");
+        }
+        "__div" => {
+            // Input: tape[ptr]=a, tape[ptr+1]=b. Output: tape[ptr]=a/b, tape[ptr+1]=a%b
+            indent(out, ctx.indent);
+            out.push_str("{ uint64_t _a = bfpp_get(ptr), _b = bfpp_get(ptr+1); if (_b) { bfpp_set(ptr, _a / _b); bfpp_set(ptr+1, _a % _b); } else { bfpp_err = BFPP_ERR_INVALID_ARG; } }\n");
+        }
+        "__mod" => {
+            // Input: tape[ptr]=a, tape[ptr+1]=b. Output: tape[ptr]=a%b
+            indent(out, ctx.indent);
+            out.push_str("{ uint64_t _b = bfpp_get(ptr+1); if (_b) { bfpp_set(ptr, bfpp_get(ptr) % _b); } else { bfpp_err = BFPP_ERR_INVALID_ARG; } }\n");
+        }
+
+        // ── String operations ────────────────────────────────────
+        "__strcmp" => {
+            // Input: tape[ptr]=addr_a, tape[ptr+1]=addr_b (both null-terminated on tape)
+            // Output: tape[ptr] = 0 if equal, <0 if a<b, >0 if a>b
+            indent(out, ctx.indent);
+            out.push_str("{ int _a = (int)bfpp_get(ptr) & TAPE_MASK; int _b = (int)bfpp_get(ptr+1) & TAPE_MASK; int _r = 0; while (tape[_a] == tape[_b] && tape[_a] != 0) { _a++; _b++; } _r = (int)tape[_a] - (int)tape[_b]; bfpp_set(ptr, (uint64_t)(int64_t)_r); }\n");
+        }
+        "__strlen" => {
+            // Input: tape[ptr]=addr (null-terminated on tape)
+            // Output: tape[ptr]=length
+            indent(out, ctx.indent);
+            out.push_str("{ int _a = (int)bfpp_get(ptr) & TAPE_MASK; int _l = 0; while (tape[_a + _l] != 0) _l++; bfpp_set(ptr, (uint64_t)_l); }\n");
+        }
+        "__strcpy" => {
+            // Input: tape[ptr]=dst_addr, tape[ptr+1]=src_addr
+            // Output: copies null-terminated string from src to dst
+            indent(out, ctx.indent);
+            out.push_str("{ int _d = (int)bfpp_get(ptr) & TAPE_MASK; int _s = (int)bfpp_get(ptr+1) & TAPE_MASK; while (tape[_s]) { tape[_d++] = tape[_s++]; } tape[_d] = 0; }\n");
+        }
+
+        // ── Array operations (O(1) element ops with shift) ───────
+        "__array_insert" => {
+            // Input: tape[ptr]=array_addr, tape[ptr+1]=index, tape[ptr+2]=element_size,
+            //        tape[ptr+3]=count (current element count), tape[ptr+4]=value_addr (source)
+            // Shifts elements at [index..count] right by element_size, copies value from value_addr.
+            indent(out, ctx.indent);
+            out.push_str("{ int _base = (int)bfpp_get(ptr) & TAPE_MASK; int _idx = (int)bfpp_get(ptr+1); int _esz = (int)bfpp_get(ptr+2); int _cnt = (int)bfpp_get(ptr+3); int _vsrc = (int)bfpp_get(ptr+4) & TAPE_MASK; int _off = _base + _idx * _esz; int _tail = (_cnt - _idx) * _esz; if (_tail > 0) memmove(&tape[_off + _esz], &tape[_off], _tail); memcpy(&tape[_off], &tape[_vsrc], _esz); }\n");
+        }
+        "__array_remove" => {
+            // Input: tape[ptr]=array_addr, tape[ptr+1]=index, tape[ptr+2]=element_size,
+            //        tape[ptr+3]=count
+            // Shifts elements at [index+1..count] left by element_size, removing element at index.
+            indent(out, ctx.indent);
+            out.push_str("{ int _base = (int)bfpp_get(ptr) & TAPE_MASK; int _idx = (int)bfpp_get(ptr+1); int _esz = (int)bfpp_get(ptr+2); int _cnt = (int)bfpp_get(ptr+3); int _off = _base + _idx * _esz; int _tail = (_cnt - _idx - 1) * _esz; if (_tail > 0) memmove(&tape[_off], &tape[_off + _esz], _tail); }\n");
+        }
+
+        // ── Indirect subroutine call ─────────────────────────────
+        "__call" => {
+            // Input: tape[ptr]=subroutine_index (0-based index into bfpp_sub_table)
+            // Calls bfpp_sub_table[index](). Enables computed dispatch / jump tables.
+            indent(out, ctx.indent);
+            out.push_str("{ int _idx = (int)bfpp_get(ptr); if (_idx >= 0 && _idx < (int)(sizeof(bfpp_sub_table)/sizeof(bfpp_sub_table[0]))) bfpp_sub_table[_idx](); else bfpp_err = BFPP_ERR_INVALID_ARG; }\n");
+        }
+
+        // ── Hash map on tape ─────────────────────────────────────
+        // Simple open-addressing hash map stored on tape.
+        // Layout at map_addr: [capacity:4][count:4][entries...]
+        // Each entry: [hash:4][key_len:1][key_data:max_key][value:cell_width]
+        "__hashmap_init" => {
+            // Input: tape[ptr]=map_addr, tape[ptr+1]=capacity (num buckets)
+            // Zeros the map region.
+            indent(out, ctx.indent);
+            out.push_str("{ int _addr = (int)bfpp_get(ptr) & TAPE_MASK; int _cap = (int)bfpp_get(ptr+1); bfpp_set(_addr, (uint64_t)_cap); bfpp_set(_addr + 4, 0); memset(&tape[_addr + 8], 0, _cap * 40); }\n");
+        }
+        "__hashmap_get" => {
+            // Input: tape[ptr]=map_addr, tape[ptr+1]=key_addr (null-terminated)
+            // Output: tape[ptr]=value (0 if not found), tape[ptr+1]=1 if found, 0 if not
+            indent(out, ctx.indent);
+            out.push_str("{ int _maddr = (int)bfpp_get(ptr) & TAPE_MASK; int _kaddr = (int)bfpp_get(ptr+1) & TAPE_MASK; int _cap = (int)bfpp_get(_maddr); uint32_t _h = 5381; for (int _i = _kaddr; tape[_i]; _i++) _h = _h * 33 + tape[_i]; int _slot = (_h % _cap) * 40 + _maddr + 8; int _found = 0; for (int _p = 0; _p < _cap; _p++) { int _s = ((_h + _p) % _cap) * 40 + _maddr + 8; if (tape[_s] == 0 && tape[_s+1] == 0 && tape[_s+2] == 0 && tape[_s+3] == 0) break; int _ka = _s + 5; int _ki = _kaddr; int _eq = 1; while (tape[_ka] && tape[_ki]) { if (tape[_ka] != tape[_ki]) { _eq = 0; break; } _ka++; _ki++; } if (_eq && tape[_ka] == tape[_ki]) { bfpp_set(ptr, bfpp_get(_s + 36)); bfpp_set(ptr+1, 1); _found = 1; break; } } if (!_found) { bfpp_set(ptr, 0); bfpp_set(ptr+1, 0); } }\n");
+        }
+        "__hashmap_set" => {
+            // Input: tape[ptr]=map_addr, tape[ptr+1]=key_addr, tape[ptr+2]=value
+            // Inserts or updates key→value. Uses djb2 hash + linear probing.
+            indent(out, ctx.indent);
+            out.push_str("{ int _maddr = (int)bfpp_get(ptr) & TAPE_MASK; int _kaddr = (int)bfpp_get(ptr+1) & TAPE_MASK; uint64_t _val = bfpp_get(ptr+2); int _cap = (int)bfpp_get(_maddr); uint32_t _h = 5381; for (int _i = _kaddr; tape[_i]; _i++) _h = _h * 33 + tape[_i]; for (int _p = 0; _p < _cap; _p++) { int _s = ((_h + _p) % _cap) * 40 + _maddr + 8; uint32_t _sh = (uint32_t)tape[_s] | ((uint32_t)tape[_s+1]<<8) | ((uint32_t)tape[_s+2]<<16) | ((uint32_t)tape[_s+3]<<24); if (_sh == 0) { tape[_s] = _h & 0xFF; tape[_s+1] = (_h>>8) & 0xFF; tape[_s+2] = (_h>>16) & 0xFF; tape[_s+3] = (_h>>24) & 0xFF; int _ki = _kaddr; int _ko = _s + 5; while (tape[_ki]) tape[_ko++] = tape[_ki++]; tape[_ko] = 0; bfpp_set(_s + 36, _val); bfpp_set(_maddr + 4, bfpp_get(_maddr + 4) + 1); break; } int _ka = _s + 5; int _ki = _kaddr; int _eq = 1; while (tape[_ka] && tape[_ki]) { if (tape[_ka] != tape[_ki]) { _eq = 0; break; } _ka++; _ki++; } if (_eq && tape[_ka] == tape[_ki]) { bfpp_set(_s + 36, _val); break; } } }\n");
+        }
+
         // ── TUI Runtime ──────────────────────────────────────────
         // These intrinsics delegate to the bfpp_rt.c double-buffered terminal
         // UI runtime. It provides a cell grid with per-cell fg/bg colors,
@@ -1688,6 +1774,7 @@ struct IntrinsicUsage {
     fb_sync: bool,   // __fb_sync, __fb_pixel_nt — framebuffer pipeline intrinsics
     gl3d: bool,      // __gl_*, __fp_*, __mat4_*, __mesh_* — requires bfpp_rt_3d + OpenGL/GLEW + math
     multigpu: bool,  // __gl_multi_gpu, __gl_gpu_count, __gl_frame_time, __scene_* — requires bfpp_rt_3d_multigpu + bfpp_rt_3d_oracle + EGL
+    indirect_call: bool, // __call — needs bfpp_sub_table (same as threading)
 }
 
 // Pre-scan the entire AST for intrinsic calls and return a summary of
@@ -1747,6 +1834,13 @@ fn scan_intrinsics(nodes: &[AstNode], usage: &mut IntrinsicUsage) {
                         usage.gl3d = true;
                         usage.multigpu = true;
                     }
+                    // Core intrinsics — no external deps, always available
+                    "__mul" | "__div" | "__mod" |
+                    "__strcmp" | "__strlen" | "__strcpy" |
+                    "__array_insert" | "__array_remove" |
+                    "__hashmap_init" | "__hashmap_get" | "__hashmap_set" => {}
+                    // Indirect call — needs sub_table
+                    "__call" => { usage.indirect_call = true; }
                     _ => {}
                 }
             }

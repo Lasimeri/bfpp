@@ -18,6 +18,12 @@
 ;   !#cr                          ; reset colors
 ;   !#cs                          ; show cursor
 ;   !#kb                          ; read a keypress → tape[ptr]
+;
+; Buffer rendering functions (pure BF++, ANSI-direct):
+;   #5 > #10 > #65 << !#tp       ; put 'A' at row 5, col 10
+;   #5 > #10 > #65 > #196 > #21 <<<<  !#tc  ; put 'A' colored at (5,10)
+;   #2 > #3 > #20 > #5 > #32 <<<< !#tf      ; fill 20x5 rect with spaces
+;   #3 > #5 > #72 > #101 > #108 > #108 > #111 > #0 <<<<<<<< !#ts ; "Hello" at (3,5)
 
 !include "io.bfpp"
 
@@ -406,5 +412,258 @@
 !#kb{
     [-]                     ; clear current cell
     ,                       ; read one byte from stdin
+    ^
+}
+
+; ==========================================================================
+; ANSI-DIRECT TUI BUFFER OPERATIONS
+; ==========================================================================
+; Pure BF++ implementations of positioned rendering. These output ANSI
+; escape sequences directly to stdout via the . operator — no C runtime
+; TUI needed, no double-buffering.
+;
+; These are the BF++ equivalents of the C runtime's bfpp_tui_put(),
+; bfpp_tui_puts(), bfpp_tui_fill(), and bfpp_tui_box().
+; The C versions write to an internal back_buf Cell array for diff-based
+; rendering. These BF++ versions emit directly to the terminal instead.
+;
+; All functions build on !#cm (cursor_move) and !#co (set_color) above,
+; inheriting their workspace convention: P+0..P+9 are clobbered.
+; Persistent state for multi-step functions lives at P+10+.
+; ==========================================================================
+
+; ==========================================================================
+; !#tp — tui_put(row, col, char)
+; Input: tape[ptr]=row, tape[ptr+1]=col, tape[ptr+2]=char
+; Moves cursor to (row,col), prints char.
+; Equivalent to: bfpp_tui_put(row, col, ch, -1, -1) + end_frame
+; Workspace: P+0..P+9 (via !#cm)
+; After: P+0 = 0
+; ==========================================================================
+!#tp{
+    ; Save char (P+2) to stack before !#cm clobbers it
+    >>$<<                   ; push char, back to P
+
+    ; P=row, P+1=col — call cursor_move
+    !#cm
+
+    ; Pop char → P, print, clear
+    ~                       ; pop char → P
+    .[-]                    ; print and clear
+
+    ^
+}
+
+; ==========================================================================
+; !#tc — tui_put_colored(row, col, char, fg, bg)
+; Input: tape[ptr]=row, [ptr+1]=col, [ptr+2]=char, [ptr+3]=fg, [ptr+4]=bg
+; Sets color (fg,bg), moves cursor to (row,col), prints char, resets color.
+; Equivalent to: bfpp_tui_put(row, col, ch, fg, bg) + end_frame
+; Workspace: P+0..P+9
+; After: P+0 = 0
+;
+; Strategy: save row, col, char to stack. Move fg/bg to P+0/P+1 for !#co.
+; Then pop saved values for !#cm and print.
+; ==========================================================================
+!#tc{
+    ; Save row, col, char to stack
+    $                       ; push row (P+0)
+    >$                      ; push col (P+1)
+    >$                      ; push char (P+2)
+    >                       ; at P+3 (fg)
+
+    ; Move fg → P+0, bg → P+1 for !#co
+    [-<<<+>>>]              ; fg: P+3 → P+0
+    >[-<<<<+>>>>]           ; bg: P+4 → P+1
+    <<<<                    ; back to P
+
+    ; P=fg, P+1=bg — set color
+    !#co
+
+    ; Pop char → P+9 (stash beyond !#cm workspace)
+    ~                       ; pop char → P
+    [->>>>>>>>>+<<<<<<<<<]  ; P → P+9
+
+    ; Pop col → P+1
+    ~                       ; pop col → P
+    [->+<]                  ; P → P+1
+
+    ; Pop row → P
+    ~                       ; pop row → P
+
+    ; P=row, P+1=col — move cursor
+    !#cm
+
+    ; Retrieve char from P+9 → P, print
+    >>>>>>>>>[-<<<<<<<<<+>>>>>>>>>]<<<<<<<<<
+    .[-]                    ; print char, clear
+
+    ; Reset colors
+    !#cr
+
+    ^
+}
+
+; ==========================================================================
+; !#tf — tui_fill(row, col, w, h, char)
+; Input: tape[ptr]=row, [ptr+1]=col, [ptr+2]=w, [ptr+3]=h, [ptr+4]=char
+; Fills a w×h rectangle starting at (row, col) with char.
+; Equivalent to: bfpp_tui_fill(row, col, w, h, ch, -1, -1) + end_frame
+;
+; Uses ANSI cursor positioning per row; the terminal auto-advances the
+; column after each printed character, so only one !#cm per row is needed.
+;
+; Persistent state at P+10..P+14 (safe from !#cm clobber of P+0..P+9):
+;   P+10 = cur_row (incremented each iteration)
+;   P+11 = col (constant)
+;   P+12 = w (constant)
+;   P+13 = remaining rows (decremented each iteration)
+;   P+14 = char (constant)
+;
+; Workspace: P+0..P+9 (clobbered by !#cm), P+10..P+14 (persistent)
+; After: P+0 = 0, P+10..P+14 = 0
+; ==========================================================================
+!#tf{
+    ; --- Setup: move inputs to persistent cells P+10..P+14 ---
+    [->>>>>>>>>>+<<<<<<<<<<]        ; row → P+10
+    >[->>>>>>>>>>+<<<<<<<<<<]       ; col → P+11
+    >[->>>>>>>>>>+<<<<<<<<<<]       ; w → P+12
+    >[->>>>>>>>>>+<<<<<<<<<<]       ; h → P+13
+    >[->>>>>>>>>>+<<<<<<<<<<]       ; char → P+14
+    <<<<                            ; back to P
+
+    ; ================== ROW LOOP ==================
+    >>>>>>>>>>>>>                   ; at P+13 (remaining rows)
+    [                               ; while remaining rows > 0
+        -                           ; dec remaining
+
+        ; Copy cur_row (P+10) → P via double-push
+        <<<$$[-]~                   ; at P+10: push twice, clear, restore
+        <<<<<<<<<<~                 ; back to P, pop → P
+
+        ; Copy col (P+11) → P+1 via double-push
+        >>>>>>>>>>>$$[-]~           ; at P+11: push twice, clear, restore
+        <<<<<<<<<<<>~<              ; back to P, pop → P+1
+
+        ; Call !#cm — cursor to (cur_row, col)
+        !#cm
+
+        ; Print char w times
+        >>>>>>>>>>>>                ; at P+12 (w)
+        $$[-]~                      ; copy w via stack
+        <<<<<<<<<<<<                ; back to P
+        >~                          ; pop w → P+1 (counter)
+        [                           ; while counter > 0
+            -                       ; dec counter
+            >>>>>>>>>>>>>           ; at P+14 (char)
+            $$[-]~                  ; copy char via double-push
+            <<<<<<<<<<<<<           ; back to P+1
+            <~                      ; pop char → P
+            .[-]                    ; print char, clear
+            >                       ; back to P+1
+        ]
+        <                           ; back to P
+
+        ; Increment cur_row for next row
+        >>>>>>>>>>+                 ; P+10 += 1
+
+        ; Go to loop counter (P+13)
+        >>>
+    ]
+    <<<<<<<<<<<<<                   ; back to P
+
+    ; Cleanup: clear P+10..P+14
+    >>>>>>>>>>[-]>[-]>[-]>[-]>[-]<<<<<<<<<<<<<<<
+
+    ^
+}
+
+; ==========================================================================
+; !#ts — tui_puts(row, col, string)
+; Input: tape[ptr]=row (>=1), tape[ptr+1]=col (>=1),
+;        tape[ptr+2..N] = null-terminated string
+;
+; Moves cursor to (row,col) then prints the null-terminated string.
+; Equivalent to: bfpp_tui_puts(row, col, str, -1, -1) + end_frame
+;
+; Algorithm:
+;   1. Move row → P+10, col → P+11 (persistent, safe from !#cm)
+;   2. Push sentinel 0 to stack (from cleared P+0)
+;   3. Push each string char to stack ($ is non-destructive, chars stay on tape)
+;   4. Navigate back: < to last char (nonzero), [<] scans through nonzero
+;      chars, stops at P+1 (= 0, col was moved out), < reaches P+0
+;   5. Copy P+10→P, P+11→P+1 via double-push, call !#cm
+;      (!#cm's stack push/pop is balanced — our chars are safe below)
+;   6. Ensure P+0 = 0 (left boundary), pop reversed string into P+1+
+;   7. Print with [.<] from rightmost cell leftward — produces forward order
+;      because the string is reversed on tape; the rightmost cell = str[0]
+;
+; Constraints:
+;   - ANSI coordinates are 1-based: row >= 1, col >= 1 (always true)
+;   - String must be null-terminated, no embedded zero bytes
+;   - String chars on tape (P+2+) are NOT cleaned up (clobbered by !#cm
+;     up to P+9, left dirty beyond P+9)
+;
+; For simple cases, calling !#cm then !#.> separately may be clearer:
+;   #5 > #10 < !#cm   #72 > #101 > #108 > #108 > #111 > #0 <<<<< !#.>
+;
+; Workspace: P+0..P+9 (via !#cm), P+10..P+11 (row/col), stack (string)
+; After: P+0 = 0, P+1..P+len = reversed string remnants
+; ==========================================================================
+!#ts{
+    ; Move row → P+10, col → P+11
+    [->>>>>>>>>>+<<<<<<<<<<]        ; row → P+10 (P+0 now 0)
+    >[->>>>>>>>>>+<<<<<<<<<<]<      ; col → P+11 (P+1 now 0), back to P
+
+    ; Push sentinel 0 (P+0 = 0 after move)
+    $                               ; push 0 to stack
+
+    ; Navigate to string start
+    >>                              ; at P+2
+
+    ; Push each string char (non-destructive: $ copies, doesn't clear)
+    ; Loop: if cell nonzero, push it, advance, check next
+    [$>]                            ; push and advance while nonzero
+    ; At null terminator (P+2+len, value 0)
+    ; Cells P+2..P+2+len-1 retain their original string values
+    ; Stack (bottom→top): 0(sentinel), str[0], str[1], ..., str[len-1]
+
+    ; Navigate back to P+0:
+    <                               ; at P+2+len-1 (last char) or P+1 (if empty)
+    [<]                             ; scan left through nonzero chars → stops at P+1 (=0)
+    <                               ; at P+0
+
+    ; Copy row from P+10 → P via double-push
+    >>>>>>>>>>$$[-]~                ; at P+10: push twice, clear, restore
+    <<<<<<<<<<~                     ; pop → P+0
+
+    ; Copy col from P+11 → P+1 via double-push
+    >>>>>>>>>>>$$[-]~               ; at P+11: push twice, clear, restore
+    <<<<<<<<<<<>~<                  ; pop → P+1
+
+    ; Move cursor — !#cm's stack usage is balanced, our string chars are safe
+    !#cm
+
+    ; Pop reversed string onto tape. P+0 = 0 serves as left boundary.
+    [-]                             ; ensure P+0 = 0
+    >                               ; at P+1
+    ~                               ; pop top → P+1
+    [                               ; while not sentinel (0)
+        >                           ; advance to next cell
+        ~                           ; pop next char
+    ]
+    ; Sentinel (0) at current cell. Reversed string at P+1..current-1:
+    ;   P+1 = str[len-1], ..., P+len = str[0]
+    ; P+0 = 0 (left boundary)
+
+    ; Print: go left 1 to str[0] (rightmost populated cell), then [.<]
+    ; prints leftward through the reversed string = forward print order
+    <                               ; at rightmost char = str[0]
+    [.<]                            ; print str[0], str[1], ..., str[len-1]
+    ; Exits when hitting P+0 = 0. ptr = P+0.
+
+    ; Cleanup persistent cells
+    >>>>>>>>>>[-]>[-]<<<<<<<<<<<    ; clear P+10, P+11
+
     ^
 }

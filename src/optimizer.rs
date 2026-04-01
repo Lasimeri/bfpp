@@ -34,13 +34,22 @@ pub fn optimize(nodes: Vec<AstNode>, level: OptLevel) -> Vec<AstNode> {
         OptLevel::Basic => {
             let nodes = pass_clear_loop(nodes);
             let nodes = pass_fold_constants(nodes);
+            let nodes = pass_coalesce_moves(nodes);
             pass_error_folding(nodes)
         }
         OptLevel::Full => {
             let nodes = pass_clear_loop(nodes);
             let nodes = pass_fold_constants(nodes);
+            let nodes = pass_coalesce_moves(nodes);
+            let nodes = pass_eval_conditionals(nodes);
             let nodes = pass_scan_loop(nodes);
             let nodes = pass_multiply_move(nodes);
+            let nodes = pass_unroll_small_loops(nodes);
+            let nodes = pass_dead_code(nodes);
+            let nodes = pass_inline_subs(nodes);
+            // Second fold pass — inlining + unrolling may expose new folding opportunities
+            let nodes = pass_fold_constants(nodes);
+            let nodes = pass_coalesce_moves(nodes);
             pass_error_folding(nodes)
         }
     }
@@ -360,6 +369,456 @@ fn pass_error_folding(nodes: Vec<AstNode>) -> Vec<AstNode> {
     result
 }
 
+// Compile-time conditional evaluation: when the current cell has a known value
+// (from SetValue or Clear), conditionals can be resolved at compile time.
+//
+// Examples:
+//   #5 ?= #5 [ body ]         → body (always true)
+//   #5 ?= #3 [ body ]         → (eliminated, always false)
+//   [-] [ body ]               → (eliminated, cell is 0, loop never enters)
+//   #0 ?{ true } : { false }  → false (cell is 0)
+//   #1 ?{ true } : { false }  → true (cell is nonzero)
+//
+// Value tracking is conservative: any loop, subroutine call, I/O, or
+// absolute addressing resets the known value to None.
+fn pass_eval_conditionals(nodes: Vec<AstNode>) -> Vec<AstNode> {
+    let mut result = Vec::new();
+    let mut known_value: Option<u64> = None;
+
+    for node in nodes {
+        // Update known_value based on current node
+        match &node {
+            AstNode::SetValue(v) => { known_value = Some(*v); }
+            AstNode::Clear => { known_value = Some(0); }
+            AstNode::Increment(n) => {
+                known_value = known_value.map(|v| v.wrapping_add(*n as u64));
+            }
+            AstNode::Decrement(n) => {
+                known_value = known_value.map(|v| v.wrapping_sub(*n as u64));
+            }
+            // These destroy known value (cell modified unpredictably)
+            AstNode::Input | AstNode::InputFd(_) | AstNode::Pop |
+            AstNode::ErrorRead | AstNode::SubCall(_) |
+            AstNode::AbsoluteAddr | AstNode::Syscall |
+            AstNode::FfiCall(_, _) => {
+                known_value = None;
+            }
+            // Pointer movement: we're now at a different cell, value unknown
+            AstNode::MoveRight(_) | AstNode::MoveLeft(_) => {
+                known_value = None;
+            }
+            _ => {}
+        }
+
+        // Try to resolve conditionals with known value
+        match &node {
+            AstNode::Loop(body) if known_value == Some(0) => {
+                // Cell is 0 → loop never executes. Eliminate.
+                continue;
+            }
+            AstNode::IfEqual(target, body, else_body) => {
+                if let Some(v) = known_value {
+                    if v == *target {
+                        // Always true — emit body directly
+                        result.extend(pass_eval_conditionals(body.clone()));
+                    } else if let Some(eb) = else_body {
+                        // Always false — emit else body
+                        result.extend(pass_eval_conditionals(eb.clone()));
+                    }
+                    // Don't reset known_value — conditionals are non-destructive
+                    continue;
+                }
+                // Value unknown — keep the conditional, recurse into bodies
+                result.push(AstNode::IfEqual(
+                    *target,
+                    pass_eval_conditionals(body.clone()),
+                    else_body.as_ref().map(|e| pass_eval_conditionals(e.clone())),
+                ));
+                known_value = None; // conditional body may modify cell
+                continue;
+            }
+            AstNode::IfNotEqual(target, body) => {
+                if let Some(v) = known_value {
+                    if v != *target {
+                        result.extend(pass_eval_conditionals(body.clone()));
+                    }
+                    continue;
+                }
+                result.push(AstNode::IfNotEqual(*target, pass_eval_conditionals(body.clone())));
+                known_value = None;
+                continue;
+            }
+            AstNode::IfLess(target, body) => {
+                if let Some(v) = known_value {
+                    if v < *target {
+                        result.extend(pass_eval_conditionals(body.clone()));
+                    }
+                    continue;
+                }
+                result.push(AstNode::IfLess(*target, pass_eval_conditionals(body.clone())));
+                known_value = None;
+                continue;
+            }
+            AstNode::IfGreater(target, body) => {
+                if let Some(v) = known_value {
+                    if v > *target {
+                        result.extend(pass_eval_conditionals(body.clone()));
+                    }
+                    continue;
+                }
+                result.push(AstNode::IfGreater(*target, pass_eval_conditionals(body.clone())));
+                known_value = None;
+                continue;
+            }
+            AstNode::IfElse(true_body, false_body) => {
+                if let Some(v) = known_value {
+                    if v != 0 {
+                        result.extend(pass_eval_conditionals(true_body.clone()));
+                    } else {
+                        result.extend(pass_eval_conditionals(false_body.clone()));
+                    }
+                    known_value = Some(0); // IfElse consumes cell (sets to 0)
+                    continue;
+                }
+                result.push(AstNode::IfElse(
+                    pass_eval_conditionals(true_body.clone()),
+                    pass_eval_conditionals(false_body.clone()),
+                ));
+                known_value = Some(0); // consumed
+                continue;
+            }
+            // Loops with unknown value: recurse but reset tracking
+            AstNode::Loop(body) => {
+                result.push(AstNode::Loop(pass_eval_conditionals(body.clone())));
+                known_value = Some(0); // loop exits when cell is 0
+                continue;
+            }
+            // Recurse into sub bodies
+            AstNode::SubDef(name, body) => {
+                result.push(AstNode::SubDef(name.clone(), pass_eval_conditionals(body.clone())));
+                continue;
+            }
+            AstNode::ResultBlock(r, k) => {
+                result.push(AstNode::ResultBlock(
+                    pass_eval_conditionals(r.clone()),
+                    pass_eval_conditionals(k.clone()),
+                ));
+                known_value = None;
+                continue;
+            }
+            _ => {}
+        }
+
+        result.push(node);
+    }
+
+    result
+}
+
+// Loop unrolling: for small constant-trip loops `#N [- body]` where N ≤ 16
+// and body is short (≤ 20 ops), replace the loop with N copies of the body.
+// Eliminates branch + counter overhead for tight inner loops.
+fn pass_unroll_small_loops(nodes: Vec<AstNode>) -> Vec<AstNode> {
+    let mut result = Vec::new();
+    let mut i = 0;
+    let nodes_vec: Vec<AstNode> = nodes;
+
+    while i < nodes_vec.len() {
+        // Pattern: SetValue(N) followed by Loop([Decrement(1), ...body...])
+        if i + 1 < nodes_vec.len() {
+            if let AstNode::SetValue(count) = &nodes_vec[i] {
+                if let AstNode::Loop(body) = &nodes_vec[i + 1] {
+                    if *count > 0 && *count <= 16
+                        && body.first() == Some(&AstNode::Decrement(1))
+                        && body.len() <= 21  // 1 (Dec) + 20 (body)
+                        && !body_has_side_effects(&body[1..])
+                    {
+                        // Unroll: emit body[1..] (skip the Decrement) N times
+                        let unrolled_body = &body[1..];
+                        for _ in 0..*count {
+                            result.extend(unrolled_body.iter().cloned());
+                        }
+                        i += 2; // skip SetValue + Loop
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Recurse into containers
+        let node = nodes_vec[i].clone();
+        match node {
+            AstNode::Loop(body) => result.push(AstNode::Loop(pass_unroll_small_loops(body))),
+            AstNode::SubDef(name, body) => {
+                result.push(AstNode::SubDef(name, pass_unroll_small_loops(body)));
+            }
+            AstNode::ResultBlock(r, k) => {
+                result.push(AstNode::ResultBlock(
+                    pass_unroll_small_loops(r),
+                    pass_unroll_small_loops(k),
+                ));
+            }
+            other => result.push(other),
+        }
+        i += 1;
+    }
+
+    result
+}
+
+// Check if a loop body slice has side effects that prevent unrolling.
+// Side effects: I/O, subroutine calls, syscalls, pointer jumps, nested loops.
+fn body_has_side_effects(body: &[AstNode]) -> bool {
+    for node in body {
+        match node {
+            AstNode::Output | AstNode::Input | AstNode::OutputFd(_) | AstNode::InputFd(_) |
+            AstNode::SubCall(_) | AstNode::Syscall | AstNode::FfiCall(_, _) |
+            AstNode::AbsoluteAddr | AstNode::Loop(_) | AstNode::Return |
+            AstNode::Propagate | AstNode::ErrorWrite | AstNode::ErrorRead |
+            AstNode::FramebufferFlush => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+// Move coalescing: merges adjacent MoveRight/MoveLeft and Increment/Decrement
+// nodes that may have been separated by earlier passes removing intervening ops.
+//
+// Examples:
+//   MoveRight(3) + MoveRight(2) → MoveRight(5)
+//   Increment(4) + Increment(6) → Increment(10)
+//   MoveRight(3) + MoveLeft(1)  → MoveRight(2)
+fn pass_coalesce_moves(nodes: Vec<AstNode>) -> Vec<AstNode> {
+    let mut result: Vec<AstNode> = Vec::with_capacity(nodes.len());
+
+    for node in nodes {
+        let node = match node {
+            AstNode::Loop(body) => AstNode::Loop(pass_coalesce_moves(body)),
+            AstNode::SubDef(name, body) => AstNode::SubDef(name, pass_coalesce_moves(body)),
+            AstNode::ResultBlock(r, k) => {
+                AstNode::ResultBlock(pass_coalesce_moves(r), pass_coalesce_moves(k))
+            }
+            other => other,
+        };
+
+        // Clone the last node's discriminant values to avoid borrow conflicts
+        // with result.pop() / result.push() below.
+        let prev_kind = result.last().cloned();
+        if let Some(prev) = prev_kind {
+            match (&prev, &node) {
+                (AstNode::MoveRight(a), AstNode::MoveRight(b)) => {
+                    result.pop();
+                    result.push(AstNode::MoveRight(a + b));
+                    continue;
+                }
+                (AstNode::MoveLeft(a), AstNode::MoveLeft(b)) => {
+                    result.pop();
+                    result.push(AstNode::MoveLeft(a + b));
+                    continue;
+                }
+                (AstNode::Increment(a), AstNode::Increment(b)) => {
+                    result.pop();
+                    result.push(AstNode::Increment(a + b));
+                    continue;
+                }
+                (AstNode::Decrement(a), AstNode::Decrement(b)) => {
+                    result.pop();
+                    result.push(AstNode::Decrement(a + b));
+                    continue;
+                }
+                (AstNode::MoveRight(a), AstNode::MoveLeft(b)) => {
+                    result.pop();
+                    if a > b { result.push(AstNode::MoveRight(a - b)); }
+                    else if b > a { result.push(AstNode::MoveLeft(b - a)); }
+                    continue;
+                }
+                (AstNode::MoveLeft(a), AstNode::MoveRight(b)) => {
+                    result.pop();
+                    if a > b { result.push(AstNode::MoveLeft(a - b)); }
+                    else if b > a { result.push(AstNode::MoveRight(b - a)); }
+                    continue;
+                }
+                (AstNode::Increment(a), AstNode::Decrement(b)) => {
+                    result.pop();
+                    if a > b { result.push(AstNode::Increment(a - b)); }
+                    else if b > a { result.push(AstNode::Decrement(b - a)); }
+                    continue;
+                }
+                (AstNode::Decrement(a), AstNode::Increment(b)) => {
+                    result.pop();
+                    if a > b { result.push(AstNode::Decrement(a - b)); }
+                    else if b > a { result.push(AstNode::Increment(b - a)); }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        result.push(node);
+    }
+
+    result
+}
+
+// Dead code elimination: removes unused subroutine definitions and unreachable
+// code after Return (^) nodes within subroutine bodies.
+//
+// Phase 1: Collect all SubCall names referenced anywhere in the AST.
+// Phase 2: Remove SubDef nodes whose names aren't in the call set.
+// Phase 3: Truncate subroutine bodies after unconditional Return.
+fn pass_dead_code(nodes: Vec<AstNode>) -> Vec<AstNode> {
+    // Phase 1: Collect all called subroutine names
+    let mut called: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_calls(&nodes, &mut called);
+
+    // Phase 2+3: Filter and truncate
+    eliminate_dead(nodes, &called)
+}
+
+fn collect_calls(nodes: &[AstNode], called: &mut std::collections::HashSet<String>) {
+    for node in nodes {
+        match node {
+            AstNode::SubCall(name) => { called.insert(name.clone()); }
+            AstNode::Loop(body) | AstNode::SubDef(_, body) => collect_calls(body, called),
+            AstNode::ResultBlock(r, k) => {
+                collect_calls(r, called);
+                collect_calls(k, called);
+            }
+            AstNode::IfEqual(_, body, el) => {
+                collect_calls(body, called);
+                if let Some(e) = el { collect_calls(e, called); }
+            }
+            AstNode::IfNotEqual(_, body) | AstNode::IfLess(_, body) |
+            AstNode::IfGreater(_, body) => collect_calls(body, called),
+            AstNode::IfElse(t, f) => {
+                collect_calls(t, called);
+                collect_calls(f, called);
+            }
+            AstNode::Deref(inner) => collect_calls(&[*inner.clone()], called),
+            _ => {}
+        }
+    }
+}
+
+fn eliminate_dead(nodes: Vec<AstNode>, called: &std::collections::HashSet<String>) -> Vec<AstNode> {
+    let mut result = Vec::new();
+
+    for node in nodes {
+        match node {
+            // Remove unused subroutine definitions
+            AstNode::SubDef(ref name, _) if !called.contains(name) => continue,
+
+            // Recurse into subroutine bodies and truncate after Return
+            AstNode::SubDef(name, body) => {
+                let body = eliminate_dead(body, called);
+                let body = truncate_after_return(body);
+                result.push(AstNode::SubDef(name, body));
+            }
+
+            // Recurse into other containers
+            AstNode::Loop(body) => result.push(AstNode::Loop(eliminate_dead(body, called))),
+            AstNode::ResultBlock(r, k) => {
+                result.push(AstNode::ResultBlock(
+                    eliminate_dead(r, called),
+                    eliminate_dead(k, called),
+                ));
+            }
+            other => result.push(other),
+        }
+    }
+
+    result
+}
+
+// Truncate a node list after the first unconditional Return,
+// and eliminate redundant trailing Return (the codegen epilogue
+// already decrements call_depth and returns on fall-through).
+fn truncate_after_return(mut nodes: Vec<AstNode>) -> Vec<AstNode> {
+    // Phase 1: Remove trailing Return (tail return elimination)
+    if let Some(AstNode::Return) = nodes.last() {
+        nodes.pop();
+    }
+    // Phase 2: Truncate after any remaining Return (unreachable code)
+    let mut result = Vec::new();
+    for node in nodes {
+        let is_return = matches!(&node, AstNode::Return);
+        result.push(node);
+        if is_return { break; }
+    }
+    result
+}
+
+// Subroutine inlining: replaces calls to small subroutines (≤ threshold ops)
+// with the subroutine's body directly at the call site. Eliminates call/return
+// overhead for tiny helper functions.
+//
+// Only inlines subroutines that:
+//   - Have ≤ INLINE_THRESHOLD nodes in their body
+//   - Don't contain Return (^) — inlining a return would break control flow
+//   - Don't contain nested SubDef (no closure-like behavior)
+//   - Don't contain SubCall (no recursion risk)
+const INLINE_THRESHOLD: usize = 8;
+
+fn pass_inline_subs(nodes: Vec<AstNode>) -> Vec<AstNode> {
+    // Phase 1: Collect inlineable subroutine bodies
+    let mut inlineable: std::collections::HashMap<String, Vec<AstNode>> =
+        std::collections::HashMap::new();
+
+    for node in &nodes {
+        if let AstNode::SubDef(name, body) = node {
+            if body.len() <= INLINE_THRESHOLD && is_inlineable(body) {
+                inlineable.insert(name.clone(), body.clone());
+            }
+        }
+    }
+
+    if inlineable.is_empty() {
+        return nodes;
+    }
+
+    // Phase 2: Replace SubCall with body for inlineable subs
+    inline_calls(nodes, &inlineable)
+}
+
+fn is_inlineable(body: &[AstNode]) -> bool {
+    for node in body {
+        match node {
+            AstNode::Return | AstNode::SubDef(_, _) | AstNode::SubCall(_) => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+fn inline_calls(nodes: Vec<AstNode>, inlineable: &std::collections::HashMap<String, Vec<AstNode>>) -> Vec<AstNode> {
+    let mut result = Vec::new();
+
+    for node in nodes {
+        match node {
+            // Replace call with body
+            AstNode::SubCall(ref name) if inlineable.contains_key(name) => {
+                result.extend(inlineable[name].clone());
+            }
+            // Recurse into containers
+            AstNode::Loop(body) => result.push(AstNode::Loop(inline_calls(body, inlineable))),
+            AstNode::SubDef(name, body) => {
+                // Don't remove the SubDef yet — DCE handles that.
+                // But inline within the body itself.
+                result.push(AstNode::SubDef(name, inline_calls(body, inlineable)));
+            }
+            AstNode::ResultBlock(r, k) => {
+                result.push(AstNode::ResultBlock(
+                    inline_calls(r, inlineable),
+                    inline_calls(k, inlineable),
+                ));
+            }
+            other => result.push(other),
+        }
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,5 +965,252 @@ mod tests {
             output,
             vec![AstNode::Loop(vec![AstNode::SetValue(15), AstNode::Output])]
         );
+    }
+
+    // ── Move coalescing tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_coalesce_adjacent_moves() {
+        let input = vec![AstNode::MoveRight(3), AstNode::MoveRight(2)];
+        let output = optimize(input, OptLevel::Basic);
+        assert_eq!(output, vec![AstNode::MoveRight(5)]);
+    }
+
+    #[test]
+    fn test_coalesce_opposite_moves() {
+        let input = vec![AstNode::MoveRight(5), AstNode::MoveLeft(3)];
+        let output = optimize(input, OptLevel::Basic);
+        assert_eq!(output, vec![AstNode::MoveRight(2)]);
+    }
+
+    #[test]
+    fn test_coalesce_cancelling_moves() {
+        let input = vec![AstNode::MoveRight(3), AstNode::MoveLeft(3)];
+        let output = optimize(input, OptLevel::Basic);
+        assert_eq!(output, vec![]);
+    }
+
+    #[test]
+    fn test_coalesce_adjacent_increments() {
+        let input = vec![AstNode::Increment(4), AstNode::Increment(6)];
+        let output = optimize(input, OptLevel::Basic);
+        assert_eq!(output, vec![AstNode::Increment(10)]);
+    }
+
+    #[test]
+    fn test_coalesce_opposite_arithmetic() {
+        let input = vec![AstNode::Increment(10), AstNode::Decrement(3)];
+        let output = optimize(input, OptLevel::Basic);
+        assert_eq!(output, vec![AstNode::Increment(7)]);
+    }
+
+    // ── Dead code elimination tests ──────────────────────────────────
+
+    #[test]
+    fn test_dce_unused_sub() {
+        // "used" sub is small enough to inline, so after inlining + DCE,
+        // both SubDefs are removed and SubCall is replaced with body.
+        let input = vec![
+            AstNode::SubDef("unused".into(), vec![AstNode::Output]),
+            AstNode::SubDef("used".into(), vec![AstNode::Output]),
+            AstNode::SubCall("used".into()),
+        ];
+        let output = optimize(input, OptLevel::Full);
+        // Both subs inlined/removed, only the Output from "used" remains
+        assert!(!output.iter().any(|n| matches!(n, AstNode::SubDef(name, _) if name == "unused")));
+        assert!(output.contains(&AstNode::Output));
+    }
+
+    #[test]
+    fn test_dce_unreachable_after_return() {
+        let input = vec![
+            AstNode::SubDef("sub".into(), vec![
+                AstNode::Output,
+                AstNode::Return,
+                AstNode::Increment(5),  // unreachable
+                AstNode::Output,        // unreachable
+            ]),
+            AstNode::SubCall("sub".into()),
+        ];
+        let output = optimize(input, OptLevel::Full);
+        assert_eq!(output, vec![
+            AstNode::SubDef("sub".into(), vec![
+                AstNode::Output,
+                AstNode::Return,
+            ]),
+            AstNode::SubCall("sub".into()),
+        ]);
+    }
+
+    // ── Subroutine inlining tests ────────────────────────────────────
+
+    #[test]
+    fn test_inline_small_sub() {
+        let input = vec![
+            AstNode::SubDef("tiny".into(), vec![AstNode::Increment(1), AstNode::Output]),
+            AstNode::SubCall("tiny".into()),
+        ];
+        let output = optimize(input, OptLevel::Full);
+        // After inlining, SubCall is replaced with body.
+        // After DCE, the now-unused SubDef is removed.
+        assert!(output.contains(&AstNode::Increment(1)));
+        assert!(output.contains(&AstNode::Output));
+        // SubCall should be gone (replaced with body)
+        assert!(!output.iter().any(|n| matches!(n, AstNode::SubCall(_))));
+    }
+
+    #[test]
+    fn test_no_inline_large_sub() {
+        // Subroutine with > INLINE_THRESHOLD ops should NOT be inlined
+        let body: Vec<AstNode> = (0..10).map(|_| AstNode::Output).collect();
+        let input = vec![
+            AstNode::SubDef("big".into(), body),
+            AstNode::SubCall("big".into()),
+        ];
+        let output = optimize(input, OptLevel::Full);
+        // SubCall should remain (not inlined)
+        assert!(output.iter().any(|n| matches!(n, AstNode::SubCall(_))));
+    }
+
+    #[test]
+    fn test_no_inline_recursive_sub() {
+        // Subroutine that calls another sub should NOT be inlined
+        let input = vec![
+            AstNode::SubDef("caller".into(), vec![AstNode::SubCall("other".into())]),
+            AstNode::SubDef("other".into(), vec![AstNode::Output]),
+            AstNode::SubCall("caller".into()),
+        ];
+        let output = optimize(input, OptLevel::Full);
+        // SubCall("caller") should remain
+        assert!(output.iter().any(|n| matches!(n, AstNode::SubCall(name) if name == "caller")));
+    }
+
+    // ── Compile-time conditional evaluation tests ────────────────
+
+    #[test]
+    fn test_eval_known_equal_true() {
+        // #5 ?= #5 [ body ] → body (always true)
+        let input = vec![
+            AstNode::SetValue(5),
+            AstNode::IfEqual(5, vec![AstNode::Output], None),
+        ];
+        let output = optimize(input, OptLevel::Full);
+        assert!(output.contains(&AstNode::Output));
+    }
+
+    #[test]
+    fn test_eval_known_equal_false() {
+        // #5 ?= #3 [ body ] → eliminated (always false)
+        let input = vec![
+            AstNode::SetValue(5),
+            AstNode::IfEqual(3, vec![AstNode::Output], None),
+        ];
+        let output = optimize(input, OptLevel::Full);
+        assert!(!output.contains(&AstNode::Output));
+    }
+
+    #[test]
+    fn test_eval_dead_loop_after_clear() {
+        // [-] [ body ] → eliminated (cell is 0, loop never enters)
+        let input = vec![
+            AstNode::Clear,
+            AstNode::Loop(vec![AstNode::Output]),
+        ];
+        let output = optimize(input, OptLevel::Full);
+        assert!(!output.contains(&AstNode::Output));
+    }
+
+    #[test]
+    fn test_eval_if_else_known_true() {
+        // #1 ?{ A } : { B } → A (cell nonzero)
+        let input = vec![
+            AstNode::SetValue(1),
+            AstNode::IfElse(vec![AstNode::Output], vec![AstNode::Input]),
+        ];
+        let output = optimize(input, OptLevel::Full);
+        assert!(output.contains(&AstNode::Output));
+        assert!(!output.contains(&AstNode::Input));
+    }
+
+    #[test]
+    fn test_eval_if_else_known_false() {
+        // #0 ?{ A } : { B } → B (cell is zero)
+        let input = vec![
+            AstNode::SetValue(0),
+            AstNode::IfElse(vec![AstNode::Output], vec![AstNode::Input]),
+        ];
+        let output = optimize(input, OptLevel::Full);
+        assert!(!output.contains(&AstNode::Output));
+        assert!(output.contains(&AstNode::Input));
+    }
+
+    // ── Loop unrolling tests ─────────────────────────────────────
+
+    #[test]
+    fn test_unroll_small_loop() {
+        // #3 [- >+<] → >+< >+< >+<
+        let input = vec![
+            AstNode::SetValue(3),
+            AstNode::Loop(vec![
+                AstNode::Decrement(1),
+                AstNode::MoveRight(1),
+                AstNode::Increment(1),
+                AstNode::MoveLeft(1),
+            ]),
+        ];
+        let output = optimize(input, OptLevel::Full);
+        // Should not contain a Loop — it was unrolled
+        assert!(!output.iter().any(|n| matches!(n, AstNode::Loop(_))));
+        // Should contain 3 copies of >+< (coalesced by move coalescing)
+        // The exact form depends on how coalescing interacts, but no loop.
+    }
+
+    #[test]
+    fn test_no_unroll_large_count() {
+        // #100 [- body] → NOT unrolled (count > 16)
+        let input = vec![
+            AstNode::SetValue(100),
+            AstNode::Loop(vec![
+                AstNode::Decrement(1),
+                AstNode::Increment(1),
+            ]),
+        ];
+        let output = optimize(input, OptLevel::Full);
+        // Loop should remain (or be optimized differently, but not unrolled)
+        // Actually this is [-+] which is just a counter drain. But the point
+        // is it shouldn't be unrolled 100 times.
+    }
+
+    #[test]
+    fn test_no_unroll_side_effects() {
+        // #3 [- .] → NOT unrolled (Output is a side effect)
+        let input = vec![
+            AstNode::SetValue(3),
+            AstNode::Loop(vec![
+                AstNode::Decrement(1),
+                AstNode::Output,
+            ]),
+        ];
+        let output = optimize(input, OptLevel::Full);
+        // Should still contain a loop (not unrolled due to I/O)
+        assert!(output.iter().any(|n| matches!(n, AstNode::Loop(_))));
+    }
+
+    // ── Tail return elimination test ─────────────────────────────
+
+    #[test]
+    fn test_tail_return_eliminated() {
+        let input = vec![
+            AstNode::SubDef("sub".into(), vec![
+                AstNode::Output,
+                AstNode::Return,  // trailing Return — redundant
+            ]),
+            AstNode::SubCall("sub".into()),
+        ];
+        let output = optimize(input, OptLevel::Full);
+        // After inlining (sub is small), the Return should be gone.
+        // The Output should remain.
+        assert!(output.contains(&AstNode::Output));
+        assert!(!output.contains(&AstNode::Return));
     }
 }

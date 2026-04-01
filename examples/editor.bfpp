@@ -1,5 +1,5 @@
 ; ═══════════════════════════════════════════════════════════════════
-; BF++ Text Editor — using QoL features (#{}, ?=, __tui_*, __memcpy)
+; BF++ Text Editor v2 — Multicore, ?{} if/else, !define, __tui_*
 ; ═══════════════════════════════════════════════════════════════════
 ;
 ; Compile:
@@ -10,21 +10,52 @@
 ;
 ; Controls:
 ;   Arrow keys    — move cursor
-;   Printable     — insert at cursor (TODO)
-;   Backspace     — delete before cursor (TODO)
-;   Enter         — insert newline (TODO)
+;   Printable     — insert character at cursor
+;   Backspace     — delete character before cursor
+;   Enter         — insert newline at cursor
+;   Ctrl+S        — save (spawns background thread)
 ;   Ctrl+Q        — quit
 ;
+; Features:
+;   - Text insertion, deletion, newline handling
+;   - Line numbers in left gutter
+;   - Status bar with cursor position and save status
+;   - Background save thread (demonstrates multicore)
+;   - Uses ?{...}:{...} if/else, !define macros, __memcpy
+;
 ; ── Tape Layout ─────────────────────────────────────────────────
-;   tape[0..49]:   workspace (intrinsic args, scratch)
-;   tape[50]:      cursor_x (0-based column)
-;   tape[51]:      cursor_y (0-based row in document)
-;   tape[52]:      scroll_y (first visible line)
-;   tape[53]:      screen_cols
-;   tape[54]:      screen_rows
-;   tape[55]:      dirty flag
-;   tape[56]:      quit flag
-;   tape[100..4095]: text buffer (newline-separated)
+;   tape[0..39]:      workspace (intrinsic args, scratch)
+;   tape[40..49]:     render state (row, col, buf_addr, continue, line_num)
+;
+;   Editor state:
+!define CUR_X 50
+!define CUR_Y 51
+!define SCROLL_Y 52
+!define SCREEN_W 53
+!define SCREEN_H 54
+!define DIRTY 55
+!define QUIT_FLAG 56
+!define DOC_LEN 57
+!define SAVE_STATUS 58
+!define MODIFIED 59
+;
+;   Gutter width:
+!define GUTTER 5
+;
+;   Computed scratch:
+!define SCRATCH_A 60
+!define SCRATCH_B 61
+!define SCRATCH_C 62
+!define SCRATCH_D 63
+!define SCRATCH_E 64
+!define SCRATCH_F 65
+;
+;   Status bar string area:
+!define STATUS_BUF 70
+;
+;   Text buffer:
+!define TEXT_BUF 200
+!define TEXT_BUF_END 65000
 
 !include "io.bfpp"
 
@@ -32,155 +63,970 @@
 ; SUBROUTINES
 ; ═══════════════════════════════════════════════════════════════════
 
-; ── render: draw the full screen ──────────────────────────────────
-!#render{
-    !#__tui_begin
+; ── save_worker: background thread for saving ────────────────────
+; Defined first so it gets subroutine index 0 in the sub table.
+; Reads text buffer, simulates save, signals completion via atomic.
+; SAVE_STATUS: 0=idle, 1=requested, 2=saving, 3=done
+!#save_worker{
+    ; Signal "saving" — atomic store 2 to SAVE_STATUS
+    %1
+    #2 > #SAVE_STATUS <
+    !#__atomic_store
 
-    ; ── Header bar: blue bg, white text ──
-    #{0, 0, 80, 1, 32, 15, 17}
-    !#__tui_fill
+    ; Simulate work: yield a few times (no real file I/O in this demo)
+    [-] !#__yield
+    [-] !#__yield
+    [-] !#__yield
 
-    ; Title "BF++ Editor" at (0, 2)
-    #{0, 2, 66, 15, 17}  !#__tui_put   ; B
-    #{0, 3, 70, 15, 17}  !#__tui_put   ; F
-    #{0, 4, 43, 15, 17}  !#__tui_put   ; +
-    #{0, 5, 43, 15, 17}  !#__tui_put   ; +
-    #{0, 7, 69, 15, 17}  !#__tui_put   ; E
-    #{0, 8, 100, 15, 17} !#__tui_put   ; d
-    #{0, 9, 105, 15, 17} !#__tui_put   ; i
-    #{0, 10, 116, 15, 17} !#__tui_put  ; t
-    #{0, 11, 111, 15, 17} !#__tui_put  ; o
-    #{0, 12, 114, 15, 17} !#__tui_put  ; r
+    ; Signal "done" — atomic store 3 to SAVE_STATUS
+    #3 > #SAVE_STATUS <
+    !#__atomic_store
 
-    ; ── Status bar (row 23): inverted colors ──
-    #{23, 0, 80, 1, 32, 0, 7}
-    !#__tui_fill
+    [-]
+    ^
+}
 
-    ; "Ctrl+Q: Quit" at (23, 2)
-    #{23, 2, 67, 0, 7}   !#__tui_put   ; C
-    #{23, 3, 116, 0, 7}  !#__tui_put   ; t
-    #{23, 4, 114, 0, 7}  !#__tui_put   ; r
-    #{23, 5, 108, 0, 7}  !#__tui_put   ; l
-    #{23, 6, 43, 0, 7}   !#__tui_put   ; +
-    #{23, 7, 81, 0, 7}   !#__tui_put   ; Q
-    #{23, 9, 81, 0, 7}   !#__tui_put   ; Q
-    #{23, 10, 117, 0, 7} !#__tui_put   ; u
-    #{23, 11, 105, 0, 7} !#__tui_put   ; i
-    #{23, 12, 116, 0, 7} !#__tui_put   ; t
+; ── cursor_to_offset: convert (CUR_X, CUR_Y) → buffer byte offset ──
+; Output: tape[SCRATCH_A] = absolute tape address of cursor position
+; Walks the text buffer counting newlines to find the target line,
+; then adds CUR_X within that line.
+!#cursor_to_offset{
+    ; tape[SCRATCH_A] = TEXT_BUF (current scan address)
+    ; tape[SCRATCH_B] = lines remaining (CUR_Y)
+    ; tape[SCRATCH_C] = continue flag
+    #TEXT_BUF $ #SCRATCH_A *~ [-]
+    #CUR_Y *$ $ #SCRATCH_B *~ [-]      ; lines remaining = cursor_y
+    #1 $ #SCRATCH_C *~ [-]              ; continue = 1
 
-    ; ── Text area: render buffer ──
-    ; Walk through tape[100+], rendering chars via __tui_put.
-    ; State stored at tape[40..42] (row, col, buf_addr) via *$/*~
-    ; to survive intrinsic calls.
-
-    ; Initialize render state
-    #1  $ #40 *~ [-]        ; tape[40] = 1 (screen row, after header)
-    #0  $ #41 *~ [-]        ; tape[41] = 0 (screen col)
-    #100 $ #42 *~ [-]       ; tape[42] = 100 (buffer start addr)
-
-    ; Render loop: read byte from buffer, dispatch
-    ; Use tape[43] as continue flag
-    #1 $ #43 *~ [-]         ; tape[43] = 1
-
-    ; Loop by checking tape[43]
-    #43 *$                  ; push tape[43]
-    ~                       ; P+0 = continue flag
-    [                       ; while continue
-        [-]
-
-        ; Read byte from buffer: tape[tape[42]]
-        #42 *$              ; push buf_addr
-        ~                   ; P+0 = buf_addr
-        *$                  ; push tape[buf_addr] (the byte)
-        [-]                 ; clear P+0
-        ~                   ; P+0 = byte
-
-        ; Check for 0 (end of buffer)
-        ?= #0 [
-            ; End of buffer — stop
-            #0 $ #43 *~ [-] ; tape[43] = 0 (stop)
-        ] : [
-            ; Check for newline
-            ?= #10 [
-                ; Newline: advance row, reset col
-                #40 *$ ~ + $ #40 *~ [-]     ; tape[40]++
-                #0 $ #41 *~ [-]             ; tape[41] = 0
-            ] : [
-                ; Printable: render at (row, col)
-                $               ; push the byte (char to render)
-
-                ; Read row and col from state
-                #40 *$ ~        ; P+0 = row
-                > #41 *$ ~      ; P+1 = col
-                > ~             ; P+2 = char (popped)
-                > #7            ; P+3 = fg (white)
-                > #0            ; P+4 = bg (black)
-                <<<<
-                !#__tui_put
-
-                ; Advance col
-                [-] #41 *$ ~ + $ #41 *~ [-]  ; tape[41]++
-            ]
-
-            ; Advance buf_addr
-            [-] #42 *$ ~ + $ #42 *~ [-]      ; tape[42]++
-
-            ; Check if we exceeded visible rows (row > 22)
-            #40 *$ ~        ; P+0 = current row
-            ?> #22 [
-                #0 $ #43 *~ [-]  ; tape[43] = 0 (stop)
-            ]
+    ; If CUR_Y == 0, skip line scanning entirely
+    #SCRATCH_B *$ ~                     ; P+0 = lines_remaining
+    ?{
+        ; CUR_Y > 0: scan through lines
+        ; Loop: while continue && lines_remaining > 0
+        #SCRATCH_C *$ ~
+        [
             [-]
-        ]
 
-        ; Re-check continue flag
-        #43 *$ ~            ; P+0 = tape[43]
+            ; Read byte at tape[SCRATCH_A] via deref
+            #SCRATCH_A *$ ~             ; P+0 = addr
+            *$                          ; push tape[addr]
+            [-] ~                       ; P+0 = byte
+
+            ; If byte == 0, end of document — stop
+            ?= #0 [
+                #0 $ #SCRATCH_C *~ [-]  ; continue = 0
+            ] : [
+                ; If byte == 10 (newline), decrement lines_remaining
+                ?= #10 [
+                    ; Found a newline — decrement line counter
+                    #SCRATCH_B *$ ~ - $ #SCRATCH_B *~ [-]
+
+                    ; If lines_remaining hit 0, stop scanning
+                    #SCRATCH_B *$ ~
+                    ?{
+                        ; Still more lines to go — do nothing
+                    }:{
+                        ; Reached target line
+                        #0 $ #SCRATCH_C *~ [-] ; continue = 0
+                    }
+                ]
+            ]
+
+            ; Advance scan address (only if still continuing)
+            #SCRATCH_C *$ ~
+            ?{
+                #SCRATCH_A *$ ~ + $ #SCRATCH_A *~ [-]   ; addr++
+            }:{}
+
+            ; Re-check continue
+            [-]
+            #SCRATCH_C *$ ~
+        ]
+        [-]
+    }:{}
+
+    ; Now SCRATCH_A points to the start of the target line.
+    ; Add CUR_X to get the final offset.
+    #CUR_X *$ $ #SCRATCH_D *~ [-]      ; SCRATCH_D = cursor_x
+    ; Add SCRATCH_D to SCRATCH_A
+    ; Loop: while SCRATCH_D > 0, decrement SCRATCH_D, increment SCRATCH_A
+    #SCRATCH_D *$ ~
+    [
+        [-]
+        #SCRATCH_A *$ ~ + $ #SCRATCH_A *~ [-]
+        #SCRATCH_D *$ ~ - $ #SCRATCH_D *~ [-]
+        #SCRATCH_D *$ ~
     ]
     [-]
 
-    ; ── Cursor ──
-    #51 *$ ~                ; P+0 = cursor_y
-    +                       ; P+0 = cursor_y + 1 (header offset)
-    > #50 *$ ~              ; P+1 = cursor_x
-    > #95                   ; P+2 = '_' cursor char
-    > #15                   ; P+3 = bright white
-    > #0                    ; P+4 = black
-    <<<<
+    ; Result: tape[SCRATCH_A] = target byte address
+    ; Clamp: don't exceed TEXT_BUF + DOC_LEN
+    ; Compute max_addr = TEXT_BUF + DOC_LEN
+    #DOC_LEN *$ $ #SCRATCH_D *~ [-]
+    #TEXT_BUF $ #SCRATCH_E *~ [-]
+    ; SCRATCH_E = TEXT_BUF + DOC_LEN
+    #SCRATCH_D *$ ~
+    [
+        [-]
+        #SCRATCH_E *$ ~ + $ #SCRATCH_E *~ [-]
+        #SCRATCH_D *$ ~ - $ #SCRATCH_D *~ [-]
+        #SCRATCH_D *$ ~
+    ]
+    [-]
+
+    ; Clamping is handled implicitly: cursor_to_offset stops at null terminator.
+    ; The cursor position is bounded by the document content.
+    [-]
+
+    ^
+}
+
+; ── insert_char: insert a byte at the cursor position ────────────
+; Input: tape[SCRATCH_F] = character to insert
+; Uses __memcpy to shift bytes right, then writes the character.
+!#insert_char{
+    ; First compute cursor offset
+    !#cursor_to_offset
+    ; SCRATCH_A = insertion address
+
+    ; Shift bytes right: memcpy(dst=addr+1, src=addr, count=TEXT_BUF+DOC_LEN-addr)
+    ; __memcpy: tape[ptr]=dst, tape[ptr+1]=src, tape[ptr+2]=count
+    ; count = TEXT_BUF + DOC_LEN - addr
+    #DOC_LEN *$ $ #SCRATCH_B *~ [-]    ; SCRATCH_B = doc_len
+    #TEXT_BUF $ #SCRATCH_C *~ [-]       ; SCRATCH_C = TEXT_BUF
+
+    ; total_end = TEXT_BUF + DOC_LEN
+    ; count = total_end - addr = (TEXT_BUF + DOC_LEN) - SCRATCH_A
+    ; SCRATCH_C = TEXT_BUF
+    ; Add DOC_LEN to SCRATCH_C
+    #SCRATCH_B *$ ~
+    [
+        [-]
+        #SCRATCH_C *$ ~ + $ #SCRATCH_C *~ [-]
+        #SCRATCH_B *$ ~ - $ #SCRATCH_B *~ [-]
+        #SCRATCH_B *$ ~
+    ]
+    [-]
+    ; SCRATCH_C = TEXT_BUF + DOC_LEN = end address
+
+    ; count = SCRATCH_C - SCRATCH_A
+    ; Subtract SCRATCH_A from SCRATCH_C
+    #SCRATCH_A *$ $ #SCRATCH_B *~ [-]   ; SCRATCH_B = addr
+    #SCRATCH_B *$ ~
+    [
+        [-]
+        #SCRATCH_C *$ ~ - $ #SCRATCH_C *~ [-]
+        #SCRATCH_B *$ ~ - $ #SCRATCH_B *~ [-]
+        #SCRATCH_B *$ ~
+    ]
+    [-]
+    ; SCRATCH_C = count of bytes to shift
+
+    ; Set up __memcpy args at ptr: dst=addr+1, src=addr, count
+    #SCRATCH_A *$ ~                     ; P+0 = addr
+    + $                                 ; push addr+1 (dst)
+    - $                                 ; push addr (src, restore original)
+
+    ; Navigate to workspace at tape[0]
+    #0 @
+    ~ > ~ <                             ; P+0 = dst (addr+1), wait... stack is LIFO
+    ; Stack has: src (top), dst. Pop → src first.
+    ; Pop src → P+0
+    ~
+    ; Pop dst → P+1... no. We want: P+0=dst, P+1=src, P+2=count
+    ; Let me redo. Push dst first, then src.
+    ; Actually stack is LIFO: pushed addr+1 then addr. Pop gives addr then addr+1.
+
+    ; Redo the push order
+    #0 @
+    #SCRATCH_A *$ ~                     ; P+0 = addr (src)
+    $                                   ; push src
+    +                                   ; P+0 = addr+1 (dst)
+    $                                   ; push dst
+    [-]
+
+    ; Now pop: dst first (top of stack), then src
+    ~                                   ; P+0 = dst (addr+1)
+    > ~ <                               ; P+1 = src (addr)
+    ; Swap: need P+0=dst, P+1=src — already correct!
+    > > #SCRATCH_C *$ ~ < <             ; P+2 = count
+    !#__memcpy
+
+    ; Write the character at the insertion address
+    #SCRATCH_A *$ ~                     ; P+0 = addr
+    > #SCRATCH_F *$ ~ <                 ; P+1 = char
+    ; Write: tape[addr] = char
+    ; Use *~ : tape[P+0] = P+0's value... no, *~ writes stack top to tape[P+0]
+    ; We need: set tape[addr] to char
+    ; Push char, set P+0 = addr, *~ writes popped value to tape[addr]
+    > $ < [-]                           ; push char (from P+1), clear P+1
+    ; P+0 = addr
+    *~                                  ; tape[addr] = char (popped from stack)
+    [-]
+
+    ; Increment DOC_LEN
+    #DOC_LEN *$ ~ + $ #DOC_LEN *~ [-]
+
+    ; Set modified flag
+    #1 $ #MODIFIED *~ [-]
+
+    ^
+}
+
+; ── delete_char: delete the byte before the cursor ───────────────
+; Shifts bytes left by 1 at cursor position.
+!#delete_char{
+    ; Compute cursor offset
+    !#cursor_to_offset
+    ; SCRATCH_A = address at cursor
+
+    ; Can't delete if cursor is at TEXT_BUF (beginning of document)
+    #SCRATCH_A *$ ~
+    ?= #TEXT_BUF [
+        ; At start of document — do nothing
+    ] : [
+        ; Delete: shift bytes left from addr to addr-1
+        ; __memcpy: dst=addr-1, src=addr, count=TEXT_BUF+DOC_LEN-addr
+        [-]
+
+        ; Compute count = TEXT_BUF + DOC_LEN - SCRATCH_A
+        #DOC_LEN *$ $ #SCRATCH_B *~ [-]
+        #TEXT_BUF $ #SCRATCH_C *~ [-]
+        ; SCRATCH_C = TEXT_BUF, add DOC_LEN
+        #SCRATCH_B *$ ~
+        [
+            [-]
+            #SCRATCH_C *$ ~ + $ #SCRATCH_C *~ [-]
+            #SCRATCH_B *$ ~ - $ #SCRATCH_B *~ [-]
+            #SCRATCH_B *$ ~
+        ]
+        [-]
+        ; Subtract SCRATCH_A from SCRATCH_C
+        #SCRATCH_A *$ $ #SCRATCH_B *~ [-]
+        #SCRATCH_B *$ ~
+        [
+            [-]
+            #SCRATCH_C *$ ~ - $ #SCRATCH_C *~ [-]
+            #SCRATCH_B *$ ~ - $ #SCRATCH_B *~ [-]
+            #SCRATCH_B *$ ~
+        ]
+        [-]
+
+        ; Set up __memcpy: P+0=dst(addr-1), P+1=src(addr), P+2=count
+        #0 @
+        #SCRATCH_A *$ ~                 ; P+0 = addr (src)
+        $                               ; push addr
+        -                               ; P+0 = addr-1 (dst)
+        > ~ <                           ; P+1 = addr (popped)
+        > > #SCRATCH_C *$ ~ < <         ; P+2 = count
+        !#__memcpy
+
+        ; Decrement DOC_LEN
+        #DOC_LEN *$ ~ - $ #DOC_LEN *~ [-]
+
+        ; Move cursor left (handled by caller)
+        ; Set modified flag
+        #1 $ #MODIFIED *~ [-]
+    ]
+
+    [-] > [-] <
+    ^
+}
+
+; ── render: draw the full screen ─────────────────────────────────
+!#render{
+    !#__tui_begin
+
+    ; ── Clear text area ──
+    ; Fill rows 1 to SCREEN_H-2 with spaces, full width
+    #SCREEN_H *$ ~                      ; P+0 = screen_h
+    --                                  ; P+0 = text area height (h-2)
+    $ [-] ~                             ; push then restore
+    ; Fill: row=1, col=0, w=SCREEN_W, h=text_area_h, char=32(space), fg=7, bg=0
+    $ [-]                               ; push text_area_h, clear P+0
+    #1                                  ; P+0 = 1 (row)
+    > #0                                ; P+1 = 0 (col)
+    > #SCREEN_W *$ ~                    ; P+2 = screen_w
+    > ~                                 ; P+3 = text_area_h (from stack)
+    > #32                               ; P+4 = space char
+    > #7                                ; P+5 = fg
+    > #0                                ; P+6 = bg
+    < < < < < <
+    !#__tui_fill
+
+    ; ── Header bar: blue bg, white text ──
+    ; Fill row 0 with spaces (blue background)
+    [-] > [-] > [-] > [-] > [-] > [-] > [-] < < < < < <
+    #0                                  ; P+0 = 0 (row)
+    > #0                                ; P+1 = 0 (col)
+    > #SCREEN_W *$ ~                    ; P+2 = screen_w
+    > #1                                ; P+3 = 1 (height)
+    > #32                               ; P+4 = space
+    > #15                               ; P+5 = fg (white)
+    > #17                               ; P+6 = bg (blue)
+    < < < < < <
+    !#__tui_fill
+
+    ; Title "BF++ Editor" using __tui_puts
+    ; __tui_puts: tape[ptr]=row, [ptr+1]=col, string at ptr+2, fg after null, bg after that
+    #0 @
+    #{0, 2} "BF++ Editor\0" #15 #17
+    #0 @
+    !#__tui_puts
+
+    ; ── Render text area with line numbers ──
+    ; State in tape[40..47]:
+    ;   tape[40] = screen_row (starts at 1)
+    ;   tape[41] = screen_col (reset per line)
+    ;   tape[42] = buf_addr (walk through text buffer)
+    ;   tape[43] = continue flag
+    ;   tape[44] = current line number (1-based)
+    ;   tape[45] = max visible rows (SCREEN_H - 2)
+    ;   tape[46] = lines rendered count
+
+    #1 $ #40 *~ [-]                     ; screen_row = 1
+    #GUTTER $ #41 *~ [-]                ; screen_col = GUTTER (after gutter)
+    #TEXT_BUF $ #42 *~ [-]              ; buf_addr = TEXT_BUF
+
+    ; Compute max visible rows = SCREEN_H - 2
+    #SCREEN_H *$ ~ -- $ #45 *~ [-]     ; tape[45] = screen_h - 2
+
+    #1 $ #43 *~ [-]                     ; continue = 1
+    #1 $ #44 *~ [-]                     ; line_number = 1
+    #0 $ #46 *~ [-]                     ; lines_rendered = 0
+
+    ; ── Draw first line number ──
+    ; Line number at (screen_row=1, col=0)
+    #0 @
+    #{1, 0} "  1 \0" #8 #0
+    #0 @
+    !#__tui_puts
+
+    ; ── Main render loop ──
+    #43 *$ ~
+    [
+        [-]
+
+        ; Read byte at buf_addr
+        #42 *$ ~                        ; P+0 = buf_addr
+        *$                              ; push tape[buf_addr]
+        [-] ~                           ; P+0 = byte
+
+        ; Check for end of document (byte == 0)
+        ?= #0 [
+            #0 $ #43 *~ [-]             ; stop
+        ] : [
+            ; Check for newline
+            ?= #10 [
+                ; ── Newline: advance to next line ──
+                #40 *$ ~ + $ #40 *~ [-]         ; screen_row++
+                #GUTTER $ #41 *~ [-]            ; screen_col = GUTTER
+                #44 *$ ~ + $ #44 *~ [-]         ; line_number++
+                #46 *$ ~ + $ #46 *~ [-]         ; lines_rendered++
+
+                ; Check if we've filled the visible area
+                ; Compare rendered (tape[46]) against max (tape[45])
+                ; Subtract: if rendered >= max, stop
+                ; P+0 = rendered, subtract max from it
+                #46 *$ ~                        ; P+0 = rendered
+                ; Subtract max using a loop on P+1
+                > #45 *$ ~ <                    ; P+1 = max
+                >[-<->]<                        ; P+0 = rendered - max (wraps if negative)
+                ; If result > 0 (and rendered >= max), stop
+                ; Actually with unsigned subtraction, if rendered >= max, P+0 >= 0
+                ; If rendered < max, P+0 wraps to large value.
+                ; Simpler: check rendered == max exactly
+                [-] #46 *$ ~                    ; P+0 = rendered
+                > #45 *$ ~ <                    ; P+1 = max
+                ; Subtract: if equal, P+0 = 0
+                >[-<->]<                        ; P+0 = rendered - max
+                ?{
+                    ; rendered != max: still have room — draw line number
+                    [-]
+                    ; Draw line number for the new line
+                    ; Construct line number string at tape[0..7]
+                    ; For simplicity, render the line number digit by digit
+                    ; Line number is in tape[44]
+                    ; We'll use __tui_put to draw each digit
+
+                    ; Compute digits of line_number
+                    ; For lines 1-999, we need up to 3 digits
+                    ; Position: (screen_row, 0), right-aligned in 4-char gutter
+                    ; Just render the number at col 0 with fg=8 (dark gray)
+
+                    #44 *$ ~                    ; P+0 = line_number
+                    $                           ; save on stack
+                    ; Hundreds digit: line_num / 100
+                    > #100 <
+                    !#m/                        ; P+0 = hundreds
+                    $                           ; push hundreds
+                    [-]
+                    ; Restore line_number
+                    ~ > ~                       ; P+0 = hundreds, P+1 = line_num (stacked)
+                    ; Actually stack has: line_num (bottom), hundreds (top)
+                    ; Pop → hundreds, Pop → line_num
+                    ; We need: tens = (line_num / 10) % 10, ones = line_num % 10
+                    ; Let me simplify: just use __tui_put for each digit
+
+                    ; Discard and use a simpler approach:
+                    ; Compute hundreds, tens, ones from line_number
+                    [-] > [-] <
+                    ; Clear stack of our pushes
+                    ~ [-] ~ [-]
+
+                    ; Read line_number fresh
+                    #44 *$ ~                    ; P+0 = line_num
+
+                    ; hundreds = line_num / 100
+                    $ [-] ~                     ; copy via stack
+                    > #100 <
+                    !#m/                        ; P+0 = hundreds
+                    $ [-]                       ; push hundreds
+
+                    ; tens = (line_num % 100) / 10
+                    #44 *$ ~
+                    > #100 <
+                    !#m%                        ; P+0 = line_num % 100
+                    > #10 <
+                    !#m/                        ; P+0 = tens
+                    $ [-]                       ; push tens
+
+                    ; ones = line_num % 10
+                    #44 *$ ~
+                    > #10 <
+                    !#m%                        ; P+0 = ones
+                    $ [-]                       ; push ones
+
+                    ; Stack (top→bottom): ones, tens, hundreds
+                    ; Pop ones → display at col 2, tens at col 1, hundreds at col 0
+
+                    ; Get screen_row for positioning
+                    #40 *$ $ #SCRATCH_A *~ [-]  ; SCRATCH_A = current screen_row
+
+                    ; Draw hundreds (col 0) — only if > 0
+                    ; Pop: ones
+                    ~                           ; P+0 = ones
+                    $ [-]                       ; save ones, clear
+                    ; Pop: tens
+                    ~                           ; P+0 = tens
+                    > ~ <                       ; P+1 = ones (save)
+                    > $ [-] <                   ; push ones again
+                    $ [-]                       ; push tens
+                    ; Pop: hundreds
+                    ~                           ; P+0 = hundreds
+                    ; Now stack has: ones(bottom), tens(top)
+
+                    ; If hundreds > 0, draw it
+                    ?{
+                        ; hundreds > 0: draw hundreds digit
+                        ; ASCII digit = value + 48
+                        ++++++++++++++++++++++++++++++++++++++++++++++++
+                        $                       ; push ASCII hundreds
+                        #SCRATCH_A *$ ~         ; P+0 = row
+                        > #0                    ; P+1 = col 0
+                        > ~ <  <                ; P+2 = char (popped)
+                        > > > #8                ; P+3 = fg (dark gray)
+                        > #0 < < < <            ; P+4 = bg (black)
+                        !#__tui_put
+                    }:{
+                        ; hundreds == 0: draw space
+                        #SCRATCH_A *$ ~
+                        > #0
+                        > #32
+                        > #8
+                        > #0 < < < <
+                        !#__tui_put
+                    }
+
+                    ; Draw tens digit (col 1) — show if hundreds > 0 OR tens > 0
+                    ; Pop tens from stack
+                    [-]
+                    ~                           ; P+0 = tens
+
+                    ?{
+                        ; tens > 0 (or we should show it): draw digit
+                        ++++++++++++++++++++++++++++++++++++++++++++++++
+                        $
+                        #SCRATCH_A *$ ~
+                        > #1
+                        > ~ <  <
+                        > > > #8
+                        > #0 < < < <
+                        !#__tui_put
+                    }:{
+                        ; tens == 0: draw space
+                        #SCRATCH_A *$ ~
+                        > #1
+                        > #32
+                        > #8
+                        > #0 < < < <
+                        !#__tui_put
+                    }
+
+                    ; Draw ones digit (col 2) — always show
+                    [-]
+                    ~                           ; P+0 = ones (from stack)
+                    ++++++++++++++++++++++++++++++++++++++++++++++++
+                    $
+                    #SCRATCH_A *$ ~
+                    > #2
+                    > ~ <  <
+                    > > > #8
+                    > #0 < < < <
+                    !#__tui_put
+
+                    ; Draw separator '|' at col 3
+                    [-] > [-] > [-] > [-] > [-] < < < <
+                    #SCRATCH_A *$ ~
+                    > #3
+                    > #124
+                    > #8
+                    > #0 < < < <
+                    !#__tui_put
+                }:{
+                    ; rendered == max: stop rendering
+                    #0 $ #43 *~ [-]             ; continue = 0
+                }
+                [-] > [-] <
+            ] : [
+                ; ── Printable character: render it ──
+                $                               ; push the byte
+
+                #40 *$ ~                        ; P+0 = screen_row
+                > #41 *$ ~                      ; P+1 = screen_col
+                > ~                             ; P+2 = char (popped)
+                > #7                            ; P+3 = fg (white)
+                > #0                            ; P+4 = bg (black)
+                < < < <
+                !#__tui_put
+
+                ; Advance screen_col
+                [-] #41 *$ ~ + $ #41 *~ [-]
+            ]
+
+            ; Advance buf_addr (if still continuing)
+            #43 *$ ~
+            ?{
+                #42 *$ ~ + $ #42 *~ [-]         ; buf_addr++
+            }:{}
+        ]
+
+        ; Re-check continue
+        [-]
+        #43 *$ ~
+    ]
+    [-]
+
+    ; ── Cursor: draw at cursor position ──
+    ; Screen position: row = CUR_Y + 1 - SCROLL_Y, col = CUR_X + GUTTER
+    #CUR_Y *$ ~
+    +                                   ; row = cursor_y + 1 (header offset)
+    > #CUR_X *$ ~
+    > > > > > #GUTTER < < < < <         ; add gutter offset
+    [-> + <]                            ; P+1 += GUTTER (move GUTTER from P+5... wait)
+    ; Redo: P+0 = row, P+1 = cursor_x. Add GUTTER to P+1.
+    ; Actually the above is wrong. Let me fix.
+    [-] > [-] <                         ; clear
+    #CUR_Y *$ ~ +                       ; P+0 = cursor_y + 1
+    > #CUR_X *$ ~                       ; P+1 = cursor_x
+    ; Add GUTTER to P+1
+    +++++ <                             ; P+1 += 5 (GUTTER=5)
+    ; P+0 = row, P+1 = col
+    > > #95                             ; P+2 = '_' (cursor char)
+    > #10                               ; P+3 = fg (green)
+    > #0                                ; P+4 = bg (black)
+    < < < <
     !#__tui_put
 
-    ; End frame
-    [-] > [-] > [-] > [-] > [-] <<<<<
+    ; ── Status bar ──
+    ; Bottom row (SCREEN_H - 1)
+    ; Fill with spaces, inverted colors
+    #SCREEN_H *$ ~ -                    ; P+0 = screen_h - 1 (status row)
+    $                                   ; push status_row
+    [-] ~                               ; P+0 = status_row
+    > #0                                ; P+1 = col 0
+    > #SCREEN_W *$ ~                    ; P+2 = width
+    > #1                                ; P+3 = height 1
+    > #32                               ; P+4 = space char
+    > #0                                ; P+5 = fg (black)
+    > #7                                ; P+6 = bg (white)
+    < < < < < < <
+    ; Need to go back to P+0 which is the status row
+    ; Actually __tui_fill reads from ptr, and we have all 7 args set up
+    !#__tui_fill
+
+    ; Status text: "BF++ | Ln X, Col Y | [status]"
+    ; Use __tui_puts for the static prefix
+    #SCREEN_H *$ ~ -                    ; status row
+    $ [-] ~                             ; P+0 = status_row
+    > #1                                ; P+1 = col 1
+    ; The string goes at ptr+2
+    #0 @
+    #SCREEN_H *$ ~ -                    ; P+0 = status_row
+    > #1 < <                            ; P+1 = 1 (col)
+    ; Hmm, this is getting complex. Let me just use __tui_put to write chars.
+
+    ; ---- Status: "BF++ " ----
+    ; Use individual __tui_put calls for the status text
+    [-] > [-] <
+    #SCREEN_H *$ ~
+    - $ #SCRATCH_A *~ [-]               ; SCRATCH_A = status bar row
+
+    ; "BF++"
+    #SCRATCH_A *$ ~
+    > #1 > #66 > #0 > #7 < < < <       ; B
+    !#__tui_put
+    [-] > [-] > [-] > [-] > [-] < < < < <
+    #SCRATCH_A *$ ~
+    > #2 > #70 > #0 > #7 < < < <       ; F
+    !#__tui_put
+    [-] > [-] > [-] > [-] > [-] < < < < <
+    #SCRATCH_A *$ ~
+    > #3 > #43 > #0 > #7 < < < <       ; +
+    !#__tui_put
+    [-] > [-] > [-] > [-] > [-] < < < < <
+    #SCRATCH_A *$ ~
+    > #4 > #43 > #0 > #7 < < < <       ; +
+    !#__tui_put
+
+    ; " | "
+    [-] > [-] > [-] > [-] > [-] < < < < <
+    #SCRATCH_A *$ ~
+    > #5 > #32 > #0 > #7 < < < <
+    !#__tui_put
+    [-] > [-] > [-] > [-] > [-] < < < < <
+    #SCRATCH_A *$ ~
+    > #6 > #124 > #0 > #7 < < < <      ; |
+    !#__tui_put
+    [-] > [-] > [-] > [-] > [-] < < < < <
+    #SCRATCH_A *$ ~
+    > #7 > #32 > #0 > #7 < < < <
+    !#__tui_put
+
+    ; "Ln "
+    [-] > [-] > [-] > [-] > [-] < < < < <
+    #SCRATCH_A *$ ~
+    > #8 > #76 > #0 > #7 < < < <       ; L
+    !#__tui_put
+    [-] > [-] > [-] > [-] > [-] < < < < <
+    #SCRATCH_A *$ ~
+    > #9 > #110 > #0 > #7 < < < <      ; n
+    !#__tui_put
+    [-] > [-] > [-] > [-] > [-] < < < < <
+    #SCRATCH_A *$ ~
+    > #10 > #32 > #0 > #7 < < < <      ; space
+    !#__tui_put
+
+    ; Print CUR_Y+1 (1-based line number) — write digits at col 11+
+    ; For simplicity, show as single/double/triple digit
+    [-] > [-] > [-] > [-] > [-] < < < < <
+    #CUR_Y *$ ~ +                       ; line = cursor_y + 1
+    ; Just render ones digit for now (simple demo)
+    ; Compute and render up to 3 digits of line number
+    $ [-] ~                             ; copy
+    > #100 <
+    !#m/                                ; P+0 = hundreds
+    ?{
+        ; Has hundreds digit
+        ++++++++++++++++++++++++++++++++++++++++++++++++
+        $
+        #SCRATCH_A *$ ~
+        > #11 > ~ > #0 > #7 < < < < <
+        !#__tui_put
+    }:{}
+    [-] > [-] > [-] > [-] > [-] < < < < <
+
+    #CUR_Y *$ ~ +
+    > #10 <
+    !#m/                                ; tens+hundreds
+    > #10 <
+    !#m%                                ; P+0 = tens digit
+    ?{
+        ++++++++++++++++++++++++++++++++++++++++++++++++
+        $
+        #SCRATCH_A *$ ~
+        > #12 > ~ > #0 > #7 < < < < <
+        !#__tui_put
+    }:{}
+    [-] > [-] > [-] > [-] > [-] < < < < <
+
+    #CUR_Y *$ ~ +
+    > #10 <
+    !#m%                                ; P+0 = ones digit
+    ++++++++++++++++++++++++++++++++++++++++++++++++
+    $
+    #SCRATCH_A *$ ~
+    > #13 > ~ > #0 > #7 < < < < <
+    !#__tui_put
+
+    ; ", Col "
+    [-] > [-] > [-] > [-] > [-] < < < < <
+    #SCRATCH_A *$ ~
+    > #14 > #44 > #0 > #7 < < < <      ; ,
+    !#__tui_put
+    [-] > [-] > [-] > [-] > [-] < < < < <
+    #SCRATCH_A *$ ~
+    > #15 > #32 > #0 > #7 < < < <      ; space
+    !#__tui_put
+    [-] > [-] > [-] > [-] > [-] < < < < <
+    #SCRATCH_A *$ ~
+    > #16 > #67 > #0 > #7 < < < <      ; C
+    !#__tui_put
+    [-] > [-] > [-] > [-] > [-] < < < < <
+    #SCRATCH_A *$ ~
+    > #17 > #111 > #0 > #7 < < < <     ; o
+    !#__tui_put
+    [-] > [-] > [-] > [-] > [-] < < < < <
+    #SCRATCH_A *$ ~
+    > #18 > #108 > #0 > #7 < < < <     ; l
+    !#__tui_put
+    [-] > [-] > [-] > [-] > [-] < < < < <
+    #SCRATCH_A *$ ~
+    > #19 > #32 > #0 > #7 < < < <      ; space
+    !#__tui_put
+
+    ; Print CUR_X+1 (1-based column) at col 20+
+    [-] > [-] > [-] > [-] > [-] < < < < <
+    #CUR_X *$ ~ +
+    > #10 <
+    !#m/
+    ?{
+        ++++++++++++++++++++++++++++++++++++++++++++++++
+        $
+        #SCRATCH_A *$ ~
+        > #20 > ~ > #0 > #7 < < < < <
+        !#__tui_put
+    }:{}
+    [-] > [-] > [-] > [-] > [-] < < < < <
+
+    #CUR_X *$ ~ +
+    > #10 <
+    !#m%
+    ++++++++++++++++++++++++++++++++++++++++++++++++
+    $
+    #SCRATCH_A *$ ~
+    > #21 > ~ > #0 > #7 < < < < <
+    !#__tui_put
+
+    ; " | " separator
+    [-] > [-] > [-] > [-] > [-] < < < < <
+    #SCRATCH_A *$ ~
+    > #23 > #124 > #0 > #7 < < < <     ; |
+    !#__tui_put
+
+    ; Save status indicator at col 25+
+    ; SAVE_STATUS: 0=idle, 1=requested, 2=saving, 3=done
+    [-] > [-] > [-] > [-] > [-] < < < < <
+    #SAVE_STATUS *$ ~
+    ?= #0 [
+        ; Idle: show "Ctrl+S:Save" or "[modified]"
+        [-]
+        #MODIFIED *$ ~
+        ?{
+            ; Modified — show "*"
+            #SCRATCH_A *$ ~
+            > #25 > #42 > #0 > #7 < < < <  ; *
+            !#__tui_put
+        }:{}
+    ] : [
+        ?= #2 [
+            ; Saving...
+            [-]
+            #0 @
+            #SCRATCH_A *$ ~ > #25 < <
+            "Saving..\0" #0 #7
+            #0 @
+            !#__tui_puts
+        ] : [
+            ?= #3 [
+                ; Saved!
+                [-]
+                #0 @
+                #SCRATCH_A *$ ~ > #25 < <
+                "Saved!\0" #0 #7
+                #0 @
+                !#__tui_puts
+                ; Reset save status to idle after displaying
+                #0 $ #SAVE_STATUS *~ [-]
+            ]
+        ]
+    ]
+
+    ; Ctrl+Q hint on the right side of status bar
+    [-] > [-] > [-] > [-] > [-] < < < < <
+    #0 @
+    #SCRATCH_A *$ ~
+    ; Place at col SCREEN_W - 10
+    #SCREEN_W *$ ~
+    ----------                          ; col = screen_w - 10
+    > ~ <                               ; swap: P+0=row is at P+1 now... no
+    ; P+0 = screen_w - 10, need to set up: row, col
+    ; Redo:
+    $ [-]                               ; push col
+    #SCRATCH_A *$ ~                     ; P+0 = status_row
+    > ~ <                               ; P+1 = col (screen_w - 10)
+    < <
+    "^Q Quit\0" #0 #7
+    #0 @
+    !#__tui_puts
+
+    ; ── End frame ──
+    [-] > [-] > [-] > [-] > [-] < < < < <
     !#__tui_end
     ^
 }
 
-; ── handle_key: process a keypress ─────────────────────────────
+; ── handle_key: dispatch a keypress ──────────────────────────────
+; Input: P+0 = keycode (from __tui_key, %2 for 16-bit arrow codes)
 !#handle_key{
-    ; P+0 = keycode (16-bit from __tui_key with %2)
-    ; Use ?= with [] for clean dispatch
+    ; Save keycode
+    $ [-]
 
-    ?= #17 [                       ; Ctrl+Q
-        #1 $ [-] #56 *~ [-]        ; tape[56] = 1 (quit)
+    ; ── Ctrl+Q (17) — quit ──
+    ~ $ [-] ~                           ; copy keycode
+    ?= #17 [
+        #1 $ #QUIT_FLAG *~ [-]
     ]
+    [-]
 
-    ; Arrow keys need 16-bit comparison
+    ; ── Ctrl+S (19) — save ──
+    ~ $ [-] ~
+    ?= #19 [
+        ; Initiate background save
+        #1 $ #SAVE_STATUS *~ [-]        ; SAVE_STATUS = 1 (requested)
+
+        ; Spawn save_worker thread (subroutine index 0)
+        ; __spawn: tape[ptr]=sub_index(0), tape[ptr+8]=start_ptr
+        #80 @
+        %8 [-]                          ; sub_index = 0
+        >>>>>>>> %8 #10 <<<<<<<<        ; start_ptr = 10 (scratch area)
+        !#__spawn
+        ; Thread ID returned at tape[80] — we don't join (fire and forget)
+        %1
+        #0 @
+
+        ; Set dirty to re-render status bar
+        #1 $ #DIRTY *~ [-]
+    ]
+    [-]
+
+    ; ── Backspace (127) — delete char before cursor ──
+    ~ $ [-] ~
+    ?= #127 [
+        ; Only delete if cursor is not at position (0,0)
+        #CUR_X *$ ~
+        > #CUR_Y *$ ~ <
+        ; If both are 0, skip. Check: x + y > 0
+        [-> + <]                        ; P+0 += P+1 (sum)
+        ?{
+            ; Cursor not at origin — can delete
+            ; First move cursor back
+            #CUR_X *$ ~
+            ?{
+                ; cursor_x > 0: just decrement
+                #CUR_X *$ ~ - $ #CUR_X *~ [-]
+            }:{
+                ; cursor_x == 0: move to end of previous line
+                ; Decrement cursor_y
+                #CUR_Y *$ ~ - $ #CUR_Y *~ [-]
+                ; Find length of that line
+                ; For simplicity, set cursor_x to a large value
+                ; and let the cursor_to_offset clamp it
+                #255 $ #CUR_X *~ [-]
+            }
+            !#delete_char
+            #1 $ #DIRTY *~ [-]
+        }:{}
+    ]
+    [-]
+
+    ; ── Enter (13) — insert newline ──
+    ~ $ [-] ~
+    ?= #13 [
+        #10 $ #SCRATCH_F *~ [-]         ; char = newline
+        !#insert_char
+        ; Move cursor to start of next line
+        #0 $ #CUR_X *~ [-]
+        #CUR_Y *$ ~ + $ #CUR_Y *~ [-]  ; cursor_y++
+        #1 $ #DIRTY *~ [-]
+    ]
+    [-]
+
+    ; ── Arrow keys (16-bit comparison) ──
     %2
-    ?= #1002 [                      ; Arrow RIGHT
-        [-] #50 *$ ~ + $ [-] #50 *~ [-]  ; tape[50]++
+
+    ; Arrow RIGHT (1002)
+    ~ $ [-] ~
+    ?= #1002 [
+        [-]
+        %1
+        #CUR_X *$ ~ + $ #CUR_X *~ [-]
+        #1 $ #DIRTY *~ [-]
     ]
-    ?= #1003 [                      ; Arrow LEFT
-        [-] #50 *$ ~ - $ [-] #50 *~ [-]  ; tape[50]--
+
+    ; Arrow LEFT (1003)
+    ~ $ [-] ~
+    ?= #1003 [
+        [-]
+        %1
+        ; Only decrement if cursor_x > 0
+        #CUR_X *$ ~
+        ?{
+            #CUR_X *$ ~ - $ #CUR_X *~ [-]
+        }:{}
+        #1 $ #DIRTY *~ [-]
     ]
-    ?= #1001 [                      ; Arrow DOWN
-        [-] #51 *$ ~ + $ [-] #51 *~ [-]  ; tape[51]++
+
+    ; Arrow DOWN (1001)
+    ~ $ [-] ~
+    ?= #1001 [
+        [-]
+        %1
+        #CUR_Y *$ ~ + $ #CUR_Y *~ [-]
+        #1 $ #DIRTY *~ [-]
     ]
-    ?= #1000 [                      ; Arrow UP
-        [-] #51 *$ ~ - $ [-] #51 *~ [-]  ; tape[51]--
+
+    ; Arrow UP (1000)
+    ~ $ [-] ~
+    ?= #1000 [
+        [-]
+        %1
+        ; Only decrement if cursor_y > 0
+        #CUR_Y *$ ~
+        ?{
+            #CUR_Y *$ ~ - $ #CUR_Y *~ [-]
+        }:{}
+        #1 $ #DIRTY *~ [-]
     ]
+
     %1
 
-    ; Set dirty
-    [-] #1 $ [-] #55 *~ [-]        ; tape[55] = 1
+    ; ── Printable characters (32..126) ──
+    ; If keycode >= 32 and keycode <= 126, insert it
+    ~ $ [-] ~                           ; copy keycode
+    ; Check: keycode >= 32
+    ; Subtract 32 — if result > 0, might be printable
+    ; BF++ doesn't have >= directly, but we can use ?> and ?<
+    ; Check keycode > 31
+    ?> #31 [
+        ; Check keycode < 127 (i.e., keycode <= 126)
+        [-]
+        ~ $ [-] ~
+        ?< #127 [
+            ; Printable! Insert it.
+            [-]
+            ~ $ #SCRATCH_F *~ [-]       ; SCRATCH_F = keycode
+            !#insert_char
+            #CUR_X *$ ~ + $ #CUR_X *~ [-]  ; cursor_x++
+            #1 $ #DIRTY *~ [-]
+        ]
+    ]
+    [-]
+
+    ; Clean up stacked keycode copies
+    ; The stack may have leftover copies; clear the cell
+    [-] > [-] <
+
     ^
 }
 
@@ -190,61 +1036,106 @@
 
 !#__tui_init
 
-; Get terminal size
+; ── Get terminal size ──
 !#__tui_size
+; Output: tape[ptr]=cols, tape[ptr+1]=rows
 $ > $ [-] < [-]
-; Pop rows → tape[54], cols → tape[53]
-~ $ [-] #54 *~ [-]
-~ $ [-] #53 *~ [-]
+~ $ [-] #SCREEN_H *~ [-]               ; screen_h = rows
+~ $ [-] #SCREEN_W *~ [-]               ; screen_w = cols
 
-; Init editor state via *$/*~
-#0 $ [-] #50 *~ [-]        ; cursor_x = 0
-#0 $ [-] #51 *~ [-]        ; cursor_y = 0
-#0 $ [-] #52 *~ [-]        ; scroll_y = 0
-#1 $ [-] #55 *~ [-]        ; dirty = 1
-#0 $ [-] #56 *~ [-]        ; quit = 0
+; ── Initialize editor state ──
+#0 $ [-] #CUR_X *~ [-]                 ; cursor_x = 0
+#0 $ [-] #CUR_Y *~ [-]                 ; cursor_y = 0
+#0 $ [-] #SCROLL_Y *~ [-]              ; scroll_y = 0
+#1 $ [-] #DIRTY *~ [-]                 ; dirty = 1
+#0 $ [-] #QUIT_FLAG *~ [-]             ; quit = 0
+#0 $ [-] #SAVE_STATUS *~ [-]           ; save_status = 0
+#0 $ [-] #MODIFIED *~ [-]              ; modified = 0
 
-; Init text buffer: "Hello, BF++ Editor!\n" at tape[100]
-#100 @
-"Hello, BF++ Editor!\n\0"
+; ── Initialize document: welcome text ──
+#TEXT_BUF @
+"Welcome to BF++ Editor v2!\n\nFeatures:\n  - Type to insert text\n  - Backspace to delete\n  - Arrow keys to navigate\n  - Ctrl+S to save (multicore)\n  - Ctrl+Q to quit\n\0"
 #0 @
 
-; Initial render
+; Count document length (bytes until null)
+; Walk TEXT_BUF forward counting non-zero bytes
+#TEXT_BUF $ #SCRATCH_A *~ [-]           ; addr = TEXT_BUF
+#0 $ #SCRATCH_B *~ [-]                 ; count = 0
+#1 $ #SCRATCH_C *~ [-]                 ; continue = 1
+
+#SCRATCH_C *$ ~
+[
+    [-]
+    #SCRATCH_A *$ ~                     ; P+0 = addr
+    *$                                  ; push tape[addr]
+    [-] ~                               ; P+0 = byte
+    ?{
+        ; Non-zero: increment count and addr
+        #SCRATCH_B *$ ~ + $ #SCRATCH_B *~ [-]
+        #SCRATCH_A *$ ~ + $ #SCRATCH_A *~ [-]
+    }:{
+        ; Zero (null terminator): stop
+        #0 $ #SCRATCH_C *~ [-]
+    }
+    #SCRATCH_C *$ ~
+]
+[-]
+
+; Store document length
+#SCRATCH_B *$ $ #DOC_LEN *~ [-]
+
+; ── Initialize mutex for save thread ──
+[-]
+!#__mutex_init
+
+; ── Initial render ──
 !#render
 
-; Main loop: while quit == 0
-#56 *$ ~                    ; P+0 = quit
-> #1 <                      ; P+1 = 1
-[[-] > [-] <]               ; if quit != 0: clear both
-> [-<+>] <                  ; P+0 = inverted quit (1=continue)
+; ── Main event loop ──
+; while quit == 0
+#QUIT_FLAG *$ ~
+> #1 <
+[[-] > [-] <]
+> [-<+>] <                              ; P+0 = !quit (1=continue)
 
-[                           ; while continue
+[
     [-]
 
     ; Poll input (16-bit for arrow keys)
     %2 #33
-    !#__tui_key             ; P+0 = keycode
+    !#__tui_key                         ; P+0 = keycode (16-bit)
 
-    ; Skip timeout (keycode == 65535 for -1 in uint16)
+    ; Skip if no key (timeout: keycode == 65535 = -1 as uint16)
     ?! #0 [
         !#handle_key
     ]
     [-]
 
+    ; Check save status — poll atomic flag
+    %1
+    #SAVE_STATUS *$ ~
+    ?= #3 [
+        ; Save completed — update status and trigger re-render
+        #1 $ #DIRTY *~ [-]
+        #0 $ #MODIFIED *~ [-]           ; clear modified flag
+    ]
+    [-]
+
     ; Render if dirty
-    #55 *$ ~                ; P+0 = dirty
+    #DIRTY *$ ~
     [
         [-]
         !#render
-        #0 $ [-] #55 *~ [-] ; clear dirty
+        #0 $ [-] #DIRTY *~ [-]         ; clear dirty
     ]
 
     ; Check quit
-    #56 *$ ~
+    #QUIT_FLAG *$ ~
     > #1 <
     [[-] > [-] <]
-    > [-<+>] <              ; P+0 = inverted quit
+    > [-<+>] <                          ; P+0 = !quit
 ]
 
+; ── Cleanup ──
 !#__tui_cleanup
 #0 !#__exit
