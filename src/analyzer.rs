@@ -60,15 +60,25 @@ pub fn analyze(nodes: &[AstNode]) -> Result<(), Vec<AnalysisError>> {
         }
     }
 
-    // Pass 2: check for duplicate subroutine definitions
-    let mut seen = HashSet::new();
-    check_duplicate_defs(nodes, &mut seen, &mut errors);
-
-    // Pass 3: warn about top-level return (not a hard error)
+    // Passes 2-4 run in parallel (rayon) — they're independent.
+    let (mut dup_errors, mut ffi_errors) = rayon::join(
+        || {
+            let mut errs = Vec::new();
+            let mut seen = HashSet::new();
+            check_duplicate_defs(nodes, &mut seen, &mut errs);
+            errs
+        },
+        || {
+            let mut errs = Vec::new();
+            check_ffi_names(nodes, &mut errs);
+            errs
+        },
+    );
+    // Pass 3 (return context) is a warning, runs on main thread
     check_return_context(nodes, false);
 
-    // Pass 4: validate FFI library/function names aren't empty
-    check_ffi_names(nodes, &mut errors);
+    errors.append(&mut dup_errors);
+    errors.append(&mut ffi_errors);
 
     if errors.is_empty() {
         Ok(())

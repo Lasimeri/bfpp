@@ -8,6 +8,7 @@
 // everything else lands in main().
 
 use crate::ast::{AstNode, FdSpec, Program};
+use rayon::prelude::*;
 
 pub struct CodegenOptions {
     pub tape_size: usize,   // number of bytes in the BF tape (should be power-of-two for TAPE_MASK)
@@ -147,24 +148,34 @@ fn generate_c(program: &Program, opts: &CodegenOptions, uses_ffi: bool, intrinsi
         sub_table.push_str("};\n\n");
     }
 
-    // ── Subroutine bodies (each as a separate string for split mode) ──
-    let mut sub_bodies: Vec<(String, String)> = Vec::new();
-    for node in &program.nodes {
-        if let AstNode::SubDef(name, body) = node {
+    // ── Subroutine bodies (parallel emission via rayon) ──
+    // Each sub body is independent — emit C code in parallel.
+    // GenCtx is cloned per-sub since emit_nodes needs &mut.
+    let sub_defs: Vec<(&String, &Vec<AstNode>)> = program.nodes.iter()
+        .filter_map(|n| match n { AstNode::SubDef(name, body) => Some((name, body)), _ => None })
+        .collect();
+
+    let sub_bodies: Vec<(String, String)> = sub_defs.par_iter()
+        .map(|(name, body)| {
             let mangled = mangle_name(name);
             let mut sub_out = String::new();
+            let mut sub_ctx = GenCtx {
+                indent: 1,
+                subroutines: ctx.subroutines.clone(),
+                eof_value: ctx.eof_value,
+                in_subroutine: true,
+                in_result_block: false,
+            };
             sub_out.push_str(&format!("void bfpp_sub_{}(void) {{\n", mangled));
-            ctx.indent = 1;
-            ctx.in_subroutine = true;
-            indent(&mut sub_out, ctx.indent);
+            indent(&mut sub_out, sub_ctx.indent);
             sub_out.push_str("if (++bfpp_call_depth > CALL_DEPTH) { fprintf(stderr, \"bfpp: call stack overflow\\n\"); exit(1); }\n");
-            emit_nodes(&mut sub_out, body, &mut ctx);
-            indent(&mut sub_out, ctx.indent);
+            emit_nodes(&mut sub_out, body, &mut sub_ctx);
+            indent(&mut sub_out, sub_ctx.indent);
             sub_out.push_str("bfpp_call_depth--;\n");
             sub_out.push_str("}\n\n");
-            sub_bodies.push((mangled, sub_out));
-        }
-    }
+            (mangled, sub_out)
+        })
+        .collect();
     ctx.in_subroutine = false;
 
     // ── Main function ──

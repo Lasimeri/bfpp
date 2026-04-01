@@ -16,6 +16,9 @@
 !define POOL 3000000
 !define GPU_COUNT 100
 
+!include "io.bfpp"
+!include "parse_num.bfpp"
+
 ; ── Print null-terminated string from POOL ──
 !#pr{ #POOL @ [. >] #0 @ ^ }
 
@@ -107,11 +110,13 @@ $ #GPU_COUNT @ ~ #0 @ %1
 [
     ; Skip comments: ; to end of line
     ?= #59 [
-        [-] , [ ?= #10 [ [-] ] [ [-] , ] ]
+        [-] , [ ?= #10 [ [-] ] : [ [-] , ] ]
         ,
     ]
     ; Skip newlines (just ignore)
     ?= #10 [ [-] ]
+    ; Handle # (numeric literal): parse decimal, emit bfpp_set
+    ?= #35 [ [-] !#pn ]
     ; Process remaining chars
     [ !#cl !#em ]
     ,

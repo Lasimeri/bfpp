@@ -1,0 +1,92 @@
+; parse_num.bfpp — decimal number parser for bootstrap compiler
+; Called when '#' detected in input. Reads decimal digits, emits:
+;   bfpp_set(ptr, N ULL);\n
+; where N is the accumulated decimal value (0-255, 8-bit).
+;
+; Entry: ptr = 0, cell 0 is free (# already consumed and cleared).
+; Exit:  cell 0 = first non-digit char (for main loop to process),
+;        or 0 if EOF was the terminator.
+;
+; Cell layout:
+;   cell 0 = char input / working value
+;   cell 1 = is_digit flag / multiply operand (for !#m*)
+;   cell 2 = accumulator
+;   cell 3-5 = !#m* workspace
+;   cell 6 = digit stash (safe from !#m* which uses 0-3)
+;
+; Dependencies: !#pr (print string), !#.+ (print_int from io.bfpp),
+;               !#m* (multiply from math.bfpp), POOL constant.
+
+!#pn{
+    ; Clear cells 0-6
+    [-] > [-] > [-] > [-] > [-] > [-] > [-] <<<<<<
+
+    ; Read first potential digit
+    ,                              ; cell 0 = char
+
+    ; Set is_digit flag: cell 1 = 1 if '0' <= char <= '9'
+    > [-] + <                      ; cell 1 = 1 (assume digit)
+    ?< #48 [ > [-] < ]            ; if char < 48: not digit
+    ?> #57 [ > [-] < ]            ; if char > 57: not digit
+
+    > [                            ; while is_digit (cell 1)
+        - <                        ; clear flag, ptr → cell 0
+
+        ; digit_value = char - '0' (subtract 48)
+        ------------------------------------------------
+
+        ; Stash digit in cell 6 (safe from !#m*)
+        [- >>>>>> + <<<<<<]        ; cell 6 = digit, cell 0 = 0
+
+        ; Move accumulator (cell 2) to cell 0 for multiply
+        >> [- << + >>] <<          ; cell 0 = acc, cell 2 = 0
+
+        ; Set cell 1 = 10 (multiplier)
+        > ++++++++++ <             ; cell 1 = 10
+
+        ; acc *= 10
+        !#m*                       ; cell 0 = acc * 10, cells 1-3 = 0
+
+        ; Add digit: move cell 6 to cell 0
+        >>>>>> [- <<<<<< + >>>>>>] <<<<<<  ; cell 0 += digit, cell 6 = 0
+
+        ; Store new accumulator in cell 2
+        [- >> + <<]                ; cell 2 = acc*10 + digit, cell 0 = 0
+
+        ; Read next char
+        ,                          ; cell 0 = next char
+
+        ; Check if digit
+        > [-] + <                  ; cell 1 = 1 (assume digit)
+        ?< #48 [ > [-] < ]        ; if char < 48: not digit
+        ?> #57 [ > [-] < ]        ; if char > 57: not digit
+        >                          ; ptr → cell 1 (loop condition)
+    ]
+
+    ; Loop exited: cell 1 = 0, cell 0 = non-digit char, cell 2 = accumulated value.
+
+    ; Save non-digit char to stack (main loop will use it)
+    < $                            ; push non-digit char, ptr → cell 0
+
+    ; Emit: bfpp_set(ptr,
+    [-]                            ; clear cell 0 before string write
+    #POOL @ "bfpp_set(ptr, \0" #0 @ !#pr
+    ; ptr = 0 after !#pr; cell 0 = POOL (contaminated by #POOL inside !#pr)
+    [-]                            ; clear POOL residue from cell 0
+
+    ; Move accumulator (cell 2) to cell 0 for decimal printing
+    >> [- << + >>] <<              ; cell 0 = acc, cell 2 = 0
+
+    ; Print accumulated value as decimal ASCII
+    !#.+                           ; prints cell 0 as decimal digits
+    ; ptr = 0 after !#.+, cell 0 = 0
+
+    ; Emit: ULL);\n
+    #POOL @ "ULL);\n\0" #0 @ !#pr
+    ; ptr = 0 after !#pr
+
+    ; Restore non-digit char from stack into cell 0
+    ~                              ; cell 0 = non-digit char
+
+    ^
+}
