@@ -158,6 +158,26 @@ run_test "selfhost_intrinsics" \
     "$SCRIPT_DIR/test_selfhost_intrinsics.bfpp" \
     "$SCRIPT_DIR/expected_selfhost_intrinsics.txt"
 
+# Integer arithmetic intrinsics (__mul, __div, __mod — thorough)
+run_test "arithmetic_intrinsics" \
+    "$SCRIPT_DIR/test_arithmetic_intrinsics.bfpp" \
+    "$SCRIPT_DIR/expected_arithmetic_intrinsics.txt"
+
+# String intrinsics (__strlen, __strcmp — thorough)
+run_test "string_intrinsics" \
+    "$SCRIPT_DIR/test_string_intrinsics.bfpp" \
+    "$SCRIPT_DIR/expected_string_intrinsics.txt"
+
+# Indirect call (__call), %4 cell width, #N numeric literals
+run_test "indirect_call" \
+    "$SCRIPT_DIR/test_indirect_call.bfpp" \
+    "$SCRIPT_DIR/expected_indirect_call.txt"
+
+# Advanced macros (!define/!undef redefine, nested ?{}, ?= #N chained)
+run_test "macros_advanced" \
+    "$SCRIPT_DIR/test_macros_advanced.bfpp" \
+    "$SCRIPT_DIR/expected_macros_advanced.txt"
+
 # Advanced optimizer passes (constant fold, DCE, inline, conditional eval)
 run_test "optimizer_advanced" \
     "$SCRIPT_DIR/test_optimizer_advanced.bfpp" \

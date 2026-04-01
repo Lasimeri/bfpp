@@ -143,9 +143,9 @@
     ?= #35 [                ; if '#'
         [-]                 ; clear '#'
 
-        ; Set up name buffer write pointer at cell 10 = 500
+        ; Set up name buffer write pointer at cell 10 = 16
         >>>>>>>>>>          ; ptr = 10
-        %4 #500             ; cell_width[10] = 4, tape[10..13] = 500
+        %4 #16              ; cell_width[10] = 4, tape[10..13] = 16
         <<<<<<<<<<          ; ptr = 0
         %1                  ; cell_width[0] = 1
 

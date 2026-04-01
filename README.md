@@ -150,11 +150,12 @@ source.bfpp
 | Stage | File | Key Mechanism |
 |-------|------|---------------|
 | Preprocess | `preprocess.rs` | Line-by-line `!include` expansion, `!define`/`!undef` macro substitution. Resolves relative to source dir, then `--include` paths, then `./stdlib/`, then exe-adjacent `stdlib/`. Cycle detection via canonical path HashSet. Max depth 64 |
-| Lex | `lexer.rs` | Peek-based character dispatcher. Multi-char tokens (strings, subroutines, fd specs, FFI, numeric literals, block comments) consume inline. Backslash lookahead cloning for `\ffi` vs `\` disambiguation. `#N`/`#0xHH` parsed as decimal/hex immediates. `/* */` with nesting depth counter. `%N` disambiguated by lookahead for 1/2/4/8 |
+| Lex | `lexer.rs` | Peek-based character dispatcher. Multi-char tokens (strings, subroutines, fd specs, FFI, numeric literals, block comments) consume inline. Backslash lookahead cloning for `\ffi` vs `\` disambiguation. `#N`/`#0xHH` parsed as decimal/hex immediates. `/* */` with nesting depth counter. `%N` disambiguated by lookahead for 1/2/4/8. Optional GPU acceleration via OpenCL (`--features gpu`) for parallel character classification on large sources |
 | Parse | `parser.rs` | `parse_block`/`parse_single` recursive descent. `BlockEnd` enum tracks context (`]` vs `}` vs EOF). Consecutive movement/arithmetic tokens coalesced via `count_consecutive`. `*` recursively wraps the next single op. `R{...}K{...}` pairing enforced here |
-| Analyze | `analyzer.rs` | Four passes: (1) collect sub defs/calls into HashSets, check for undefined calls; (2) detect duplicate defs with separate `seen` set; (3) warn on top-level `^`; (4) reject empty FFI names |
-| Optimize | `optimizer.rs` | Ordered peephole passes: clear-loop -> scan-loop -> multiply-move -> error-folding. Each pass recurses into all block-containing nodes |
-| Codegen | `codegen.rs` | Emits C header (includes, defines, runtime state, helper functions, errno mapping, syscall wrapper, constructor, optional SDL2 framebuffer, optional dlfcn), forward-declares subs, emits sub bodies with call-depth guards, then main(). Subroutine names mangled for C identifier compatibility. `__`-prefixed sub calls are intercepted as compiler intrinsics (inline C emission). Intrinsic usage detection drives conditional `#include` emission and TUI runtime linking |
+| Analyze | `analyzer.rs` | Four passes: (1) collect sub defs/calls into HashSets, check for undefined calls; (2) detect duplicate defs with separate `seen` set; (3) warn on top-level `^`; (4) reject empty FFI names. Passes 2+4 run in parallel via `rayon::join` |
+| Optimize | `optimizer.rs` | 12 ordered peephole passes: clear-loop, scan-loop, multiply-move, error-folding, constant-fold, conditional eval, loop unrolling, move coalescing, tail return elimination, second fold round. Per-subroutine optimization parallelized via rayon. Each pass recurses into all block-containing nodes |
+| Codegen | `codegen.rs` | Emits C header (includes, defines, runtime state, helper functions, errno mapping, syscall wrapper, constructor, optional SDL2 framebuffer, optional dlfcn), forward-declares subs, emits sub bodies with call-depth guards, then main(). Subroutine bodies emitted in parallel via rayon `par_iter`. Subroutine names mangled for C identifier compatibility. `__`-prefixed sub calls are intercepted as compiler intrinsics (inline C emission). Intrinsic usage detection drives conditional `#include` emission and runtime linking |
+| CC | `main.rs` | Parallel compilation: per-subroutine `.c` files compiled concurrently via threaded `cc -c`, then linked. Passes `-mavx2 -mfma` on x86_64 |
 
 ---
 
@@ -216,6 +217,12 @@ bfpp ffi_demo.bfpp -o ffi_demo
 
 # 3D rendering (links GL, GLEW, math; requires SDL2 framebuffer)
 bfpp examples/3d_demo.bfpp --include stdlib --framebuffer 640x480 --tape-size 1048576 -o 3d_demo
+
+# Build the bootstrap compiler (BF++ compiler written in BF++)
+bfpp bootstrap/bfpp_self.bfpp --include bootstrap --include stdlib --tape-size 1048576 -o bfpp_bootstrap
+
+# GPU-accelerated compilation (requires OpenCL)
+cargo build --release --features gpu
 ```
 
 ---
@@ -583,6 +590,25 @@ Primitives for writing a BF++ compiler in BF++. These provide efficient operatio
 | `!#__array_insert` | Array addr + index + value | Insert element at index |
 | `!#__array_remove` | Array addr + index | Remove element at index |
 
+### GPU Compute Intrinsics (OpenCL)
+
+Available when `__gpu_*` intrinsics are used. Requires OpenCL runtime (`libOpenCL.so`). Programs can offload parallel computation to GPU hardware. The compiler auto-links `runtime/bfpp_rt_opencl.{c,h}` and `-lOpenCL` (via `dlopen`).
+
+| Intrinsic | Input | Output / Effect |
+|-----------|-------|-----------------|
+| `!#__gpu_init` | -- | Initialize OpenCL context + command queue |
+| `!#__gpu_count` | -- | `tape[ptr]` = number of OpenCL-capable GPUs |
+| `!#__gpu_memset` | `tape[ptr]` = addr, `[ptr+1]` = value, `[ptr+2]` = count | Fill GPU-side buffer |
+| `!#__gpu_memcpy` | `tape[ptr]` = dest, `[ptr+1]` = src, `[ptr+2]` = count | Copy between tape and GPU memory |
+| `!#__gpu_sort` | `tape[ptr]` = addr, `[ptr+1]` = count | GPU-accelerated parallel sort |
+| `!#__gpu_reduce` | `tape[ptr]` = addr, `[ptr+1]` = count, `[ptr+2]` = op | Parallel reduction (sum, min, max) |
+| `!#__gpu_transform` | `tape[ptr]` = addr, `[ptr+1]` = count, `[ptr+2]` = op | Per-element transform kernel |
+| `!#__gpu_rasterize` | Rasterization params from tape | GPU-accelerated rasterization |
+| `!#__gpu_blur` | `tape[ptr]` = addr, `[ptr+1]` = w, `[ptr+2]` = h, `[ptr+3]` = radius | GPU box blur |
+| `!#__gpu_poll` | -- | `tape[ptr]` = 1 if last async op completed, 0 if pending |
+| `!#__gpu_wait` | -- | Block until pending GPU operations complete |
+| `!#__gpu_dispatch` | `tape[ptr]` = kernel_id, params from tape | Dispatch a custom OpenCL kernel |
+
 ---
 
 ## TUI Runtime Library
@@ -652,17 +678,18 @@ Shell-based runner. Compiles `.bfpp` sources, runs binaries, compares stdout aga
 
 ```
 bfpp/
-  Cargo.toml              -- crate metadata, clap dependency
+  Cargo.toml              -- crate metadata: clap, rayon, opencl3 (optional)
   src/
-    main.rs               -- CLI (clap derive), compilation pipeline orchestration
+    main.rs               -- CLI (clap derive), compilation pipeline orchestration, parallel CC
     ast.rs                -- AstNode enum, FdSpec, Program struct
     lexer.rs              -- Single-pass tokenizer, string/fd/sub/FFI parsers
     parser.rs             -- Recursive descent, coalescing, R/K pairing
-    analyzer.rs           -- 4-pass semantic validation
-    optimizer.rs          -- Peephole passes (clear, scan, multiply-move, error-fold)
-    codegen.rs            -- AST -> C source, runtime emission, name mangling
+    analyzer.rs           -- 4-pass semantic validation (passes 2+4 parallel via rayon)
+    optimizer.rs          -- 12 peephole passes (clear, scan, multiply-move, error-fold, etc.)
+    codegen.rs            -- AST -> C source, runtime emission, name mangling (parallel emission)
     error_codes.rs        -- Error code constants (Rust), errno mapping (C source)
     preprocess.rs         -- !include expansion, path resolution, cycle detection
+    gpu.rs                -- OpenCL GPU-accelerated lexing + pattern detection (optional, --features gpu)
   stdlib/
     io.bfpp               -- print_string, print_int, read_line, read_int
     math.bfpp             -- multiply, divide, modulo, power
@@ -675,6 +702,11 @@ bfpp/
     graphics.bfpp         -- SDL2 framebuffer: set_pixel, get_pixel, clear_fb, fill_rect, draw_hline
     3d.bfpp               -- 3D rendering: ~45 intrinsics (GL proxy, Q16.16 math, mesh generators)
     math3d.bfpp           -- Pure BF++ 3D math (585 lines: vectors, matrices, transforms)
+  bootstrap/
+    bfpp_self.bfpp        -- Self-hosting BF++ compiler (main driver)
+    parse_num.bfpp        -- Numeric literal parser for bootstrap compiler
+    parse_str.bfpp        -- String literal parser for bootstrap compiler
+    parse_sub.bfpp        -- Subroutine definition/call parser for bootstrap compiler
   spec/
     BFPP_SPEC.md          -- Full language specification
     ERROR_CODES.md        -- Error code table and errno mapping
@@ -689,11 +721,14 @@ bfpp/
     framebuffer_demo.bfpp -- SDL2 framebuffer example
     tui_demo.bfpp         -- ANSI terminal UI demo
     3d_demo.bfpp          -- 3D rendering demo (OpenGL + software fallback)
+    editor.bfpp           -- Terminal text editor (TUI intrinsics, multicore save)
+    thread_test.bfpp      -- Threading intrinsics demo
+    intrinsics_demo.bfpp  -- Compiler intrinsics demo (getenv, getpid, time, sleep)
   tests/
     integration/
       test_runner.sh      -- Integration test harness
-      expected_*.txt      -- Expected output files
-      test_*.bfpp         -- Test source files
+      expected_*.txt      -- Expected output files (22 files)
+      test_*.bfpp         -- Test source files (23 programs)
       classic_bf/         -- Classic BF compatibility tests
   benchmarks/             -- Performance benchmarks
   runtime/
@@ -704,11 +739,20 @@ bfpp/
     bfpp_rt_3d_shaders.h  -- Embedded GLSL shaders (Blinn-Phong + PCF shadows)
     bfpp_rt_3d_math.c     -- Q16.16 fixed-point math (sin/cos LUT, 4x4 matrices)
     bfpp_rt_3d_meshgen.c  -- Mesh generators (cube, sphere, torus, plane, cylinder)
-    bfpp_rt_3d_software.c -- Software rasterizer fallback (edge-function, SSE SIMD)
+    bfpp_rt_3d_software.c -- Software rasterizer fallback (edge-function, AVX2 + SSE SIMD)
     bfpp_rt_3d_multigpu.h -- Multi-GPU header (EGL contexts, SFR/AFR/AUTO, command replay)
     bfpp_rt_3d_multigpu.c -- Multi-GPU impl (NUMA-aware alloc, thread pinning, frame pacing)
     bfpp_rt_3d_oracle.h   -- Scene oracle header (lock-free SPSC triple buffer)
     bfpp_rt_3d_oracle.c   -- Scene oracle impl (temporal extrapolation, Rodrigues rotation)
+    bfpp_fb_pipeline.h    -- Framebuffer pipeline header (render threads, presenter)
+    bfpp_fb_pipeline.c    -- Framebuffer pipeline impl (8 render threads, vsync presenter)
+    bfpp_fb_terminal.h    -- Terminal framebuffer header (headless/SSH rendering)
+    bfpp_fb_terminal.c    -- Terminal framebuffer impl (true-color ANSI, delta encoding, adaptive fps)
+    bfpp_rt_opencl.h      -- OpenCL GPU compute header (12 compute intrinsics)
+    bfpp_rt_opencl.c      -- OpenCL GPU compute impl (kernel dispatch, memory management)
+    bfpp_rt_opencl_kernels.h -- Embedded OpenCL kernel source strings
+    bfpp_rt_parallel.h    -- Threading runtime header (spawn, join, mutex, barrier, atomics)
+    bfpp_rt_parallel.c    -- Threading runtime impl (up to 128 threads, 256 mutexes)
 ```
 
 ---

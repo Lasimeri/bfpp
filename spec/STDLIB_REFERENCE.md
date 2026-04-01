@@ -1,6 +1,6 @@
 # BF++ Standard Library Reference
 
-**Version**: 0.4.0
+**Version**: 0.5.0
 
 ---
 
@@ -348,3 +348,48 @@ F                           ; flush to screen
 |------------|--------|------|---------|-------------|
 | cube_mesh | `\cmsh` | `tape[ptr]`=dest_addr, `[ptr+1]`=size (Q16.16) | `tape[ptr]` = vertex count | Generate cube mesh vertices in pure BF++. Writes 36 vertices (6 faces x 2 triangles) with positions and normals. |
 | plane_mesh | `\pmsh` | `tape[ptr]`=dest_addr, `[ptr+1]`=width, `[ptr+2]`=depth (Q16.16) | `tape[ptr]` = vertex count | Generate plane mesh (2 triangles, 6 vertices) with positions and normals in pure BF++. |
+
+---
+
+## Bootstrap Compiler (`bootstrap/`)
+
+A self-hosting BF++ compiler written in BF++, demonstrating the language's self-hosting capability. Located in the `bootstrap/` directory (not in `stdlib/`). Consists of 4 files totaling ~565 lines.
+
+**Status**: Working. Parses a subset of BF++ and emits C output.
+
+### Files
+
+| File | Lines | Description |
+|------|-------|-------------|
+| `bfpp_self.bfpp` | 157 | Main compiler driver. Reads source from stdin, dispatches to parsers, emits C preamble (includes, tape/stack declarations, main function) and postamble. Handles core BF operators (`><+-.,[]`), string literals, numeric literals, subroutine definitions/calls, and comments. |
+| `parse_num.bfpp` | 92 | Parses `#N` numeric literals (decimal and `#0xHH` hex) and `%N` cell width directives. Emits corresponding `bfpp_set()` and `cell_width[]` assignment C code. |
+| `parse_str.bfpp` | 75 | Parses `"..."` string literals with escape sequence support (`\0`, `\n`, `\t`, `\\`, `\"`, `\xHH`). Emits per-byte `bfpp_set()` and `ptr++` C code for each character. |
+| `parse_sub.bfpp` | 241 | Parses `!#name{...}` subroutine definitions and `!#name` calls. Handles subroutine name mangling, forward declarations, call-depth guards, and `^` return emission. Uses `__hashmap_*` intrinsics to track defined subroutine names. |
+
+### Dependencies
+
+The bootstrap compiler relies on the self-hosting intrinsics:
+- **Arithmetic**: `__mul`, `__div`, `__mod` — for numeric literal parsing and address computation
+- **String**: `__strcmp`, `__strlen`, `__strcpy` — for subroutine name matching and C identifier mangling
+- **Dispatch**: `__call` — for computed handler dispatch (character classification -> parser function)
+- **Data structures**: `__hashmap_init`, `__hashmap_get`, `__hashmap_set` — for subroutine name registry
+- **Array**: `__array_insert`, `__array_remove` — for managing token buffers
+
+### Usage
+
+```sh
+# Build the bootstrap compiler
+bfpp bootstrap/bfpp_self.bfpp --include bootstrap --include stdlib --tape-size 1048576 -o bfpp_bootstrap
+
+# Compile a BF++ program using the bootstrap compiler
+echo '"Hello, World!\n\0" <<<<<<<<<<<<<<< [.>]' | ./bfpp_bootstrap > hello.c
+cc -O2 hello.c -o hello
+./hello
+```
+
+### Limitations
+
+- Parses a subset of BF++ (core ops, strings, numeric literals, subroutines, comments)
+- Does not support: FFI, framebuffer, 3D intrinsics, preprocessor macros, if/else syntax, threading
+- Single-pass compilation (no optimizer passes)
+- Output C code is not optimized (no coalescing or peephole passes)

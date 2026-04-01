@@ -1,8 +1,8 @@
 # BF++ Language Specification
 
-**Version**: 0.4.0
+**Version**: 0.5.0
 **Status**: Draft
-**Date**: 2026-03-31
+**Date**: 2026-04-01
 
 ---
 
@@ -426,6 +426,46 @@ Intrinsics for arithmetic, string operations, indirect calls, and data structure
 | `__array_insert` | `tape[ptr]`=array_addr, `tape[ptr+1]`=index, `tape[ptr+2]`=elem_size, `tape[ptr+3]`=count, `tape[ptr+4]`=value_addr | — | Insert element at index. Shifts subsequent elements right. |
 | `__array_remove` | `tape[ptr]`=array_addr, `tape[ptr+1]`=index, `tape[ptr+2]`=elem_size, `tape[ptr+3]`=count | — | Remove element at index. Shifts subsequent elements left. |
 
+#### 3.8.11 GPU Compute (OpenCL)
+
+GPU compute intrinsics offload parallel operations to OpenCL-capable GPUs. The runtime (`bfpp_rt_opencl.{c,h}`) loads `libOpenCL.so` via `dlopen` at init. Programs degrade gracefully on systems without GPU compute.
+
+| Intrinsic | Input Tape Layout | Output | Effect |
+|-----------|-------------------|--------|--------|
+| `__gpu_init` | — | — | Initialize OpenCL context, select best GPU, create command queue. |
+| `__gpu_count` | — | `tape[ptr]` = GPU count | Query number of OpenCL-capable devices. |
+| `__gpu_memset` | `[ptr]`=addr, `[ptr+4]`=value, `[ptr+8]`=count | — | Fill GPU-side buffer with value. |
+| `__gpu_memcpy` | `[ptr]`=dest, `[ptr+4]`=src, `[ptr+8]`=count | — | Copy between tape memory and GPU memory. |
+| `__gpu_sort` | `[ptr]`=addr, `[ptr+4]`=count | Sorted data at addr | GPU-accelerated parallel sort (bitonic sort kernel). |
+| `__gpu_reduce` | `[ptr]`=addr, `[ptr+4]`=count, `[ptr+8]`=op (0=sum, 1=min, 2=max) | `tape[ptr]` = result | Parallel reduction across array. |
+| `__gpu_transform` | `[ptr]`=addr, `[ptr+4]`=count, `[ptr+8]`=op | Transformed data at addr | Per-element transform kernel. |
+| `__gpu_rasterize` | Rasterization params from tape | — | GPU-accelerated triangle rasterization. |
+| `__gpu_blur` | `[ptr]`=addr, `[ptr+4]`=w, `[ptr+8]`=h, `[ptr+12]`=radius | Blurred image at addr | GPU box blur kernel. |
+| `__gpu_poll` | — | `tape[ptr]` = 0/1 | Check if last async operation completed. |
+| `__gpu_wait` | — | — | Block until all pending GPU operations complete. |
+| `__gpu_dispatch` | `[ptr]`=kernel_id, params from tape | — | Dispatch a custom OpenCL kernel by ID. |
+
+**Runtime files**: `bfpp_rt_opencl.c/h` (OpenCL context management, kernel dispatch, memory transfer), `bfpp_rt_opencl_kernels.h` (embedded OpenCL kernel source strings).
+
+#### 3.8.12 Terminal Framebuffer Backend
+
+When `--framebuffer WxH` is active and no display server is detected (or `BFPP_TERMINAL_FB=1` is set), the runtime uses a terminal-based framebuffer backend (`bfpp_fb_terminal.{c,h}`) instead of SDL2.
+
+**Features**:
+- True-color ANSI rendering (24-bit `ESC[38;2;r;g;bm` sequences)
+- Delta encoding: only changed pixels are re-emitted between frames
+- Half-block characters (`▀` / `▄`) for 2x vertical resolution
+- Adaptive frame rate targeting configurable bandwidth (`BFPP_TERMINAL_BW`, default 256 KB/s)
+- No code changes needed — the `F` flush operator works identically on both backends
+
+**Environment variables**:
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `BFPP_TERMINAL_FB` | auto-detect | Force terminal backend when set to `1` |
+| `BFPP_TERMINAL_BW` | 256 | Target bandwidth in KB/s |
+
+**Runtime files**: `bfpp_fb_terminal.c/h`.
+
 ### 3.9 C Runtime Library (`bfpp_rt.h`)
 
 The C runtime library provides a double-buffered TUI subsystem for programs that need terminal UI beyond what ANSI escape sequences in BF++ can efficiently provide. It is automatically linked when any `__tui_*` intrinsic is used.
@@ -632,6 +672,50 @@ The compiler performs up to 12 optimization passes at `-O2`. Passes are applied 
 | 10 | Second fold+coalesce round | Re-run constant folding and move/increment coalescing after inline/unroll expose new patterns | `-O2` |
 | 11 | Copy loop optimization | `[->+<]` patterns → direct assignment | `-O2` |
 | 12 | Scan loop optimization | `[>]` / `[<]` → memchr-based scan | `-O2` |
+
+### 6.6 Parallel Compilation
+
+The compiler supports parallel compilation for improved throughput:
+
+1. **Parallel codegen**: Subroutine bodies are emitted concurrently using `rayon` `par_iter`. Each subroutine body is generated into an independent buffer, then concatenated in definition order.
+2. **Parallel analysis**: Analyzer passes 2 (duplicate definition detection) and 4 (empty FFI name rejection) run concurrently via `rayon::join`.
+3. **Parallel CC invocation**: The generated C code is split into per-subroutine translation units (`.c` files), compiled in parallel via threaded `cc -c` invocations, then linked in a final pass.
+
+### 6.7 CC Flags
+
+| Flag | Condition |
+|------|-----------|
+| `-O2 -Wall` | Always |
+| `-mavx2 -mfma` | x86_64 targets |
+| `-lSDL2` | Framebuffer mode |
+| `-ldl` | FFI usage |
+| `-lGL -lGLEW -lm` | 3D intrinsics |
+| `-lEGL` | Multi-GPU intrinsics |
+| `-lOpenCL` | GPU compute intrinsics (via `dlopen`) |
+| `-lpthread` | Threading intrinsics |
+
+### 6.8 GPU-Accelerated Compilation
+
+When built with `--features gpu`, the compiler uses OpenCL to accelerate lexing:
+- **Character classification kernel**: each source byte is classified into a token type code in parallel on the GPU.
+- **Pattern detection kernel**: identifies multi-character patterns (clear loops, scan loops, multiply-move).
+- Falls back to CPU when source is under 10KB or OpenCL is unavailable.
+- Produces identical results to the CPU path.
+
+Requires the `opencl3` crate (optional dependency).
+
+### 6.9 Bootstrap Compiler
+
+The `bootstrap/` directory contains a self-hosting BF++ compiler written in BF++:
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `bfpp_self.bfpp` | 157 | Main compiler driver |
+| `parse_num.bfpp` | 92 | Numeric literal + cell width parser |
+| `parse_str.bfpp` | 75 | String literal parser with escape sequences |
+| `parse_sub.bfpp` | 241 | Subroutine definition/call parser |
+
+The bootstrap compiler uses the self-hosting intrinsics (`__mul`, `__div`, `__mod`, `__strcmp`, `__strlen`, `__strcpy`, `__call`, `__hashmap_*`, `__array_*`) for efficient parsing and code generation. It parses a subset of BF++ and emits C output.
 
 ---
 

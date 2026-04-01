@@ -54,6 +54,12 @@
 | **Hash maps** | Not possible | `__hashmap_init/get/set` | Runtime hash map data structure via intrinsics |
 | **Indirect calls** | Not possible | `__call` (dispatch by subroutine index) | Computed dispatch tables; call subroutine determined at runtime |
 | **Self-hosting capability** | No (no arithmetic, no strings, no data structures) | Self-hosting intrinsic set enables writing BF++ compiler in BF++ | Arithmetic + strings + hash maps + indirect dispatch = sufficient for a compiler |
+| **Bootstrap compiler** | N/A | `bootstrap/bfpp_self.bfpp` — BF++ compiler written in BF++ | Parses subset of BF++, emits C. 4 files, ~565 lines of BF++ |
+| **GPU compute** | Not possible | 12 `__gpu_*` OpenCL intrinsics: init, memset, memcpy, sort, reduce, transform, rasterize, blur, poll, wait, dispatch | Offload parallel computation to GPU. Runtime loads `libOpenCL.so` via `dlopen` |
+| **GPU-accelerated compilation** | N/A | `--features gpu` enables OpenCL-accelerated lexing | Parallel character classification + pattern detection on GPU. Falls back to CPU for small sources or when OpenCL is unavailable |
+| **Terminal rendering** | Not possible | Terminal framebuffer backend (`bfpp_fb_terminal.c`) — true-color ANSI with delta encoding | Auto-detected on headless/SSH. Half-block characters for 2x vertical resolution. Adaptive fps targeting 256KB/s bandwidth |
+| **Parallel compilation** | N/A | Per-subroutine `.c` files compiled concurrently via threaded `cc -c` | Plus parallel codegen (rayon `par_iter`) and parallel analysis (rayon `join`) |
+| **AVX2 SIMD** | N/A | Dirty detection, row flip, 8-pixel edge functions, terminal downsampling | `-mavx2 -mfma` CC flags on x86_64. Software rasterizer + framebuffer pipeline |
 | **Watch mode** | N/A | `--watch` flag for auto-recompilation | Monitors source files and recompiles on change |
 
 ---

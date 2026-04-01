@@ -1,0 +1,6 @@
+ABCDE
+EDCBA
+AAA
+CAB
+3
+2

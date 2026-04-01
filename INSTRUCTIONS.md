@@ -19,12 +19,19 @@ BF++ is a Rust project that transpiles BF++ source to C, then invokes a C compil
 - EGL headers (only if using multi-GPU intrinsics)
   - Debian/Ubuntu: `sudo apt install libegl-dev`
   - Usually included with NVIDIA proprietary drivers; no extra package needed on Arch with NVIDIA
+- OpenCL runtime (only if using `__gpu_*` compute intrinsics in programs, or `--features gpu` for compiler acceleration)
+  - Arch: `sudo pacman -S opencl-headers ocl-icd` (plus GPU-specific ICD: `opencl-nvidia` or `opencl-mesa`)
+  - Debian/Ubuntu: `sudo apt install opencl-headers ocl-icd-libopencl1`
+- AVX2-capable CPU recommended for x86_64 targets (the compiler passes `-mavx2 -mfma` to `cc` automatically)
 
 Build from source:
 
 ```sh
 cd bfpp
 cargo build --release
+
+# With GPU-accelerated compilation (optional — accelerates lexing on large sources):
+cargo build --release --features gpu
 ```
 
 The binary is at `target/release/bfpp`. Optionally add it to PATH:
@@ -996,6 +1003,91 @@ These intrinsics provide efficient primitives for writing a BF++ compiler in BF+
 ,                         ; read input byte
 !#__call                  ; call handler[tape[ptr]]
 ```
+
+---
+
+#### 22. GPU Compute Intrinsics (OpenCL)
+
+The `__gpu_*` intrinsics offload parallel computation to OpenCL-capable GPUs. Programs using these intrinsics get `runtime/bfpp_rt_opencl.{c,h}` auto-linked. The runtime loads `libOpenCL.so` via `dlopen` at init, so programs degrade gracefully on systems without GPU compute.
+
+| Intrinsic | Input | Output | Description |
+|-----------|-------|--------|-------------|
+| `!#__gpu_init` | -- | -- | Initialize OpenCL context + command queue |
+| `!#__gpu_count` | -- | `[ptr]=count` | Query number of OpenCL GPUs |
+| `!#__gpu_memset` | `[ptr]=addr, [+1]=value, [+2]=count` | -- | Fill GPU buffer |
+| `!#__gpu_memcpy` | `[ptr]=dest, [+1]=src, [+2]=count` | -- | Copy tape <-> GPU memory |
+| `!#__gpu_sort` | `[ptr]=addr, [+1]=count` | Sorted data at addr | GPU parallel sort |
+| `!#__gpu_reduce` | `[ptr]=addr, [+1]=count, [+2]=op` | `[ptr]=result` | Parallel reduction |
+| `!#__gpu_transform` | `[ptr]=addr, [+1]=count, [+2]=op` | Transformed data | Per-element transform |
+| `!#__gpu_rasterize` | Params from tape | -- | GPU-accelerated rasterization |
+| `!#__gpu_blur` | `[ptr]=addr, [+1]=w, [+2]=h, [+3]=radius` | Blurred data | GPU box blur |
+| `!#__gpu_poll` | -- | `[ptr]=0/1` | Check if async op completed |
+| `!#__gpu_wait` | -- | -- | Block until GPU operations complete |
+| `!#__gpu_dispatch` | `[ptr]=kernel_id, params` | -- | Dispatch custom kernel |
+
+---
+
+#### 23. Terminal Framebuffer Backend
+
+When `--framebuffer WxH` is active but no display server is available (headless, SSH), the runtime automatically falls back to a terminal framebuffer backend (`runtime/bfpp_fb_terminal.{c,h}`). This renders frames as true-color ANSI escape sequences with delta encoding.
+
+**Environment variables:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BFPP_TERMINAL_FB` | auto-detect | Set to `1` to force terminal backend even when a display server is available |
+| `BFPP_TERMINAL_BW` | 256 | Target bandwidth in KB/s. Adaptive frame rate adjusts to stay within this budget. Set lower for slow SSH connections |
+
+The terminal backend uses half-block characters (`▀` / `▄`) to double vertical resolution — each terminal row displays two pixel rows. Delta encoding skips unchanged regions between frames. Press `q` or `Ctrl+C` to quit.
+
+No code changes are needed to switch between SDL2 and terminal rendering — the runtime detects the environment and selects the appropriate backend.
+
+---
+
+#### 24. Bootstrap Compiler
+
+The `bootstrap/` directory contains a self-hosting BF++ compiler written in BF++ itself. This demonstrates the language's self-hosting capability — the bootstrap compiler can parse a subset of BF++ and emit C output.
+
+**Files:**
+
+| File | Description |
+|------|-------------|
+| `bfpp_self.bfpp` | Main compiler driver: reads source, dispatches to parsers, emits C preamble/postamble |
+| `parse_num.bfpp` | Parses `#N` numeric literals and `%N` cell width directives |
+| `parse_str.bfpp` | Parses `"..."` string literals with escape sequences |
+| `parse_sub.bfpp` | Parses `!#name{...}` subroutine definitions and `!#name` calls |
+
+**Compile and run the bootstrap compiler:**
+
+```sh
+# Build the bootstrap compiler
+bfpp bootstrap/bfpp_self.bfpp --include bootstrap --include stdlib --tape-size 1048576 -o bfpp_bootstrap
+
+# Use it to compile a BF++ program
+echo '"Hello\n\0" <<<<<< [.>]' | ./bfpp_bootstrap > hello.c
+cc -O2 hello.c -o hello
+./hello
+```
+
+The bootstrap compiler uses `__mul`, `__div`, `__mod`, `__strcmp`, `__strlen`, `__strcpy`, `__call`, `__hashmap_*`, and `__array_*` self-hosting intrinsics for efficient parsing and code generation.
+
+---
+
+#### 25. AVX2 SIMD and Parallel Compilation
+
+**AVX2 acceleration**: On x86_64 targets, the compiler passes `-mavx2 -mfma` to `cc`. The software rasterizer and framebuffer pipeline use AVX2 intrinsics for:
+- Dirty region detection (8-pixel-wide comparisons)
+- Row flip (framebuffer Y-axis correction)
+- 8-pixel edge function evaluation (triangle rasterization)
+- Terminal downsampling (pixel averaging for half-block rendering)
+
+If the target CPU does not support AVX2, you can override CC flags: `bfpp program.bfpp --cc "cc -O2 -march=native"`.
+
+**Parallel compilation**: The compiler splits generated code into per-subroutine `.c` files, then compiles them in parallel using threaded `cc -c` invocations. The object files are linked in a final pass. This significantly speeds up compilation for programs with many subroutines.
+
+**Parallel codegen**: Subroutine bodies are emitted concurrently via `rayon` `par_iter`.
+
+**Parallel analysis**: Analyzer passes 2 and 4 run concurrently via `rayon::join`.
 
 ---
 
