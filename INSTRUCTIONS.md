@@ -624,7 +624,116 @@ The `!include` directive splices another file's contents into the source before 
 
 ---
 
-#### 15. Compiler Intrinsics
+#### 15. Preprocessor Macros
+
+`!define NAME VALUE` creates a text-substitution macro. All subsequent occurrences of `NAME` in the source are replaced with `VALUE` during preprocessing (before lexing). `!undef NAME` removes a previously defined macro.
+
+**Defining and using macros:**
+
+```bfpp
+!define WIDTH 320
+!define HEIGHT 200
+!define PIXEL_SIZE 3
+
+; These expand at compile time:
+%4 #WIDTH >        ; becomes: %4 #320 >
+#HEIGHT >          ; becomes: #200 >
+#PIXEL_SIZE        ; becomes: #3
+```
+
+**Conditional compilation pattern:**
+
+```bfpp
+!define DEBUG 1
+
+; Later in code, use !undef to disable:
+!undef DEBUG
+!define DEBUG 0
+```
+
+**Rules:**
+- Macros are expanded left-to-right during preprocessing, before lexing.
+- `!define` is line-scoped: NAME is the first token after `!define`, VALUE is everything after it on the same line.
+- Macro names are case-sensitive.
+- Macros can reference other macros (expanded recursively).
+- `!undef` on an undefined name is a no-op.
+
+---
+
+#### 16. If/Else Syntax
+
+`?{true_body}:{false_body}` is a destructive truthiness test on the current cell. If `tape[ptr]` is nonzero, the true body executes; otherwise the false body executes. The cell is consumed (set to 0) by the test.
+
+```bfpp
+; If cell != 0, print 'Y'; else print 'N'
+?{
+  #89 .              ; print 'Y'
+}:{
+  #78 .              ; print 'N'
+}
+```
+
+**Comparison with `[...]`:**
+
+The `[...]` loop tests without consuming and repeats. `?{...}:{...}` tests once, destructively, and provides an else branch.
+
+```bfpp
+; Using loops: no else branch, cell must be manually cleared
+[
+  ; nonzero path
+  [-]                ; must clear to exit loop
+]
+
+; Using if/else: clean, one-shot, with else
+?{
+  ; nonzero path (cell already consumed)
+}:{
+  ; zero path
+}
+```
+
+**Nested if/else:**
+
+```bfpp
+?{
+  ; outer true
+  > ?{
+    ; inner true
+  }:{
+    ; inner false
+  }
+}:{
+  ; outer false
+}
+```
+
+**Note:** The cell is destroyed by the test. If you need the value after the branch, push it to the stack first with `$`.
+
+---
+
+#### 17. Watch Mode
+
+The `--watch` flag makes the compiler monitor source files for changes and automatically recompile:
+
+```sh
+bfpp program.bfpp --watch
+```
+
+When a source file (including any `!include`d files) changes on disk, the compiler re-runs the full pipeline (preprocess, lex, parse, analyze, optimize, codegen, compile). Errors are printed but do not terminate the watch loop — the compiler waits for the next change.
+
+Useful during development with a separate terminal running the compiled binary.
+
+```sh
+# Terminal 1: watch and recompile
+bfpp editor.bfpp --framebuffer 640x480 --watch -o editor
+
+# Terminal 2: run (re-run after each recompile)
+./editor
+```
+
+---
+
+#### 18. Compiler Intrinsics
 
 Compiler intrinsics are subroutine calls with names prefixed by `__` (double underscore). Instead of generating BF++ subroutine call/return sequences, the compiler replaces each intrinsic call with inline C code. This provides direct access to OS facilities (terminal control, time, environment, process management) and the TUI runtime library without raw syscall setup.
 
@@ -714,7 +823,7 @@ Unrecognized intrinsic names (any `!#__` name not in the table above) emit a C c
 
 ---
 
-#### 16. TUI Runtime
+#### 19. TUI Runtime
 
 The TUI runtime (`runtime/bfpp_rt.{h,c}`) provides a double-buffered terminal UI system. It is linked automatically when any `__tui_*` intrinsic is used. The runtime handles raw mode, alternate screen, cursor hiding, and efficient diff-based rendering.
 
@@ -806,6 +915,86 @@ The TUI runtime (`runtime/bfpp_rt.{h,c}`) provides a double-buffered terminal UI
 
 [-] #0 !#__tui_key
 !#__tui_cleanup
+```
+
+---
+
+#### 20. SDL Input and Texture Intrinsics
+
+SDL input intrinsics provide keyboard and mouse input from the SDL window (requires `--framebuffer`).
+
+| Intrinsic | Input | Output | Description |
+|-----------|-------|--------|-------------|
+| `!#__input_poll` | -- | -- | Poll SDL event queue, update internal input state |
+| `!#__input_mouse_pos` | -- | `[ptr]=x, [ptr+1]=y` | Get current mouse position |
+| `!#__input_key_held` | `[ptr]=scancode` | `[ptr]=0 or 1` | Check if a key is currently held |
+
+Texture intrinsics for loading and managing GPU textures:
+
+| Intrinsic | Input | Output | Description |
+|-----------|-------|--------|-------------|
+| `!#__gl_create_texture` | -- | `[ptr]=tex_id` | Create a new texture |
+| `!#__gl_texture_data` | `[ptr]=id, [+1]=w, [+2]=h, [+3]=data_ptr` | -- | Upload pixel data |
+| `!#__gl_bind_texture` | `[ptr]=tex_id, [+1]=unit` | -- | Bind texture to unit |
+| `!#__gl_delete_texture` | `[ptr]=tex_id` | -- | Delete texture |
+| `!#__img_load` | BMP path at `[ptr]` | `[ptr]=tex_id` | Load BMP file via SDL2 |
+
+**Example -- load and bind a texture:**
+
+```bfpp
+"sprite.bmp\0"
+<<<<<<<<<<<
+!#__img_load          ; tape[ptr] = texture ID
+> #0 <                ; texture unit 0
+!#__gl_bind_texture
+```
+
+---
+
+#### 21. Self-Hosting Intrinsics
+
+These intrinsics provide efficient primitives for writing a BF++ compiler in BF++ itself. They bypass the performance limitations of pure BF++ for operations that would require hundreds of tape operations.
+
+**Arithmetic:**
+
+| Intrinsic | Input | Output | Description |
+|-----------|-------|--------|-------------|
+| `!#__mul` | `[ptr]=a, [ptr+1]=b` | `[ptr]=a*b` | Integer multiplication |
+| `!#__div` | `[ptr]=a, [ptr+1]=b` | `[ptr]=a/b` | Integer division |
+| `!#__mod` | `[ptr]=a, [ptr+1]=b` | `[ptr]=a%b` | Integer modulo |
+
+**String operations:**
+
+| Intrinsic | Input | Output | Description |
+|-----------|-------|--------|-------------|
+| `!#__strcmp` | Strings at addr `[ptr]` and `[ptr+1]` | `[ptr]=result` | 0 if equal |
+| `!#__strlen` | String at `[ptr]` | `[ptr]=length` | Null-terminated string length |
+| `!#__strcpy` | Src at `[ptr]`, dest at `[ptr+1]` | -- | Copy null-terminated string |
+
+**Data structures:**
+
+| Intrinsic | Input | Output | Description |
+|-----------|-------|--------|-------------|
+| `!#__hashmap_init` | -- | `[ptr]=handle` | Initialize a hash map |
+| `!#__hashmap_get` | `[ptr]=handle, [+1]=key` | `[ptr]=value` | Look up key |
+| `!#__hashmap_set` | `[ptr]=handle, [+1]=key, [+2]=value` | -- | Insert/update |
+| `!#__array_insert` | Array addr + index + value | -- | Insert at index |
+| `!#__array_remove` | Array addr + index | -- | Remove at index |
+
+**Indirect dispatch:**
+
+| Intrinsic | Input | Output | Description |
+|-----------|-------|--------|-------------|
+| `!#__call` | `[ptr]=sub_index` | -- | Call subroutine by index (0-based definition order) |
+
+`__call` enables computed dispatch — the subroutine to call is determined at runtime. This is essential for dispatch tables (e.g., opcode handlers in a compiler).
+
+**Example -- tokenizer dispatch table:**
+
+```bfpp
+; Read a character, dispatch to handler by value
+,                         ; read input byte
+!#__call                  ; call handler[tape[ptr]]
 ```
 
 ---
@@ -1168,6 +1357,7 @@ The runtime is not intended to be called directly from C code (though it can be)
 | `--include <path>`   | none     | Additional include search paths (repeatable)         |
 | `--cc <compiler>`    | `cc`     | C compiler to invoke                                 |
 | `--eof <value>`      | 0        | Value written to cell on EOF (0 or 255)              |
+| `--watch`            | off      | Watch mode: recompile on source file change          |
 
 ---
 
@@ -1177,14 +1367,20 @@ The runtime is not intended to be called directly from C code (though it can be)
 |-------|----------------|------------------------------------------------------|-----------------------------------------------|
 | O0    | `-O0` or `--no-optimize` | None. AST passes through unchanged.        | Debugging generated C code.                   |
 | O1    | `-O1` (default)| Clear-loop (`[-]` -> set 0), error folding (collapse consecutive `?`). | Normal compilation. Safe, lightweight passes. |
-| O2    | `-O2`          | All O1 passes + scan-loop (`[>]`/`[<]` -> linear scan) + multiply-move (`[->+++<<]` -> direct arithmetic). | Maximum performance. Use for production builds. |
+| O2    | `-O2`          | All 12 passes: O1 + scan-loop, multiply-move, conditional eval, loop unrolling, move coalescing, tail return elimination, second fold round. | Maximum performance. Use for production builds. |
 
 **What each pass does:**
 
 - **Clear-loop:** `[-]` and `[+]` become `tape[ptr] = 0` (single assignment instead of a loop).
 - **Error folding:** Consecutive `? ? ?` collapses to a single `?` (redundant checks eliminated).
+- **Constant fold:** Dead store elimination and arithmetic folding (`#5 +++` becomes `#8`).
 - **Scan-loop:** `[>]` becomes a while-loop scanning right for zero; `[<]` scans left.
 - **Multiply-move:** `[->>+++<<]` becomes `tape[ptr+2] += tape[ptr] * 3; tape[ptr] = 0` (O(1) instead of O(N) per source cell value).
+- **Conditional eval:** Compile-time evaluation of `?{...}:{...}` when the condition is a known constant.
+- **Loop unrolling:** Small fixed-count loops have their bodies unrolled, eliminating loop overhead.
+- **Move coalescing:** Adjacent pointer moves are merged and opposing moves cancel (`> > > <` becomes `>>`).
+- **Tail return elimination:** Removes redundant `^` at the end of subroutine bodies.
+- **Second fold round:** Re-applies constant folding after other passes expose new optimization opportunities.
 
 ---
 

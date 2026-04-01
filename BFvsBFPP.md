@@ -4,7 +4,7 @@
 
 **Standard Brainfuck** is a minimalist esoteric language with exactly 8 operators. It is Turing-complete but provides no I/O beyond single-byte stdin/stdout, no error handling, no subroutines, no bitwise operations, and no system interface. Programs operate on a fixed 30,000-cell tape of 8-bit values with a single pointer.
 
-**BF++** is a strict superset of Brainfuck that retains symbolic minimalism while adding 30+ operators for system calls, file I/O, networking, error handling, subroutines, bitwise arithmetic, FFI, and a framebuffer. Programs are transpiled to C11 via a Rust-based compiler, then compiled to native binaries. BF++ includes a standard library written in BF++ itself, a preprocessor with `!include` support, and a multi-pass optimizer.
+**BF++** is a strict superset of Brainfuck that retains symbolic minimalism while adding 30+ operators for system calls, file I/O, networking, error handling, subroutines, bitwise arithmetic, FFI, and a framebuffer. Programs are transpiled to C11 via a Rust-based compiler, then compiled to native binaries. BF++ includes a standard library written in BF++ itself, a preprocessor with `!include` support, `!define`/`!undef` macros, if/else syntax, and a 12-pass optimizer.
 
 ---
 
@@ -31,9 +31,9 @@
 | **System interface** | None | Raw syscalls (`\`), FFI (`\ffi "lib" "func"`), framebuffer (`F`) | Platform-abstracted via runtime header |
 | **Stack** | None | Auxiliary data stack (`$` push, `~` pop) | 4,096 entries, 64-bit each, separate from tape |
 | **Call stack** | None | 256-frame call stack for subroutines | Stores return address + saved error state |
-| **Preprocessing** | None | `!include "file"` with search paths and cycle detection | Text-level expansion before lexing |
-| **Optimization** | None (typically interpreted) | Clear-loop, scan-loop, multiply-move, error folding | `-O1` (basic), `-O2` (full) |
-| **Standard library** | None | 10 modules: io, math, string, mem, err, file, net, tui, graphics, 3d | Written in BF++ itself |
+| **Preprocessing** | None | `!include "file"`, `!define NAME VALUE`, `!undef NAME` | Text-level expansion + macro substitution before lexing |
+| **Optimization** | None (typically interpreted) | 12 passes: clear-loop, scan-loop, multiply-move, error folding, constant fold, conditional eval, loop unrolling, move coalescing, tail return elimination, second fold | `-O1` (basic), `-O2` (full) |
+| **Standard library** | None | 11 modules: io, math, string, mem, err, file, net, tui, graphics, 3d, math3d | Written in BF++ itself |
 | **Compilation** | Typically interpreted | Transpiled to C11, compiled via `cc`. `--emit-c` available | Also supports direct C output for inspection |
 | **Comments** | Non-operator chars ignored (implicit) | `;` line comments + `/* */` block comments (nestable) | BF's implicit comment behavior preserved |
 | **Memory layout** | Flat, unstructured | Structured regions: general purpose, syscall params, I/O buffer, framebuffer | Conventions enforced by stdlib, not hardware |
@@ -47,6 +47,14 @@
 | **3D rendering** | None | OpenGL 3.3 core profile + software rasterizer fallback, ~45 intrinsics | Blinn-Phong shading, PCF shadow mapping. FBO render → PBO async readback → tape → SDL2 present |
 | **Multi-GPU** | N/A | EGL multi-context with SFR/AFR/AUTO modes | Per-GPU GL contexts, command recording + replay, NUMA-aware allocation, frame pacing with dropout recovery |
 | **Fixed-point math** | Manual (chain `+`/`-` for any arithmetic) | Q16.16 intrinsics with sin/cos LUT, matrix ops | Hardware-free trig and linear algebra via lookup tables and fixed-point multiply/divide |
+| **Preprocessor macros** | None | `!define NAME VALUE`, `!undef NAME` | Compile-time text substitution; macros expanded before lexing |
+| **If/else syntax** | None (`[]` loops only, no else branch) | `?{true_body}:{false_body}` | Destructive truthiness test with else branch; cell consumed by test |
+| **Integer arithmetic intrinsics** | Not possible (increment/decrement only) | `__mul`, `__div`, `__mod` | Direct multiplication, division, modulo via compiler intrinsics |
+| **String intrinsics** | Not possible | `__strcmp`, `__strlen`, `__strcpy` | Efficient string operations bypassing single-pointer limitation |
+| **Hash maps** | Not possible | `__hashmap_init/get/set` | Runtime hash map data structure via intrinsics |
+| **Indirect calls** | Not possible | `__call` (dispatch by subroutine index) | Computed dispatch tables; call subroutine determined at runtime |
+| **Self-hosting capability** | No (no arithmetic, no strings, no data structures) | Self-hosting intrinsic set enables writing BF++ compiler in BF++ | Arithmetic + strings + hash maps + indirect dispatch = sufficient for a compiler |
+| **Watch mode** | N/A | `--watch` flag for auto-recompilation | Monitors source files and recompiles on change |
 
 ---
 
@@ -406,7 +414,7 @@ R{
 - Every program starts from scratch
 
 **BF++:**
-8 modules, all written in BF++ itself:
+11 modules, all written in BF++ itself:
 
 | Module | Prefix | Key Subroutines |
 |--------|--------|-----------------|
@@ -418,6 +426,9 @@ R{
 | `file.bfpp` | `f` | `!#fo` file_open, `!#fr` file_read, `!#fw` file_write, `!#fc` file_close |
 | `net.bfpp` | `t` | `!#tcp` tcp_connect, `!#tl` tcp_listen, `!#ta` tcp_accept, `!#ts` tcp_send, `!#tr` tcp_recv |
 | `tui.bfpp` | `c`/`d` | `!#cm` cursor_move, `!#cl` clear, `!#co` set_color, `!#db` draw_box |
+| `graphics.bfpp` | `p`/`g` | `!#px` set_pixel, `!#gx` get_pixel, `!#gc` clear_fb, `!#fl` fill_rect |
+| `3d.bfpp` | -- | ~45 GL proxy, Q16.16 math, mesh generator intrinsics |
+| `math3d.bfpp` | -- | Pure BF++ 3D math (585 lines: vectors, matrices, transforms) |
 
 Naming convention: 2-character names after `#`. First character = module, second = operation.
 

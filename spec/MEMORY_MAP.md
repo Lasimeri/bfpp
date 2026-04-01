@@ -1,6 +1,6 @@
 # BF++ Memory Map
 
-**Version**: 0.3.0
+**Version**: 0.4.0
 
 ---
 
@@ -105,6 +105,37 @@ BF++ uses a flat tape with conventionally designated regions. The tape is a cont
   - Initialized to `0x1000` by `!#mi` (heap_init)
   - Allocatable range: `0x1000`–`0xFFFF` (or up to framebuffer offset if enabled)
 - Remaining space (0x9002–0x9FFF): reserved for future use (thread-local storage, debug info, etc.)
+
+### Hash Map Layout (used by `__hashmap_*` intrinsics)
+
+Hash maps created via `__hashmap_init` are stored inline on the tape at a user-specified address. The layout is:
+
+```
+map_addr + 0x00  ┌──────────────────────────────┐
+                 │  capacity (4 bytes)           │  Max number of buckets
+         + 0x04  │  count (4 bytes)              │  Current number of entries
+         + 0x08  │  bucket[0]                    │
+                 │    used (1 byte)               │  0 = empty, 1 = occupied
+                 │    key_addr (4 bytes)          │  Tape offset to null-terminated key
+                 │    value (4 bytes)             │  Stored value
+         + 0x11  │  bucket[1]                    │
+                 │    (same layout, 9 bytes)      │
+                 │  ...                          │
+                 │  bucket[capacity-1]           │
+                 └──────────────────────────────┘
+```
+
+**Per-bucket size**: 9 bytes (1 + 4 + 4).
+
+**Total map size**: `8 + (capacity * 9)` bytes.
+
+**Hash function**: FNV-1a on the null-terminated key bytes, modulo capacity.
+
+**Collision resolution**: Linear probing. On collision, advance to `(hash + 1) % capacity` until an empty bucket is found. `__hashmap_get` probes until it finds a matching key or an empty bucket.
+
+**Key storage**: Keys are NOT copied into the map — `key_addr` is a tape offset pointing to where the key string lives. The caller is responsible for ensuring key strings remain valid (not overwritten) for the lifetime of the map.
+
+**Capacity planning**: Load factor above ~70% degrades probe chain length significantly. Size maps to at least `1.5x` expected entry count.
 
 ### Framebuffer (dynamic offset–end of tape)
 

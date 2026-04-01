@@ -1,6 +1,6 @@
 # BF++ Language Specification
 
-**Version**: 0.3.0
+**Version**: 0.4.0
 **Status**: Draft
 **Date**: 2026-03-31
 
@@ -54,6 +54,25 @@ Unterminated block comments are a compile-time error.
 | `\xHH` | Hex byte value |
 
 String literals write their ASCII bytes sequentially to the tape starting at the current pointer, advancing the pointer past the last byte written.
+
+### 2.4 Preprocessor Macros
+
+`!define NAME VALUE` defines a text substitution macro. All subsequent occurrences of `NAME` in the source are replaced with `VALUE` before parsing. `!undef NAME` removes the macro definition.
+
+```
+!define SCREEN_W 320
+!define SCREEN_H 200
+#SCREEN_W > #SCREEN_H <   ; expands to: #320 > #200 <
+
+!undef SCREEN_W            ; SCREEN_W is no longer substituted
+```
+
+**Semantics**:
+- Macros are processed in a single left-to-right pass before operator parsing.
+- `VALUE` is the remainder of the line after `NAME` (trimmed).
+- Macro names must not conflict with operator characters or intrinsic names.
+- `!define` with no value defines the name as empty (useful for conditional guards).
+- Redefinition of an existing name silently replaces the previous value.
 
 ---
 
@@ -169,8 +188,17 @@ All bitwise operations respect the current cell width at `ptr`.
 | Op | Name | Semantics |
 |----|------|-----------|
 | `;` | Comment | Ignore all characters until end of line |
+| `?{...}:{...}` | If/Else | Test `tape[ptr]` for truthiness. If non-zero, execute the first block; if zero, execute the second block. **Destructive**: consumes (zeroes) the tested cell. |
 
-Standard BF loops (`[`/`]`) remain the primary control flow mechanism. Combined with subroutines and error propagation, they provide sufficient control flow for systems programming.
+Standard BF loops (`[`/`]`) remain the primary control flow mechanism. The `?{...}:{...}` if/else construct provides branching without the BF flag-cell boilerplate.
+
+**If/Else semantics**: `?{true_body}:{false_body}` reads `tape[ptr]`. If non-zero, the true block executes; otherwise the false block executes. The tested cell is consumed (set to zero) regardless of which branch is taken. This is destructive — save the value with `$` before the test if it's needed later.
+
+```bfpp
+; If cell != 0, print 'Y'; else print 'Z'
+$                         ; save value (destructive test)
+?{ #89 . }:{ #90 . }     ; 'Y' if true, 'Z' if false
+```
 
 ### 3.8 Compiler Intrinsics
 
@@ -338,6 +366,65 @@ When any `__gl_*`, `__fp_*`, `__mesh_*`, or `__scene_*` intrinsic is used, the c
 | `__scene_extrap_ms` | `[ptr]`=milliseconds | — | Set extrapolation lookahead time. |
 
 **Runtime files**: `bfpp_rt_3d.c/h` (GL proxy layer), `bfpp_rt_3d_math.c` (Q16.16 math with sin LUT), `bfpp_rt_3d_meshgen.c` (mesh generators), `bfpp_rt_3d_software.c` (SSE software rasterizer with Blinn-Phong), `bfpp_rt_3d_shaders.h` (GLSL shaders), `bfpp_rt_3d_multigpu.c/h` (multi-GPU via EGL, SFR/AFR), `bfpp_rt_3d_oracle.c/h` (Scene Oracle with lock-free triple buffer).
+
+#### 3.8.8 SDL Input
+
+| Intrinsic | Input Tape Layout | Output | Effect |
+|-----------|-------------------|--------|--------|
+| `__input_poll` | — | `tape[ptr]`=type (0-5), `tape[ptr+4]`=key, `tape[ptr+8]`=x, `tape[ptr+12]`=y | Poll next SDL event from queue. Type: 0=none, 1=key_down, 2=key_up, 3=mouse_move, 4=mouse_down, 5=mouse_up. |
+| `__input_mouse_pos` | — | `tape[ptr]`=x, `tape[ptr+4]`=y | Get cached mouse position (last known from event polling). |
+| `__input_key_held` | `[ptr]`=scancode | `tape[ptr]`=0/1 | Check if key is currently held (from SDL keyboard state). Returns 1 if held, 0 if not. |
+
+#### 3.8.9 Textures
+
+| Intrinsic | Input Tape Layout | Output | Effect |
+|-----------|-------------------|--------|--------|
+| `__gl_create_texture` | — | `tape[ptr]`=texture_id | Generate a GL texture object. Returns texture ID. |
+| `__gl_texture_data` | `[ptr]`=tex_id, `[ptr+4]`=width, `[ptr+8]`=height, `[ptr+12]`=format (0=RGB, 1=RGBA), `[ptr+16]`=data_addr (tape offset) | — | Upload pixel data from tape to texture. |
+| `__gl_bind_texture` | `[ptr]`=unit, `[ptr+4]`=tex_id | — | Bind texture to texture unit. |
+| `__gl_delete_texture` | `[ptr]`=tex_id | — | Delete texture object. |
+| `__img_load` | `[ptr]`=path_addr (tape offset to null-terminated path), `[ptr+4]`=dest_addr (tape offset) | `tape[ptr+8]`=width, `tape[ptr+12]`=height, `tape[ptr+16]`=channels | Load BMP image from disk into tape memory at dest_addr. |
+
+#### 3.8.10 Self-Hosting Intrinsics
+
+Intrinsics for arithmetic, string operations, indirect calls, and data structures — designed to support BF++ self-hosting (compiler-in-BF++).
+
+**Arithmetic**:
+
+| Intrinsic | Input Tape Layout | Output | Effect |
+|-----------|-------------------|--------|--------|
+| `__mul` | `tape[ptr]`=a, `tape[ptr+1]`=b | `tape[ptr]` = a * b | Integer multiply. |
+| `__div` | `tape[ptr]`=a, `tape[ptr+1]`=b | `tape[ptr]` = a / b, `tape[ptr+1]` = remainder | Integer divide with remainder. |
+| `__mod` | `tape[ptr]`=a, `tape[ptr+1]`=b | `tape[ptr]` = a % b | Integer modulo. |
+
+**String Operations**:
+
+| Intrinsic | Input Tape Layout | Output | Effect |
+|-----------|-------------------|--------|--------|
+| `__strcmp` | `tape[ptr]`=addr_a, `tape[ptr+1]`=addr_b (tape offsets to null-terminated strings) | `tape[ptr]` = -1/0/1 | Compare strings lexicographically. Returns 0 if equal, -1 if a<b, 1 if a>b. |
+| `__strlen` | `tape[ptr]`=addr (tape offset to null-terminated string) | `tape[ptr]` = length | Length of null-terminated string (excluding null). |
+| `__strcpy` | `tape[ptr]`=dest_addr, `tape[ptr+1]`=src_addr | — | Copy null-terminated string from src to dest (including null terminator). |
+
+**Indirect Calls**:
+
+| Intrinsic | Input Tape Layout | Output | Effect |
+|-----------|-------------------|--------|--------|
+| `__call` | `tape[ptr]`=subroutine_index | — | Indirect subroutine call via `bfpp_sub_table[tape[ptr]]()`. Enables computed dispatch for switch-like constructs. |
+
+**Hash Map**:
+
+| Intrinsic | Input Tape Layout | Output | Effect |
+|-----------|-------------------|--------|--------|
+| `__hashmap_init` | `tape[ptr]`=map_addr, `tape[ptr+1]`=capacity | — | Initialize hash map at tape address with given capacity. |
+| `__hashmap_get` | `tape[ptr]`=map_addr, `tape[ptr+1]`=key_addr (tape offset to null-terminated key) | `tape[ptr]`=value, `tape[ptr+1]`=found (0/1) | Look up key. If found, value is returned and found=1. If not found, found=0. |
+| `__hashmap_set` | `tape[ptr]`=map_addr, `tape[ptr+1]`=key_addr, `tape[ptr+2]`=value | — | Insert or update key-value pair. |
+
+**Array Operations**:
+
+| Intrinsic | Input Tape Layout | Output | Effect |
+|-----------|-------------------|--------|--------|
+| `__array_insert` | `tape[ptr]`=array_addr, `tape[ptr+1]`=index, `tape[ptr+2]`=elem_size, `tape[ptr+3]`=count, `tape[ptr+4]`=value_addr | — | Insert element at index. Shifts subsequent elements right. |
+| `__array_remove` | `tape[ptr]`=array_addr, `tape[ptr+1]`=index, `tape[ptr+2]`=elem_size, `tape[ptr+3]`=count | — | Remove element at index. Shifts subsequent elements left. |
 
 ### 3.9 C Runtime Library (`bfpp_rt.h`)
 
@@ -525,6 +612,26 @@ Subroutine names are mangled: symbol characters are mapped to mnemonics (e.g., `
 | `-o FILE` | Output binary name |
 | `--emit-c` | Output C source instead of compiling |
 | `--include PATH` | Add stdlib search path |
+| `--watch` | Poll input file every 500ms; recompile on change |
+
+### 6.5 Optimizer Passes
+
+The compiler performs up to 12 optimization passes at `-O2`. Passes are applied in order; some are repeated after inlining/unrolling exposes new opportunities.
+
+| # | Pass | Description | Level |
+|---|------|-------------|-------|
+| 1 | Clear loop detection | `[-]` → `bfpp_set(ptr, 0)` | `-O1` |
+| 2 | Increment coalescing | `+++` → `tape[ptr] += 3` | `-O1` |
+| 3 | Move coalescing | `>>>` → `ptr += 3`; `>>>>><<<` → `ptr += 2`; cancellation | `-O2` |
+| 4 | Dead store elimination | Remove writes to cells that are immediately overwritten | `-O2` |
+| 5 | Constant folding | `#5 > #3 <` with known cell values → propagate constants | `-O2` |
+| 6 | Subroutine inlining | Inline small subroutines (body ≤ threshold) at call site | `-O2` |
+| 7 | Compile-time conditional evaluation | Resolve `?=`/`?!`/if-else when cell value is known at compile time | `-O2` |
+| 8 | Loop unrolling | `#N [- body]` unrolled to N copies when N≤16 and body has no side effects | `-O2` |
+| 9 | Tail return elimination | Trailing `^` in subroutines removed (implicit return) | `-O2` |
+| 10 | Second fold+coalesce round | Re-run constant folding and move/increment coalescing after inline/unroll expose new patterns | `-O2` |
+| 11 | Copy loop optimization | `[->+<]` patterns → direct assignment | `-O2` |
+| 12 | Scan loop optimization | `[>]` / `[<]` → memchr-based scan | `-O2` |
 
 ---
 

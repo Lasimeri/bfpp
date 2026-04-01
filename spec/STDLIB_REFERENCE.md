@@ -1,6 +1,6 @@
 # BF++ Standard Library Reference
 
-**Version**: 0.3.0
+**Version**: 0.4.0
 
 ---
 
@@ -109,6 +109,30 @@ Loop-based unsigned arithmetic. No dependencies.
 
 ---
 
+## Module: `math3d.bfpp`
+
+Pure BF++ 3D math library. No intrinsic dependencies — all arithmetic is implemented in BF++ using Russian Peasant multiplication, binary long division, Taylor series, and Newton's method. 585 lines.
+
+**Status**: Working. Provides integer-only alternatives to the `__fp_*` intrinsics for environments where C runtime intrinsics are unavailable or when self-hosting.
+
+| Subroutine | Symbol | Args | Returns | Description | Status |
+|------------|--------|------|---------|-------------|--------|
+| rp_multiply | `!#rm` | `tape[ptr]` = A, `tape[ptr+1]` = B | `tape[ptr]` = A * B | Russian Peasant multiplication (shift-and-add). Handles arbitrary magnitudes. | Working |
+| long_divide | `!#ld` | `tape[ptr]` = A, `tape[ptr+1]` = B | `tape[ptr]` = A / B, `tape[ptr+1]` = remainder | Binary long division. Error 6 if B=0. | Working |
+| taylor_sin | `!#ts` | `tape[ptr]` = angle (Q16.16) | `tape[ptr]` = sin(angle) (Q16.16) | Taylor series sine approximation (5 terms). | Working |
+| taylor_cos | `!#tc` | `tape[ptr]` = angle (Q16.16) | `tape[ptr]` = cos(angle) (Q16.16) | Taylor series cosine approximation (5 terms). | Working |
+| newton_sqrt | `!#ns` | `tape[ptr]` = value (Q16.16) | `tape[ptr]` = sqrt(value) (Q16.16) | Newton's method square root (8 iterations). | Working |
+| mat4_identity | `!#mi4` | `tape[ptr]` = dest_addr | 16 Q16.16 values at dest | Write 4x4 identity matrix. | Working |
+| mat4_multiply | `!#mm4` | `tape[ptr]`=a_addr, `[ptr+1]`=b_addr, `[ptr+2]`=dest_addr | 16 Q16.16 values at dest | Matrix multiply A * B. Uses rp_multiply. | Working |
+| mat4_rotate_y | `!#mr4` | `tape[ptr]`=src_addr, `[ptr+1]`=angle, `[ptr+2]`=dest_addr | Rotated matrix at dest | Rotate around Y axis. Uses taylor_sin/cos. | Working |
+| mat4_translate | `!#mt4` | `tape[ptr]`=src_addr, `[ptr+1]`=tx, `[ptr+2]`=ty, `[ptr+3]`=tz, `[ptr+4]`=dest_addr | Translated matrix at dest | Apply translation. | Working |
+| mat4_perspective | `!#mp4` | `tape[ptr]`=fov, `[ptr+1]`=aspect, `[ptr+2]`=near, `[ptr+3]`=far, `[ptr+4]`=dest_addr | Perspective matrix at dest | Build perspective projection. All Q16.16. | Working |
+| vec3_normalize | `!#vn` | `tape[ptr]`=x, `[ptr+1]`=y, `[ptr+2]`=z (Q16.16) | `tape[ptr..ptr+2]` = normalized xyz | Normalize 3D vector. Uses newton_sqrt. | Working |
+| vec3_cross | `!#vx` | `tape[ptr]`=a_addr, `[ptr+1]`=b_addr, `[ptr+2]`=dest_addr | Cross product at dest | Cross product of two vec3s. | Working |
+| vec3_dot | `!#vd` | `tape[ptr]`=a_addr, `[ptr+1]`=b_addr | `tape[ptr]` = dot product (Q16.16) | Dot product of two vec3s. | Working |
+
+---
+
 ## Module: `mem.bfpp`
 
 Memory management within the tape. Rewritten with `#N`, `%N`, `*$`, and `*~` (deref-push/pop).
@@ -145,6 +169,15 @@ Terminal UI via ANSI escape sequences. Fully rewritten with `#N` numeric literal
 | draw_hline | `!#dl` | `tape[ptr]` = row, `[ptr+1]` = col, `[ptr+2]` = len, `[ptr+3]` = char | — | Draw horizontal line of `char` repeated `len` times. | P+0..P+9 | Working |
 | draw_vline | `!#dv` | `tape[ptr]` = row, `[ptr+1]` = col, `[ptr+2]` = len, `[ptr+3]` = char | — | Draw vertical line, one char per row. | P+0..P+14 | Working |
 | read_key | `!#kb` | — | `tape[ptr]` = char code | Read single keypress (requires raw terminal mode). | P+0 | Working (basic) |
+
+**ANSI-Direct Rendering** (bypass C runtime — emit ANSI sequences directly from BF++):
+
+| Subroutine | Symbol | Args | Returns | Description | Workspace | Status |
+|------------|--------|------|---------|-------------|-----------|--------|
+| tui_print | `!#tp` | `ptr` -> null-terminated string, `tape[ptr-2]`=row, `tape[ptr-1]`=col | — | Move cursor to (row,col) and print string. Combines cursor move + string output. | P-2..P+N | Working |
+| tui_color | `!#tc` | `tape[ptr]`=fg (0-255), `tape[ptr+1]`=bg (0-255) | — | Set 256-color fg/bg via ANSI escapes. -1 (255) = default. | P+0..P+4 | Working |
+| tui_fill | `!#tf` | `tape[ptr]`=row, `[ptr+1]`=col, `[ptr+2]`=w, `[ptr+3]`=h, `[ptr+4]`=char | — | Fill rectangular region by emitting cursor moves + repeated chars. No C runtime needed. | P+0..P+9 | Working |
+| tui_style | `!#ts` | `tape[ptr]`=style (0=reset, 1=bold, 4=underline, 7=inverse) | — | Set text style via `ESC[Nm`. | P+0..P+2 | Working |
 
 **Color codes** (256-color mode via `!#co`):
 
@@ -216,7 +249,7 @@ F                           ; flush to screen
 
 ## Module: `3d.bfpp`
 
-3D rendering wrappers for all `__gl_*`, `__fp_*`, `__mesh_*`, and `__scene_*` compiler intrinsics. Provides thin subroutines that set up tape parameters and call the corresponding intrinsic. 485 lines.
+3D rendering wrappers for all `__gl_*`, `__fp_*`, `__mesh_*`, `__scene_*`, `__input_*`, and `__img_*` compiler intrinsics. Includes thin subroutine wrappers, pure BF++ mesh generators, texture management, and SDL input. 680+ lines.
 
 **Status**: Working. All subroutines are thin wrappers (tape setup + intrinsic call + return). Numeric values use Q16.16 fixed-point (65536 = 1.0).
 
@@ -290,3 +323,28 @@ F                           ; flush to screen
 | scene_publish | `\spub` | `__scene_publish` | Publish scene state (triple-buffer swap). |
 | scene_mode | `\smod` | `__scene_mode` | Set scene oracle mode. |
 | scene_extrap | `\sext` | `__scene_extrap_ms` | Set extrapolation lookahead (ms). |
+
+**Texture Wrappers**:
+
+| Subroutine | Symbol | Intrinsic Called | Description |
+|------------|--------|------------------|-------------|
+| gl_create_texture | `\gtc` | `__gl_create_texture` | Generate texture. Returns texture ID. |
+| gl_texture_data | `\gtd` | `__gl_texture_data` | Upload pixel data to texture. |
+| gl_bind_texture | `\gbt` | `__gl_bind_texture` | Bind texture to unit. |
+| gl_delete_texture | `\gdt` | `__gl_delete_texture` | Delete texture. |
+| img_load | `\iml` | `__img_load` | Load BMP image from disk. Returns width, height, channels. |
+
+**SDL Input Wrappers**:
+
+| Subroutine | Symbol | Intrinsic Called | Description |
+|------------|--------|------------------|-------------|
+| input_poll | `\ipol` | `__input_poll` | Poll SDL event queue. Returns event type, key, x, y. |
+| input_mouse | `\imos` | `__input_mouse_pos` | Get cached mouse position. Returns x, y. |
+| input_key_held | `\ikey` | `__input_key_held` | Check if key is held by scancode. Returns 0/1. |
+
+**Pure BF++ Mesh Generators** (no intrinsics — implemented in BF++):
+
+| Subroutine | Symbol | Args | Returns | Description |
+|------------|--------|------|---------|-------------|
+| cube_mesh | `\cmsh` | `tape[ptr]`=dest_addr, `[ptr+1]`=size (Q16.16) | `tape[ptr]` = vertex count | Generate cube mesh vertices in pure BF++. Writes 36 vertices (6 faces x 2 triangles) with positions and normals. |
+| plane_mesh | `\pmsh` | `tape[ptr]`=dest_addr, `[ptr+1]`=width, `[ptr+2]`=depth (Q16.16) | `tape[ptr]` = vertex count | Generate plane mesh (2 triangles, 6 vertices) with positions and normals in pure BF++. |

@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.4.0] - 2026-03-31
+
+### Added
+- **Preprocessor macros**: `!define NAME VALUE` and `!undef NAME` for compile-time text substitution
+- **If/else syntax**: `?{true_body}:{false_body}` — destructive truthiness test on current cell
+- **Watch mode**: `--watch` CLI flag recompiles automatically on source file change
+- **SDL input events**: `__input_poll`, `__input_mouse_pos`, `__input_key_held` — keyboard/mouse input from SDL window
+- **Texture intrinsics**: `__gl_create_texture`, `__gl_texture_data`, `__gl_bind_texture`, `__gl_delete_texture`, `__img_load` (BMP loading via SDL2)
+- **Self-hosting intrinsics**: `__mul`, `__div`, `__mod`, `__strcmp`, `__strlen`, `__strcpy`, `__call` (indirect subroutine dispatch), `__hashmap_init/get/set`, `__array_insert/remove` — primitives for writing a BF++ compiler in BF++
+- **stdlib/math3d.bfpp** (585 lines): pure BF++ 3D math library (vectors, matrices, transforms — no C intrinsics)
+- **5 new optimizer passes** (12 total): conditional eval, loop unrolling, move coalescing, tail return elimination, second constant fold round
+- **Editor rewrite**: `editor.bfpp` rewritten to 1141 lines with multicore save, line numbers, and text editing
+
+### Changed
+- Redundant `TAPE_MASK` operations eliminated in generated C (cleaner output)
+- Pure BF++ mesh rendering and TUI implementations added to existing stdlibs
+
+### Fixed
+- **Constant folding**: dead store elimination and arithmetic folding corrected
+- **clear_fb fix**: no longer corrupts scratch data region
+
+### Tests
+- 114 unit tests, all passing (up from 86 in v0.3.0)
+- Zero clippy warnings
+
 ## [0.3.0] - 2026-03-31
 
 ### Added

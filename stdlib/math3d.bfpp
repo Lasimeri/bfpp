@@ -27,7 +27,7 @@
 ;
 ; LIMITATIONS:
 ;   - \fpm: unsigned/positive inputs only. a*b must fit in uint32.
-;   - \fps, \fpc: angles must be positive, ≤ π. Caller normalizes.
+;   - \fps, \fpc: angles must be positive, <= pi. Caller normalizes.
 ;   - \fpd: stub — use reciprocal multiply or C intrinsic instead.
 ;   - Signed Q16.16: not supported by these pure BF++ versions.
 ;     Negation via subtraction loop is O(|x|) which is infeasible for
@@ -57,7 +57,7 @@
 ; For a=b=65536 (1.0*1.0): ~131K iterations total. Feasible.
 ;
 ; Overflow: a*b must be < 2^32. This covers:
-;   - Any multiply where one operand is ≤ 1.0 (65536)
+;   - Any multiply where one operand is <= 1.0 (65536)
 ;   - Both operands < ~256.0 (16,777,216)
 ;   - All Taylor series intermediate products for sin/cos
 \fpm{
@@ -73,39 +73,50 @@
         ; $ doesn't consume P+0, so P+0 retains a throughout.
         <<<< $                      ; [P+0] push a. Stack: [a]
         >>>>>>>>>>>> [-] ~          ; [P+12] = a (pop). Stack: []
-        [- <<<< + >>>>]             ; P+12→P+8: acc += a (P+12 consumed)
+        [- <<<< + >>>>]             ; P+12 to P+8: acc += a (P+12 consumed)
         <<<<<<<<                    ; [P+4]
     ]
     <<<<                            ; [P+0]
 
     ; acc (P+8) = a * b (unsigned, assuming no overflow)
 
-    ; -- Divide acc by 65536 → result in P+0 --
-    ; Method: flag-driven loop. While acc ≥ 65536: subtract 65536, result++.
-    ; Subtraction of 65536 = 256 iterations of subtracting 256 (coalesced -).
+    ; -- Divide acc by 65536 -> result in P+0 --
+    ; Method: flag-driven loop. While acc >= 65536: subtract 65536, result++.
+    ; Subtraction of 65536 = 256 iterations of 256 decrements (coalesced -).
+    ;
+    ; Loop structure:
+    ;   P+12 = 1 (continue flag)
+    ;   while P+12 > 0:
+    ;     P+12 = 0 (default: stop)
+    ;     if P+8 > 65535: subtract, result++, P+12 = 1 (continue)
+    ;     (if P+8 <= 65535, P+12 stays 0, loop exits)
 
     [-]                             ; [P+0] result = 0
 
     >>>>>>>>>>>> #1                 ; [P+12] continue_flag = 1
     [                               ; while continue_flag > 0
+        [-]                         ; P+12 = 0 (default: stop)
         <<<<                        ; [P+8] (acc)
-        ?> #65535 {                 ; if acc > 65535 (non-destructive check)
+        ?> #65535 [                 ; if acc > 65535 (non-destructive)
             ; Subtract 65536 from acc via 256 x Decrement(256)
-            >>>> #256               ; [P+12] = 256 (loop counter)
+            ; Use P+4 as loop counter (it's 0 from multiply cleanup).
+            <<<<                    ; [P+4]
+            #256                    ; P+4 = 256
             [                       ; 256 iterations
-                -                   ; [P+12]--
-                <<<< ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ >>>>
-                ; Each line above: P+8 -= 256, back to P+12
+                -                   ; P+4--
+                >>>> ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ <<<<
+                ; P+8 -= 256, back to P+4
             ]
-            <<<<                    ; [P+8] (acc reduced by 65536)
+            >>>>                    ; [P+8] (acc reduced by 65536)
 
             ; result++
-            <<<<<<<< + >>>>>>>>     ; [P+0]++, back to [P+8]
+            <<<<<<<< + >>>>>>>>     ; P+0++, back to [P+8]
 
-            >>>> #1                 ; [P+12] continue_flag = 1 (keep going)
-        } : {
-            >>>> [-]                ; [P+12] = 0 (exit loop)
-        }
+            ; Set continue flag
+            >>>> #1                 ; [P+12] = 1 (keep going)
+            <<<<                    ; [P+8]
+        ]
+        >>>>                        ; [P+12] (either 0=stop or 1=continue)
     ]
     <<<<<<<<<<<<                    ; [P+0] = result = (a * b) / 65536
 
@@ -127,43 +138,43 @@
 ;   for typical inputs.
 ;
 ; WORKAROUND: Use reciprocal multiplication instead of division.
-;   x / 6   → \fpm with P+4 = 10923  (Q16.16 of 1/6)
-;   x / 120 → \fpm with P+4 = 546    (Q16.16 of 1/120)
-;   x / 5040→ \fpm with P+4 = 13     (Q16.16 of 1/5040)
-;   x / 2   → \fpm with P+4 = 32768  (Q16.16 of 0.5)
+;   x / 6   -> \fpm with P+4 = 10923  (Q16.16 of 1/6)
+;   x / 120 -> \fpm with P+4 = 546    (Q16.16 of 1/120)
+;   x / 5040-> \fpm with P+4 = 13     (Q16.16 of 1/5040)
+;   x / 2   -> \fpm with P+4 = 32768  (Q16.16 of 0.5)
 ;
 ; For arbitrary division, use the C intrinsic __fp_div.
 
 ; ============================================================================
 ; \fpc — Fixed-point cosine (2-term Taylor)
 ; ============================================================================
-; cos(x) ≈ 1 - x²/2
-; Accuracy: within ~5% for |x| < 1 radian, ~15% at x = π/2.
+; cos(x) ~ 1 - x^2/2
+; Accuracy: within ~5% for |x| < 1 radian, ~15% at x = pi/2.
 ;
-; Input:  P+0 = angle (Q16.16, positive, ≤ π)
+; Input:  P+0 = angle (Q16.16, positive, <= pi)
 ; Output: P+0 = cos(angle) (Q16.16)
 ; Workspace: P+4..P+12 (%4, managed by \fpm)
 ;
 ; Algorithm:
-;   1. x² = fpm(x, x)
-;   2. x²/2 = fpm(x², 32768)   [32768 = Q16.16(0.5)]
-;   3. result = 65536 - x²/2    [65536 = Q16.16(1.0)]
+;   1. x^2 = fpm(x, x)
+;   2. x^2/2 = fpm(x^2, 32768)   [32768 = Q16.16(0.5)]
+;   3. result = 65536 - x^2/2     [65536 = Q16.16(1.0)]
 \fpc{
-    ; x² = fpm(x, x)
+    ; x^2 = fpm(x, x)
     $                               ; push x (non-destructive copy)
     >>>> %4 [-] ~                   ; [P+4] = x (pop from stack)
-    <<<< \fpm                       ; [P+0] = x²
+    <<<< \fpm                       ; [P+0] = x^2
 
-    ; x²/2 = fpm(x², 32768)
+    ; x^2/2 = fpm(x^2, 32768)
     >>>> #32768                     ; [P+4] = Q16.16(0.5)
-    <<<< \fpm                       ; [P+0] = x²/2
+    <<<< \fpm                       ; [P+0] = x^2/2
 
-    ; result = 1.0 - x²/2
-    $                               ; push x²/2
-    >>>> [-] ~                      ; [P+4] = x²/2 (pop)
+    ; result = 1.0 - x^2/2
+    $                               ; push x^2/2
+    >>>> [-] ~                      ; [P+4] = x^2/2 (pop)
     <<<< #65536                     ; [P+0] = 65536 (1.0)
     >>>> [- <<<< - >>>>]           ; [P+0] -= [P+4] (destructive subtract)
-    <<<<                            ; [P+0] = 1.0 - x²/2
+    <<<<                            ; [P+0] = 1.0 - x^2/2
 
     >>>> [-] <<<<                   ; cleanup P+4
 
@@ -173,20 +184,20 @@
 ; ============================================================================
 ; \fps — Fixed-point sine (3-term Taylor)
 ; ============================================================================
-; sin(x) ≈ x - x³/6 + x⁵/120
-; Accuracy: within ~0.5% for |x| < π/2, ~2% at x = π.
+; sin(x) ~ x - x^3/6 + x^5/120
+; Accuracy: within ~0.5% for |x| < pi/2, ~2% at x = pi.
 ;
-; Input:  P+0 = angle (Q16.16, positive, ≤ π)
+; Input:  P+0 = angle (Q16.16, positive, <= pi)
 ; Output: P+0 = sin(angle) (Q16.16)
 ; Workspace: P+4..P+12 (%4, managed by \fpm internally)
 ; Stack: uses up to 4 slots
 ;
 ; Algorithm:
-;   x² = fpm(x, x)
-;   x³ = fpm(x², x)
-;   t1 = fpm(x³, 10923)        [10923 = Q16.16(1/6)]
-;   x⁵ = fpm(x³, x²)
-;   t2 = fpm(x⁵, 546)          [546 = Q16.16(1/120)]
+;   x^2 = fpm(x, x)
+;   x^3 = fpm(x^2, x)
+;   t1 = fpm(x^3, 10923)        [10923 = Q16.16(1/6)]
+;   x^5 = fpm(x^3, x^2)
+;   t2 = fpm(x^5, 546)          [546 = Q16.16(1/120)]
 ;   result = x - t1 + t2
 ;
 ; Stack management is tracked with [S: ...] comments (bottom to top).
@@ -195,64 +206,64 @@
 \fps{
     ; [S: empty] P+0 = x
 
-    ; -- Step 1: x² = fpm(x, x) --
+    ; -- Step 1: x^2 = fpm(x, x) --
     $ $ $                           ; push x three times. [S: x x x]
     >>>> %4 [-] ~ <<<<             ; P+4 = x (pop). [S: x x]
-    \fpm                            ; P+0 = x²
+    \fpm                            ; P+0 = x^2
 
-    ; -- Step 2: x³ = fpm(x², x) --
-    ; Need P+0 = x², P+4 = x.
-    ; Stack has: x x. Must get x into P+4 without losing x².
-    ; Stash x² in P+8 (safe — fpm cleaned P+8).
+    ; -- Step 2: x^3 = fpm(x^2, x) --
+    ; Need P+0 = x^2, P+4 = x.
+    ; Stack has: x x. Must get x into P+4 without losing x^2.
+    ; Stash x^2 in P+8 (safe — fpm cleaned it).
     >>>>>>>> %4 [-] <<<<<<<<        ; clear P+8 (ensure %4)
-    $ >>>>>>>> ~ <<<<<<<<           ; push x², pop to P+8. P+0 = x². [S: x x x²]
-    ; Wait: $ pushes P+0 (x²). Stack: x x x². >>>> ~ pops x² to P+8. Stack: x x.
-    ; P+0 still has x² ($ doesn't consume). P+8 = x².
+    $ >>>>>>>> ~ <<<<<<<<           ; push x^2, pop to P+8. P+0 = x^2. [S: x x x^2]
+    ; $ pushes x^2. Stack: x x x^2. >>>>>>>> ~ pops x^2 to P+8. Stack: x x.
+    ; P+0 still has x^2. P+8 = x^2.
 
-    ; Pop x → P+4
+    ; Pop x -> P+4
     >>>> [-] ~ <<<<                 ; P+4 = x (pop). [S: x]
-    ; P+0 = x², P+4 = x.
-    ; Save x² (from P+8) back to stack for later use in x⁵.
-    >>>>>>>> $ <<<<<<<<             ; push P+8 (x²). [S: x x²]
+    ; P+0 = x^2, P+4 = x.
+    ; Save x^2 (from P+8) back to stack for later use in x^5.
+    >>>>>>>> $ <<<<<<<<             ; push P+8 (x^2). [S: x x^2]
     >>>>>>>> [-] <<<<<<<<           ; clear P+8 (fpm will use it)
-    \fpm                            ; P+0 = x³
+    \fpm                            ; P+0 = x^3
 
-    ; -- Step 3: t1 = fpm(x³, 10923) = x³/6 --
-    ; Save x³ for x⁵ computation.
-    $                               ; push x³. [S: x x² x³]
-    >>>> #10923 <<<<                ; P+4 = Q16.16(1/6). P+0 = x³ (unchanged).
-    \fpm                            ; P+0 = t1 = x³/6
-    $                               ; push t1. [S: x x² x³ t1]
+    ; -- Step 3: t1 = fpm(x^3, 10923) = x^3/6 --
+    ; Save x^3 for x^5 computation.
+    $                               ; push x^3. [S: x x^2 x^3]
+    >>>> #10923 <<<<                ; P+4 = Q16.16(1/6). P+0 = x^3 (unchanged).
+    \fpm                            ; P+0 = t1 = x^3/6
+    $                               ; push t1. [S: x x^2 x^3 t1]
 
-    ; -- Step 4: x⁵ = fpm(x³, x²) --
-    ; Stack: x x² x³ t1. Need x³ in P+0, x² in P+4.
-    ; Pop t1 → stash in P+8.
-    >>>>>>>> %4 [-] ~ <<<<<<<<      ; P+8 = t1 (pop). [S: x x² x³]
-    ; Pop x³ → P+0
-    [-] ~                           ; P+0 = x³ (pop). [S: x x²]
-    ; Pop x² → P+4
-    >>>> [-] ~ <<<<                 ; P+4 = x² (pop). [S: x]
+    ; -- Step 4: x^5 = fpm(x^3, x^2) --
+    ; Stack: x x^2 x^3 t1. Need x^3 in P+0, x^2 in P+4.
+    ; Pop t1 -> stash in P+8.
+    >>>>>>>> %4 [-] ~ <<<<<<<<      ; P+8 = t1 (pop). [S: x x^2 x^3]
+    ; Pop x^3 -> P+0
+    [-] ~                           ; P+0 = x^3 (pop). [S: x x^2]
+    ; Pop x^2 -> P+4
+    >>>> [-] ~ <<<<                 ; P+4 = x^2 (pop). [S: x]
     ; Save t1 (from P+8) back to stack.
     >>>>>>>> $ <<<<<<<<             ; push P+8 (t1). [S: x t1]
     >>>>>>>> [-] <<<<<<<<           ; clear P+8 (fpm workspace)
-    \fpm                            ; P+0 = x⁵ = x³ * x²
+    \fpm                            ; P+0 = x^5 = x^3 * x^2
 
-    ; -- Step 5: t2 = fpm(x⁵, 546) = x⁵/120 --
-    >>>> #546 <<<<                  ; P+4 = Q16.16(1/120). P+0 = x⁵.
-    \fpm                            ; P+0 = t2 = x⁵/120
+    ; -- Step 5: t2 = fpm(x^5, 546) = x^5/120 --
+    >>>> #546 <<<<                  ; P+4 = Q16.16(1/120). P+0 = x^5.
+    \fpm                            ; P+0 = t2 = x^5/120
 
     ; -- Step 6: result = x - t1 + t2 --
     ; P+0 = t2. Stack: x t1. Need all three.
 
     ; Save t2 in P+8.
     >>>>>>>> %4 [-] <<<<<<<<        ; clear P+8
-    $ >>>>>>>> ~ <<<<<<<<           ; P+8 = t2 (push+pop). [S: x t1]
-    ; P+0 = t2 (unchanged).
+    $ >>>>>>>> ~ <<<<<<<<           ; push t2, pop to P+8. [S: x t1]
+    ; P+0 = t2 (unchanged). P+8 = t2.
 
-    ; Pop t1 → P+4
+    ; Pop t1 -> P+4
     >>>> [-] ~ <<<<                 ; P+4 = t1 (pop). [S: x]
 
-    ; Pop x → P+0
+    ; Pop x -> P+0
     [-] ~                           ; P+0 = x (pop). [S: empty]
 
     ; P+0 = x, P+4 = t1, P+8 = t2
@@ -349,8 +360,7 @@
 
     ; Write translation column via deref-pop.
     ; Stack LIFO: pop tz first, then ty, then tx.
-    ; tz → dest+56, ty → dest+52, tx → dest+48.
-    ; Navigate P+0 to dest+56 first.
+    ; tz -> dest+56, ty -> dest+52, tx -> dest+48.
 
     ; dest + 56 = 56 increments
     ++++++++++++++++++++++++++++++++++++++++++++++++++++++++ ; P+0 = dest+56
@@ -373,7 +383,7 @@
 ; ============================================================================
 ; \m4r — Matrix rotate Y-axis (pure BF++)
 ; ============================================================================
-; Input:  P+0 = dest addr (%4), P+4 = angle (Q16.16 radians, positive, ≤ π)
+; Input:  P+0 = dest addr (%4), P+4 = angle (Q16.16 radians, positive, <= pi)
 ; Output: Y-axis rotation matrix at dest (column-major)
 ; Workspace: P+8..P+20 (%4)
 ;
@@ -383,161 +393,70 @@
 ;   m[2]=-sin  m[6]=0    m[10]=cos   m[14]=0
 ;   m[3]=0     m[7]=0    m[11]=0     m[15]=1
 ;
-; Byte offsets for non-zero, non-identity elements:
-;   m[0]  = cos   at dest+0
-;   m[2]  = -sin  at dest+8
-;   m[8]  = sin   at dest+32
-;   m[10] = cos   at dest+40
-;   m[5]  = 1     at dest+20  (from identity)
-;   m[15] = 1     at dest+60  (from identity)
+; Byte offsets for rotation elements:
+;   m[0]=cos at dest+0, m[2]=-sin at dest+8,
+;   m[8]=sin at dest+32, m[10]=cos at dest+40
 ;
 ; Uses Taylor-approximate \fps and \fpc for sin/cos computation.
 ; WARNING: Only accurate for |angle| < ~1.5 radians due to Taylor truncation.
 ; For general rotation, use the C intrinsic __mat4_rotate.
 \m4r{
-    ; -- Save dest, get angle ready --
-    $                               ; push dest. [S: dest]
-    ; Copy angle to P+0 for trig functions.
-    >>>> $ <<<<                     ; push P+4 (angle). [S: dest angle]
-    >>>> $ <<<<                     ; push P+4 again. [S: dest angle angle]
-    [-] ~                           ; P+0 = angle (pop). [S: dest angle]
+    ; Save dest to P+16 (outside trig workspace P+0..P+12)
+    >>>>>>>>>>>>>>>> %4 [-]
+    <<<<<<<<<<<<<<<<                ; ensure P+16 is %4, clear
+    $ >>>>>>>>>>>>>>>> ~
+    <<<<<<<<<<<<<<<<                ; P+16 = dest. [S: empty]
+    ; P+0 = dest (unchanged by $).
 
-    ; -- Compute cos(angle) --
-    ; \fpc uses P+0..P+12
-    \fpc                            ; P+0 = cos(angle)
-
-    ; Stash cos in P+8 (fpc cleaned it)
-    >>>>>>>> %4 [-] <<<<<<<<        ; ensure P+8 is %4 and clear
-    $ >>>>>>>> ~ <<<<<<<<           ; push cos, pop to P+8. [S: dest angle]
-    ; P+0 = cos ($ didn't consume). P+8 = cos.
-
-    ; -- Compute sin(angle) --
-    ; Get angle from stack.
-    [-] ~                           ; P+0 = angle (pop). [S: dest]
-    ; \fps uses P+0..P+12. P+8 has cos — push to save it.
-    >>>>>>>> $ <<<<<<<<             ; push P+8 (cos). [S: dest cos]
-    >>>>>>>> [-] <<<<<<<<           ; clear P+8 (fps workspace)
-    \fps                            ; P+0 = sin(angle)
-
-    ; Restore cos from stack.
-    >>>>>>>> %4 [-] ~ <<<<<<<<      ; P+8 = cos (pop). [S: dest]
-    ; P+0 = sin. P+8 = cos.
-
-    ; -- Compute -sin --
-    ; -sin = 0 - sin via destructive subtract loop.
-    ; Copy sin to P+4, set P+12 = 0, subtract P+4 from P+12 → P+12 = -sin.
-    $                               ; push sin. [S: dest sin]
-    >>>> %4 [-] ~                   ; P+4 = sin (pop). [S: dest]
-    <<<< ; [P+0] = sin
-    >>>>>>>>>>>> %4 [-] <<<<<<<<<<<<; P+12 = 0
-    >>>> [- >>>>>>>> - <<<<<<<< ]   ; P+12 -= P+4: while P+4>0: P+4--, P+12--
-    ; P+4 = 0. P+12 = 0 - sin = -sin (two's complement wrapping).
-    <<<<                            ; [P+0] = sin
-
-    ; State: P+0 = sin, P+4 = 0, P+8 = cos, P+12 = -sin. [S: dest]
-
-    ; -- Write matrix --
-    ; Push all rotation values to stack in reverse write order (LIFO).
-    ; Write order: m[0]=cos, m[2]=-sin, m[8]=sin, m[10]=cos
-    ; Push order (last written first pushed): cos, sin, -sin, cos
-
-    ; Push cos (for m[10], popped last)
-    >>>>>>>> $ <<<<<<<<             ; push P+8 (cos). [S: dest cos]
-    ; Push sin (for m[8])
-    $                               ; push P+0 (sin). [S: dest cos sin]
-    ; Push -sin (for m[2])
-    >>>>>>>>>>>> $ <<<<<<<<<<<<     ; push P+12 (-sin). [S: dest cos sin -sin]
-    ; Push cos (for m[0], popped first)
-    >>>>>>>> $ <<<<<<<<             ; push P+8 (cos). [S: dest cos sin -sin cos]
-
-    ; Get dest from deep in stack. Pop cos, -sin, sin, cos → stash, then dest.
-    ; Actually easier: save the 4 values to tape, pop dest, push them back.
-    ; Or: put dest in P+0 by popping through.
-
-    ; Pop rotation values to tape cells, then pop dest.
-    [-] ~                           ; P+0 = cos (pop, for m[0]). [S: dest cos sin -sin]
-    >>>> [-] ~                      ; P+4 = -sin (pop, for m[2]). [S: dest cos sin]
-    >>>>>>>> [-] ~                  ; P+12 = sin (pop, for m[8]). [S: dest cos]
-    <<<<                            ; [P+8] (has cos already)
-    [-] ~                           ; P+8 = cos (pop, for m[10]). [S: dest]
-    ; Wait, P+8 already had cos. This pop puts the stacked cos into P+8. Same value. Fine.
-
-    ; Stash all rotation values on stack again (push in order for later use)
-    $                               ; push P+8 (cos for m[10]). [S: dest cos]
-    >>>> $                          ; push P+12 (sin for m[8]). [S: dest cos sin]
-    <<<<<<<< $                      ; push P+4 (-sin for m[2]). [S: dest cos sin -sin]
-    <<<< $                          ; push P+0 (cos for m[0]). [S: dest cos sin -sin cos]
-
-    ; Now pop dest.
-    ; Still can't reach dest — it's under 4 values. Same LIFO problem.
-
-    ; DIFFERENT APPROACH: Don't push dest to the stack at all.
-    ; Use a workspace cell (P+16) to hold dest.
-    ; Restart the function with P+16 as dest storage.
-
-    ; Clear stack of the mess above — pop 5 items.
-    [-] ~ [-] ~ [-] ~ [-] ~ [-] ~
-    [-]                             ; P+0 = 0, stack empty
-
-    ^
-}
-
-; ============================================================================
-; \m4r — Matrix rotate Y-axis (FINAL)
-; ============================================================================
-; Redesigned to avoid deep-stack dest retrieval.
-; Stores dest in P+16 (tape cell) instead of on the stack.
-;
-; Input:  P+0 = dest addr (%4), P+4 = angle (Q16.16, positive, ≤ π)
-; Output: Y-rotation matrix at dest
-; Workspace: P+8..P+20 (%4)
-\m4r{
-    ; Save dest to P+16 (out of trig function workspace P+0..P+12)
-    >>>>>>>>>>>>>>>> %4 [-] <<<<<<<<<<<<<<<<    ; ensure P+16 is %4
-    $ >>>>>>>>>>>>>>>> ~ <<<<<<<<<<<<<<<<       ; P+16 = dest. [S: empty]
-    ; P+0 = dest (unchanged by push).
-
-    ; Get angle into P+0 for trig computation.
-    >>>> $ <<<<                     ; push angle (P+4). [S: angle]
-    >>>> $ <<<<                     ; push angle again. [S: angle angle]
+    ; Copy angle to P+0 for trig computation.
+    >>>> $ <<<<                     ; push P+4 (angle). [S: angle]
+    >>>> $ <<<<                     ; push again. [S: angle angle]
     [-] ~                           ; P+0 = angle (pop). [S: angle]
 
     ; -- cos(angle) --
-    \fpc                            ; P+0 = cos
+    ; \fpc uses P+0..P+12
+    \fpc                            ; P+0 = cos(angle)
+
     ; Save cos to P+20.
-    >>>>>>>>>>>>>>>>>>>> %4 [-] <<<<<<<<<<<<<<<<<<<< ; ensure P+20 is %4
-    $ >>>>>>>>>>>>>>>>>>>> ~ <<<<<<<<<<<<<<<<<<<< ; P+20 = cos. [S: angle]
-    ; P+0 = cos.
+    >>>>>>>>>>>>>>>>>>>> %4 [-]
+    <<<<<<<<<<<<<<<<<<<< ; ensure P+20 is %4, clear
+    $ >>>>>>>>>>>>>>>>>>>> ~
+    <<<<<<<<<<<<<<<<<<<<            ; P+20 = cos. [S: angle]
+    ; P+0 = cos (unchanged).
 
     ; -- sin(angle) --
+    ; Get angle from stack.
     [-] ~                           ; P+0 = angle (pop). [S: empty]
-    \fps                            ; P+0 = sin
+    ; \fps uses P+0..P+12. P+20 has cos (safe — outside workspace).
+    \fps                            ; P+0 = sin(angle)
 
-    ; -- Compute -sin --
-    ; sin in P+0. Copy to P+4, negate into P+8.
-    $ >>>> %4 [-] ~ <<<<            ; P+4 = sin (push+pop). [S: empty]
-    ; P+0 = sin.
+    ; State: P+0 = sin, P+16 = dest, P+20 = cos. [S: empty]
+
+    ; -- Compute -sin = 0 - sin --
+    ; Copy sin to P+4, negate via wrapping subtraction into P+8.
+    $                               ; push sin. [S: sin]
+    >>>> %4 [-] ~                   ; P+4 = sin (pop). [S: empty]
+    <<<<                            ; [P+0] = sin
     >>>>>>>> %4 [-] <<<<<<<<        ; P+8 = 0
-    >>>> [- >>>>>>>> - <<<<<<<<]    ; while P+4>0: P+4--, P+8-- (wrapping)
-    ; P+4 = 0. P+8 = -sin.
+    >>>> [- >>>>>>>> - <<<<<<<<]    ; while P+4>0: P+4--, P+8-- (wrapping = -sin)
+    ; P+4 = 0. P+8 = -sin (two's complement).
     <<<<                            ; [P+0] = sin
 
-    ; State: P+0=sin, P+4=0(consumed), P+8=-sin, P+16=dest, P+20=cos. [S: empty]
+    ; State: P+0=sin, P+4=0, P+8=-sin, P+16=dest, P+20=cos. [S: empty]
 
     ; -- Write identity at dest --
-    ; \m4i uses P+0, P+4. It will destroy our sin value in P+0.
-    ; Save sin to stack.
-    $                               ; push sin. [S: sin]
+    ; \m4i uses P+0 and P+4 as workspace. Save sin and -sin first.
+    $                               ; push sin (P+0). [S: sin]
+    >>>>>>>> $                      ; push -sin (P+8). [S: sin -sin]
+    <<<<<<<<                        ; [P+0]
     ; Load dest into P+0 for m4i.
-    >>>>>>>>>>>>>>>> $ <<<<<<<<<<<<<<<<  ; push P+16 (dest). [S: sin dest]
-    [-] ~                           ; P+0 = dest (pop). [S: sin]
-    ; \m4i uses P+0 and P+4 as workspace. P+8 has -sin — save it.
-    >>>>>>>> $ <<<<<<<<             ; push P+8 (-sin). [S: sin -sin]
-    \m4i                            ; identity at dest. P+0 = dest. P+4 = 0 (cleaned).
+    >>>>>>>>>>>>>>>> $
+    <<<<<<<<<<<<<<<<                ; push P+16 (dest). [S: sin -sin dest]
+    [-] ~                           ; P+0 = dest (pop). [S: sin -sin]
+    \m4i                            ; identity at dest. P+0 = dest. P+4 cleaned.
 
-    ; Restore -sin
+    ; Restore -sin and sin from stack.
     >>>>>>>> %4 [-] ~ <<<<<<<<      ; P+8 = -sin (pop). [S: sin]
-    ; Restore sin
     >>>>>>>>>>>> %4 [-] ~ <<<<<<<<<<<<  ; P+12 = sin (pop). [S: empty]
     ; P+0 = dest. P+8 = -sin. P+12 = sin. P+20 = cos.
 
@@ -547,31 +466,36 @@
     ; m[8] = sin at dest+32
     ; m[10] = cos at dest+40
     ;
-    ; Push in reverse pop order (last write first push):
-    ; Write order: dest+0(cos), dest+8(-sin), dest+32(sin), dest+40(cos)
-    ; Push: cos(m[10]), sin(m[8]), -sin(m[2]), cos(m[0])
+    ; Push in reverse write order (LIFO — last written pushed first):
+    ; Write order: dest+0, dest+8, dest+32, dest+40
+    ; Push order: cos(m[10]), sin(m[8]), -sin(m[2]), cos(m[0])
 
-    >>>>>>>>>>>>>>>>>>>> $ <<<<<<<<<<<<<<<<<<<< ; push P+20 (cos, for m[10]). [S: cos]
-    >>>>>>>>>>>> $ <<<<<<<<<<<<     ; push P+12 (sin, for m[8]). [S: cos sin]
-    >>>>>>>> $ <<<<<<<<             ; push P+8 (-sin, for m[2]). [S: cos sin -sin]
-    >>>>>>>>>>>>>>>>>>>> $ <<<<<<<<<<<<<<<<<<<< ; push P+20 (cos, for m[0]). [S: cos sin -sin cos]
+    >>>>>>>>>>>>>>>>>>>> $          ; push P+20 (cos for m[10]). [S: cos]
+    <<<<<<<<<<<<<<<<<<<<<<<<        ; [P+0] — wait, that's 24 back from P+20. P+20-24=P-4. Wrong!
+    ; From P+20: back to P+12 is <<<<<<<< (8 bytes). Back to P+0 is <<<<<<<<<<<<<<<<<<<< (20).
+    <<<<<<<<<<<<<<<<<<<<            ; [P+0]
+    >>>>>>>>>>>> $                  ; push P+12 (sin for m[8]). [S: cos sin]
+    <<<<                            ; [P+8]
+    $                               ; push P+8 (-sin for m[2]). [S: cos sin -sin]
+    <<<<<<<<                        ; [P+0]
+    >>>>>>>>>>>>>>>>>>>> $          ; push P+20 (cos for m[0]). [S: cos sin -sin cos]
+    <<<<<<<<<<<<<<<<<<<<            ; [P+0] = dest
 
-    ; P+0 = dest. Write via *~.
-
+    ; Write via *~ (deref-pop)
     ; m[0] = cos at dest+0
     *~                              ; tape[dest] = cos (pop). [S: cos sin -sin]
 
     ; m[2] = -sin at dest+8
-    ++++++++ *~                     ; P+0=dest+8. tape[dest+8] = -sin (pop). [S: cos sin]
+    ++++++++ *~                     ; P+0 = dest+8. tape[dest+8] = -sin. [S: cos sin]
 
-    ; m[8] = sin at dest+32 (dest+8 + 24 = dest+32)
-    ++++++++++++++++++++++++ *~     ; P+0=dest+32. tape[dest+32] = sin (pop). [S: cos]
+    ; m[8] = sin at dest+32 (need +24 from current dest+8)
+    ++++++++++++++++++++++++ *~     ; P+0 = dest+32. tape[dest+32] = sin. [S: cos]
 
-    ; m[10] = cos at dest+40 (dest+32 + 8 = dest+40)
-    ++++++++ *~                     ; P+0=dest+40. tape[dest+40] = cos (pop). [S: empty]
+    ; m[10] = cos at dest+40 (need +8 from dest+32)
+    ++++++++ *~                     ; P+0 = dest+40. tape[dest+40] = cos. [S: empty]
 
     ; Restore P+0 = dest (dest+40 - 40 = dest)
-    ---------------------------------------- ; P+0 = dest
+    ---------------------------------------- ; 40 decrements. P+0 = dest.
 
     ; Cleanup workspace
     >>>> [-]                        ; P+4

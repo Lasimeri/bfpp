@@ -1,6 +1,6 @@
 # BF++ Examples
 
-**Version**: 0.3.0
+**Version**: 0.4.0
 
 Annotated examples demonstrating BF++ language features.
 
@@ -565,3 +565,31 @@ $                           ; save sphere vertex count
 ; Cleanup
 \g3c
 ```
+
+---
+
+## 24. Text Editor (`examples/editor.bfpp`)
+
+A full-featured terminal text editor in 1141 lines of BF++. Demonstrates TUI rendering, keyboard input, file I/O, and multicore background operations.
+
+**Compile**:
+```bash
+bfpp examples/editor.bfpp --include stdlib --tape-size 262144 -o editor
+```
+
+**Features**:
+- Full text editing with insert/delete/backspace
+- Line number display (left gutter)
+- Status bar with filename, cursor position, modified indicator
+- Scrolling (vertical and horizontal)
+- File open/save via stdlib `file.bfpp`
+- Multicore background save (non-blocking writes using `__fork`/`__waitpid` pattern)
+- Arrow key navigation, Home/End, Page Up/Down
+- Uses `__tui_*` intrinsics for double-buffered rendering
+
+**Key concepts demonstrated**:
+- **Large-scale BF++ architecture**: 1141 lines organized into 20+ subroutines with clear separation of concerns (buffer management, rendering, input dispatch, file I/O).
+- **Preprocessor macros**: `!define` used for buffer offsets, color constants, and key bindings — making the source configurable.
+- **If/Else branching**: `?{...}:{...}` used extensively in the key dispatch loop to route different key codes to handler subroutines.
+- **Multicore pattern**: Fork a child process for disk I/O; parent continues rendering while child writes to disk. Child exit status checked via `__waitpid` on next save attempt.
+- **TUI double buffering**: Each frame builds the screen via `__tui_put`/`__tui_puts`/`__tui_fill`, then `__tui_end` diffs and emits only changed cells.

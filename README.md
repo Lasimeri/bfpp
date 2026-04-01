@@ -1,6 +1,6 @@
 # BF++
 
-A Brainfuck superset transpiler that compiles to C, adding syscalls, subroutines, error handling, bitwise ops, stack operations, FFI, numeric literals, compiler intrinsics (terminal, TUI, process, I/O), optional SDL2 framebuffer graphics, 3D rendering (OpenGL 3.3 + software rasterizer fallback), and multi-GPU support (EGL multi-context SFR/AFR/AUTO). Written in Rust. Produces self-contained, single-file C programs with an embedded runtime. Includes external C runtime libraries for double-buffered TUI rendering, 3D rendering, and multi-GPU coordination.
+A Brainfuck superset transpiler that compiles to C, adding syscalls, subroutines, error handling, bitwise ops, stack operations, FFI, numeric literals, preprocessor macros (`!define`/`!undef`), if/else syntax (`?{...}:{...}`), compiler intrinsics (terminal, TUI, process, I/O, SDL input, textures), self-hosting intrinsics (arithmetic, strings, hash maps, indirect calls), optional SDL2 framebuffer graphics, 3D rendering (OpenGL 3.3 + software rasterizer fallback), and multi-GPU support (EGL multi-context SFR/AFR/AUTO). Written in Rust. Produces self-contained, single-file C programs with an embedded runtime. Includes external C runtime libraries for double-buffered TUI rendering, 3D rendering, and multi-GPU coordination.
 
 ---
 
@@ -110,6 +110,9 @@ Separate read/write tapes for parallel data processing. Each thread gets its own
 | `;` | Line comment | Line comment (to end of line) |
 | `/* ... */` | Block comment | Nestable block comment. `/* outer /* inner */ still comment */` is valid. Unterminated block comment is a lex error |
 | `!include "file"` | Include | Preprocessor directive: splice file contents into source before lexing |
+| `!define NAME VALUE` | Define macro | Preprocessor: all subsequent occurrences of NAME are replaced with VALUE before lexing |
+| `!undef NAME` | Undefine macro | Preprocessor: remove a previously defined macro |
+| `?{...}:{...}` | If/else | Destructive truthiness test: if `tape[ptr]` is nonzero, execute true body; else execute false body. Cell is consumed (set to 0) |
 
 ---
 
@@ -121,7 +124,7 @@ Compilation pipeline:
 source.bfpp
     |
     v
-[Preprocess] -- expand !include directives, cycle detection, resolve search paths
+[Preprocess] -- expand !include directives, !define/!undef macros, cycle detection, resolve search paths
     |
     v
 [Lex] -- single-pass character dispatch -> flat token stream. Unrecognized chars = comments
@@ -146,7 +149,7 @@ source.bfpp
 
 | Stage | File | Key Mechanism |
 |-------|------|---------------|
-| Preprocess | `preprocess.rs` | Line-by-line `!include` expansion. Resolves relative to source dir, then `--include` paths, then `./stdlib/`, then exe-adjacent `stdlib/`. Cycle detection via canonical path HashSet. Max depth 64 |
+| Preprocess | `preprocess.rs` | Line-by-line `!include` expansion, `!define`/`!undef` macro substitution. Resolves relative to source dir, then `--include` paths, then `./stdlib/`, then exe-adjacent `stdlib/`. Cycle detection via canonical path HashSet. Max depth 64 |
 | Lex | `lexer.rs` | Peek-based character dispatcher. Multi-char tokens (strings, subroutines, fd specs, FFI, numeric literals, block comments) consume inline. Backslash lookahead cloning for `\ffi` vs `\` disambiguation. `#N`/`#0xHH` parsed as decimal/hex immediates. `/* */` with nesting depth counter. `%N` disambiguated by lookahead for 1/2/4/8 |
 | Parse | `parser.rs` | `parse_block`/`parse_single` recursive descent. `BlockEnd` enum tracks context (`]` vs `}` vs EOF). Consecutive movement/arithmetic tokens coalesced via `count_consecutive`. `*` recursively wraps the next single op. `R{...}K{...}` pairing enforced here |
 | Analyze | `analyzer.rs` | Four passes: (1) collect sub defs/calls into HashSets, check for undefined calls; (2) detect duplicate defs with separate `seen` set; (3) warn on top-level `^`; (4) reject empty FFI names |
@@ -188,6 +191,7 @@ bfpp [OPTIONS] <INPUT>
 | `--include <PATH>` | none | Additional include search path (repeatable) |
 | `--cc <COMPILER>` | `cc` | C compiler command |
 | `--eof <VALUE>` | 0 | Value written to cell on EOF during `,` (0 or 255) |
+| `--watch` | false | Watch mode: recompile automatically when source files change |
 
 ### Examples
 
@@ -272,7 +276,7 @@ R{
 
 ## Standard Library
 
-10 modules, all written in BF++. Include via `!include "module.bfpp"` or `--include stdlib/`. All modules use `#N`/`%N` operators where applicable.
+11 modules, all written in BF++. Include via `!include "module.bfpp"` or `--include stdlib/`. All modules use `#N`/`%N` operators where applicable.
 
 ### Module Status
 
@@ -288,6 +292,7 @@ R{
 | **Error** | `err.bfpp` | `!#es` err_to_string, `!#ep` panic, `!#ea` assert | Working. `!#es` prints single-digit error codes (0-9). `!#ep` uses SYS_exit via `\`. `!#ea` calls `!#ep` on assertion failure |
 | **Graphics** | `graphics.bfpp` | `!#px` set_pixel, `!#gx` get_pixel, `!#gc` clear_fb, `!#fl` fill_rect, `!#lh` draw_hline, `!#rc` draw_rect (stub), `!#ln` draw_line (stub) | SDL2 framebuffer primitives. Requires `--framebuffer WxH` and `%4` (32-bit cells). `!#px`/`!#gx`/`!#gc`/`!#fl` working. `!#rc`/`!#ln` are stubs (not implementable due to `@` single-jump constraint). Includes math.bfpp for address computation |
 | **3D** | `3d.bfpp` | ~45 intrinsics across 3 tiers: GL proxy intrinsics, Q16.16 fixed-point math, mesh generators | OpenGL 3.3 core profile with software rasterizer fallback. Blinn-Phong shading, PCF shadow mapping. Renders to offscreen FBO, async PBO readback to tape[FB_OFFSET]. Multi-GPU support via EGL (SFR/AFR/AUTO). Scene oracle for lock-free triple-buffered CPU-GPU data transfer. 485 lines |
+| **Math3D** | `math3d.bfpp` | Pure BF++ 3D math: vectors, matrices, transforms | 585 lines of pure BF++ math — no C intrinsics. Provides vector/matrix operations for 3D computation using only BF++ operators and stdlib |
 
 ### Calling Convention
 
@@ -301,13 +306,13 @@ All stdlib functions follow the same pattern:
 
 ## Optimization
 
-Three levels controlled by `-O` flag (overridden by `--no-optimize`):
+Three levels controlled by `-O` flag (overridden by `--no-optimize`). 12 optimizer passes total.
 
 | Level | Flag | Passes | Description |
 |-------|------|--------|-------------|
 | None | `-O0` | -- | AST passes through unchanged |
-| Basic | `-O1` | clear-loop, error-folding | `[-]`/`[+]` -> `Clear` (cell = 0). Consecutive `?` collapsed to one |
-| Full | `-O2` | clear-loop, scan-loop, multiply-move, error-folding | Adds: `[>]` -> `ScanRight`, `[<]` -> `ScanLeft`. `[->>+++<<]` patterns -> `MultiplyMove` (straight-line arithmetic instead of O(n) loop) |
+| Basic | `-O1` | clear-loop, error-folding, constant-fold | `[-]`/`[+]` -> `Clear` (cell = 0). Consecutive `?` collapsed to one. Dead stores and arithmetic folded |
+| Full | `-O2` | All 12 passes | Adds: scan-loop, multiply-move, conditional eval, loop unrolling, move coalescing, tail return elimination, second fold round |
 
 ### Optimizer Details
 
@@ -317,6 +322,12 @@ Three levels controlled by `-O` flag (overridden by `--no-optimize`):
 | Scan loop | `[>]` or `[<]` | `while(tape[ptr]) ptr++/--` | Semantically equivalent but enables future memchr optimization |
 | Multiply-move | `[->>+++<<]` | `tape[ptr+2] += tape[ptr]*3; tape[ptr]=0` | O(N*M) loop -> O(M) straight-line. Detects balanced decrement-move-increment patterns. Merges duplicate target offsets |
 | Error folding | `???` | `?` | Consecutive propagate checks are redundant. N-1 branch instructions eliminated |
+| Constant fold | `#5 +++` | `#8` | Dead store elimination + arithmetic folding. Adjacent set/inc/dec collapsed |
+| Conditional eval | `?{const}:{const}` | Direct branch | Compile-time evaluation of if/else with known constant conditions |
+| Loop unrolling | Small fixed-count loops | Unrolled body | Eliminates loop overhead for short iteration counts |
+| Move coalescing | `> > > <` | `>>` | Merges adjacent pointer moves, cancels opposing moves |
+| Tail return elimination | `!#sub ... ^` at end | Optimized return | Eliminates redundant return at end of subroutine body |
+| Second fold round | Post-optimization constants | Fold again | Re-applies constant folding after other passes expose new opportunities |
 
 Pass ordering matters: clear-loop runs first so `[-]` is reduced before multiply-move pattern matching (prevents false matches).
 
@@ -532,6 +543,43 @@ Lock-free SPSC triple-buffered scene snapshot system:
 - Temporal extrapolation decouples simulation rate from render rate
 - Runtime files: `bfpp_rt_3d_oracle.{c,h}`
 
+### SDL Input Intrinsics
+
+| Intrinsic | Input | Output / Effect |
+|-----------|-------|-----------------|
+| `!#__input_poll` | -- | Poll SDL event queue, update internal input state |
+| `!#__input_mouse_pos` | -- | `tape[ptr]` = mouse X, `tape[ptr+1]` = mouse Y |
+| `!#__input_key_held` | `tape[ptr]` = SDL scancode | `tape[ptr]` = 1 if key held, 0 if not |
+
+### Texture Intrinsics
+
+| Intrinsic | Input | Output / Effect |
+|-----------|-------|-----------------|
+| `!#__gl_create_texture` | -- | `tape[ptr]` = new texture ID |
+| `!#__gl_texture_data` | `tape[ptr]` = tex ID, `[ptr+1]` = width, `[ptr+2]` = height, `[ptr+3]` = data ptr | Upload pixel data to texture |
+| `!#__gl_bind_texture` | `tape[ptr]` = texture ID, `[ptr+1]` = texture unit | Bind texture to unit |
+| `!#__gl_delete_texture` | `tape[ptr]` = texture ID | Delete texture |
+| `!#__img_load` | Null-terminated BMP path at `tape[ptr]` | Load BMP image via SDL2, `tape[ptr]` = texture ID |
+
+### Self-Hosting Intrinsics
+
+Primitives for writing a BF++ compiler in BF++. These provide efficient operations that would be prohibitively slow in pure BF++.
+
+| Intrinsic | Input | Output / Effect |
+|-----------|-------|-----------------|
+| `!#__mul` | `tape[ptr]`, `tape[ptr+1]` | `tape[ptr]` = product |
+| `!#__div` | `tape[ptr]`, `tape[ptr+1]` | `tape[ptr]` = quotient |
+| `!#__mod` | `tape[ptr]`, `tape[ptr+1]` | `tape[ptr]` = remainder |
+| `!#__strcmp` | Null-terminated strings at `tape[ptr]` and `tape[ptr+1]` (as addresses) | `tape[ptr]` = 0 if equal, nonzero otherwise |
+| `!#__strlen` | Null-terminated string at `tape[ptr]` | `tape[ptr]` = length |
+| `!#__strcpy` | Source addr at `tape[ptr]`, dest addr at `tape[ptr+1]` | Copies string |
+| `!#__call` | `tape[ptr]` = subroutine index | Indirect subroutine dispatch (call by index) |
+| `!#__hashmap_init` | -- | Initialize a hash map, `tape[ptr]` = map handle |
+| `!#__hashmap_get` | `tape[ptr]` = map handle, key at `tape[ptr+1]` | `tape[ptr]` = value |
+| `!#__hashmap_set` | `tape[ptr]` = map handle, key at `tape[ptr+1]`, value at `tape[ptr+2]` | Insert/update entry |
+| `!#__array_insert` | Array addr + index + value | Insert element at index |
+| `!#__array_remove` | Array addr + index | Remove element at index |
+
 ---
 
 ## TUI Runtime Library
@@ -563,7 +611,7 @@ Lock-free SPSC triple-buffered scene snapshot system:
 
 ## Testing
 
-86 unit tests, all passing. Zero clippy warnings.
+114 unit tests, all passing. Zero clippy warnings.
 
 ### Unit Tests
 
@@ -623,6 +671,7 @@ bfpp/
     err.bfpp              -- err_to_string, panic, assert
     graphics.bfpp         -- SDL2 framebuffer: set_pixel, get_pixel, clear_fb, fill_rect, draw_hline
     3d.bfpp               -- 3D rendering: ~45 intrinsics (GL proxy, Q16.16 math, mesh generators)
+    math3d.bfpp           -- Pure BF++ 3D math (585 lines: vectors, matrices, transforms)
   spec/
     BFPP_SPEC.md          -- Full language specification
     ERROR_CODES.md        -- Error code table and errno mapping
