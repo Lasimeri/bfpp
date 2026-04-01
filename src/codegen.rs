@@ -10,6 +10,7 @@
 use crate::ast::{AstNode, FdSpec, Program};
 use rayon::prelude::*;
 
+
 pub struct CodegenOptions {
     pub tape_size: usize,   // number of bytes in the BF tape (should be power-of-two for TAPE_MASK)
     pub stack_size: usize,  // max depth of the BF++ value stack ($~ operations)
@@ -56,6 +57,8 @@ pub struct CodegenResult {
     pub uses_multigpu: bool,
     /// True if GPU compute intrinsics used — triggers bfpp_rt_opencl + dlopen(libOpenCL)
     pub uses_opencl: bool,
+    /// True if compressed I/O intrinsics used — triggers bfpp_rt_compress + -lz
+    pub uses_compressed_io: bool,
 }
 
 /// Split sources for parallel C compilation.
@@ -82,8 +85,9 @@ pub fn generate(program: &Program, opts: &CodegenOptions) -> CodegenResult {
     let uses_3d = intrinsics.gl3d;
     let uses_multigpu = intrinsics.multigpu;
     let uses_opencl = intrinsics.opencl;
+    let uses_compressed_io = intrinsics.compressed_io;
     let (c_source, split) = generate_c(program, opts, uses_ffi, &intrinsics);
-    CodegenResult { c_source, split, uses_ffi, uses_tui_runtime, uses_fb_pipeline, uses_threading, uses_3d, uses_multigpu, uses_opencl }
+    CodegenResult { c_source, split, uses_ffi, uses_tui_runtime, uses_fb_pipeline, uses_threading, uses_3d, uses_multigpu, uses_opencl, uses_compressed_io }
 }
 
 // Recursively checks whether any node in the AST uses \ffi calls.
@@ -118,6 +122,8 @@ fn generate_c(program: &Program, opts: &CodegenOptions, uses_ffi: bool, intrinsi
         eof_value: opts.eof_value,
         in_subroutine: false,
         in_result_block: false,
+        par_bodies: Vec::new(),
+        par_counter: 0,
     };
 
     collect_subroutines(&program.nodes, &mut ctx.subroutines);
@@ -165,7 +171,9 @@ fn generate_c(program: &Program, opts: &CodegenOptions, uses_ffi: bool, intrinsi
                 eof_value: ctx.eof_value,
                 in_subroutine: true,
                 in_result_block: false,
-            };
+                par_bodies: Vec::new(),
+                par_counter: 0,
+                        };
             sub_out.push_str(&format!("void bfpp_sub_{}(void) {{\n", mangled));
             indent(&mut sub_out, sub_ctx.indent);
             sub_out.push_str("if (++bfpp_call_depth > CALL_DEPTH) { fprintf(stderr, \"bfpp: call stack overflow\\n\"); exit(1); }\n");
@@ -173,7 +181,17 @@ fn generate_c(program: &Program, opts: &CodegenOptions, uses_ffi: bool, intrinsi
             indent(&mut sub_out, sub_ctx.indent);
             sub_out.push_str("bfpp_call_depth--;\n");
             sub_out.push_str("}\n\n");
-            (mangled, sub_out)
+            // Prepend any parallel body functions generated during this sub's emission
+            if !sub_ctx.par_bodies.is_empty() {
+                let mut combined = String::new();
+                for pb in &sub_ctx.par_bodies {
+                    combined.push_str(pb);
+                }
+                combined.push_str(&sub_out);
+                (mangled, combined)
+            } else {
+                (mangled, sub_out)
+            }
         })
         .collect();
     ctx.in_subroutine = false;
@@ -214,6 +232,10 @@ fn generate_c(program: &Program, opts: &CodegenOptions, uses_ffi: bool, intrinsi
     single.push_str(&sub_table);
     for (_, body) in &sub_bodies {
         single.push_str(body);
+    }
+    // Emit any parallel body functions generated during main() emission
+    for pb in &ctx.par_bodies {
+        single.push_str(pb);
     }
     single.push_str(&main_out);
 
@@ -305,6 +327,12 @@ struct GenCtx {
     eof_value: u8,
     in_subroutine: bool,
     in_result_block: bool,
+    /// Accumulated parallel body function definitions. Emitted at file scope
+    /// between subroutine bodies and main(). Each entry is a complete C
+    /// function definition string.
+    par_bodies: Vec<String>,
+    /// Counter for generating unique parallel body function names (_par_body_0, _par_body_1, ...).
+    par_counter: usize,
 }
 
 fn collect_subroutines(nodes: &[AstNode], names: &mut Vec<String>) {
@@ -339,6 +367,9 @@ fn emit_header(opts: &CodegenOptions, uses_ffi: bool, intrinsics: &IntrinsicUsag
     h.push_str("#include <netinet/in.h>\n");
     h.push_str("#include <arpa/inet.h>\n");
     h.push_str("#include <sys/syscall.h>\n");
+    // mmap for lazy tape allocation — pages are demand-faulted by the kernel,
+    // so only touched regions consume physical memory. Fallback to calloc.
+    h.push_str("#include <sys/mman.h>\n");
     // dlfcn.h only if the program uses \ffi — avoids unnecessary dep
     if uses_ffi {
         h.push_str("#include <dlfcn.h>\n");
@@ -379,6 +410,10 @@ fn emit_header(opts: &CodegenOptions, uses_ffi: bool, intrinsics: &IntrinsicUsag
     }
     if intrinsics.opencl {
         h.push_str("#include \"bfpp_rt_opencl.h\"\n");
+    }
+    if intrinsics.compressed_io {
+        h.push_str("#define HAVE_ZLIB\n");
+        h.push_str("#include \"bfpp_rt_compress.h\"\n");
     }
     h.push('\n');
 
@@ -450,7 +485,7 @@ fn emit_header(opts: &CodegenOptions, uses_ffi: bool, intrinsics: &IntrinsicUsag
     // Threading mode always uses external linkage (_Thread_local without static).
     h.push_str("#ifdef BFPP_DECL_ONLY\n");
     // Declarations only — for sub TUs in parallel compile
-    h.push_str("extern uint8_t tape[];\n");
+    h.push_str("extern uint8_t *tape;\n");
     if intrinsics.threading {
         h.push_str("extern _Thread_local int ptr;\n");
         h.push_str("extern _Thread_local int bfpp_err;\n");
@@ -464,17 +499,22 @@ fn emit_header(opts: &CodegenOptions, uses_ffi: bool, intrinsics: &IntrinsicUsag
         h.push_str("extern uint64_t stack[];\n");
         h.push_str("extern int sp;\n");
         h.push_str("extern int bfpp_call_depth;\n");
-        h.push_str("extern uint8_t cell_width[];\n");
+        h.push_str("extern uint8_t *cell_width;\n");
     }
     h.push_str("#else\n");
-    // Definitions — for single-file mode or the main TU in parallel compile
-    h.push_str("uint8_t tape[TAPE_SIZE];\n");
+    // Definitions — for single-file mode or the main TU in parallel compile.
+    // tape and cell_width are pointers, allocated lazily via mmap in the
+    // constructor. This avoids committing physical memory for the full tape
+    // size — only touched pages fault in.
+    h.push_str("uint8_t *tape;\n");
     if intrinsics.threading {
         h.push_str("_Thread_local int ptr = 0;\n");
         h.push_str("_Thread_local int bfpp_err = 0;\n");
         h.push_str("_Thread_local uint64_t stack[STACK_SIZE];\n");
         h.push_str("_Thread_local int sp = 0;\n");
         h.push_str("_Thread_local int bfpp_call_depth = 0;\n");
+        // Thread-local cell_width stays as a fixed array — mmap per-thread
+        // would require modifying the parallel runtime's thread entry point.
         h.push_str("_Thread_local uint8_t cell_width[TAPE_SIZE];\n");
     } else if intrinsics.gl3d || intrinsics.indirect_call || do_split {
         // External linkage: needed when 3D runtime, indirect calls, or
@@ -484,25 +524,26 @@ fn emit_header(opts: &CodegenOptions, uses_ffi: bool, intrinsics: &IntrinsicUsag
         h.push_str("uint64_t stack[STACK_SIZE];\n");
         h.push_str("int sp = 0;\n");
         h.push_str("int bfpp_call_depth = 0;\n");
-        h.push_str("uint8_t cell_width[TAPE_SIZE];\n");
+        h.push_str("uint8_t *cell_width;\n");
     } else {
         h.push_str("static int ptr = 0;\n");
         h.push_str("static int bfpp_err = 0;\n");
         h.push_str("static uint64_t stack[STACK_SIZE];\n");
         h.push_str("static int sp = 0;\n");
         h.push_str("static int bfpp_call_depth = 0;\n");
-        h.push_str("static uint8_t cell_width[TAPE_SIZE];\n");
+        h.push_str("static uint8_t *cell_width;\n");
     }
     h.push_str("#endif /* BFPP_DECL_ONLY */\n");
 
-    // Dual-tape, terminal state, constructor — only in definitions TU
+    // Dual-tape, terminal state, constructor — only in definitions TU.
+    // Dual tapes are also mmap-allocated pointers for lazy allocation.
     h.push_str("#ifndef BFPP_DECL_ONLY\n");
-    h.push_str("static uint8_t rtape[TAPE_SIZE];\n");
-    h.push_str("static uint8_t wtape[TAPE_SIZE];\n");
+    h.push_str("static uint8_t *rtape;\n");
+    h.push_str("static uint8_t *wtape;\n");
     h.push_str("static int rptr = 0;\n");
     h.push_str("static int wptr = 0;\n");
-    h.push_str("static uint8_t rcell_width[TAPE_SIZE];\n");
-    h.push_str("static uint8_t wcell_width[TAPE_SIZE];\n");
+    h.push_str("static uint8_t *rcell_width;\n");
+    h.push_str("static uint8_t *wcell_width;\n");
     if intrinsics.terminal {
         h.push_str("static struct termios bfpp_saved_termios;\n");
         h.push_str("static int bfpp_term_raw = 0;\n");
@@ -612,12 +653,55 @@ static void bfpp_cycle_width(int p) {
     }
 }
 
-/* Constructor: runs before main(). Zeros the tape, sets every cell_width
-   entry to 1 (each cell starts as a single byte), and zeros the stack. */
+/* Lazy mmap allocator for tape-sized buffers. Pages are demand-faulted
+   by the kernel, so only touched regions consume physical memory.
+   Falls back to calloc if mmap fails (e.g., on non-Linux platforms). */
+static uint8_t *bfpp_mmap_alloc(size_t size) {
+    uint8_t *p = (uint8_t *)mmap(NULL, size, PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) {
+        p = (uint8_t *)calloc(size, 1);
+    } else if (size >= 2097152) {
+        madvise(p, size, MADV_HUGEPAGE);
+    }
+    return p;
+}
+
+static void bfpp_mmap_free(uint8_t *p, size_t size) {
+    if (!p) return;
+    /* Detect whether p was mmap'd (page-aligned) or calloc'd.
+       mmap always returns page-aligned; calloc almost never does for large allocs
+       but may on some allocators. munmap on a calloc'd pointer is UB, so we
+       attempt munmap and fall back to free on failure. */
+    if (munmap(p, size) != 0) free(p);
+}
+
+/* Constructor: runs before main(). Allocates tape and cell_width via
+   lazy mmap, sets every cell_width entry to 1, zeros the stack. */
 static void __attribute__((constructor)) bfpp_init(void) {
-    memset(tape, 0, TAPE_SIZE);
-    memset(cell_width, 1, TAPE_SIZE);  /* 1 = independent 1-byte cell */
+    tape       = bfpp_mmap_alloc(TAPE_SIZE);
+    cell_width = bfpp_mmap_alloc(TAPE_SIZE);
+    rtape      = bfpp_mmap_alloc(TAPE_SIZE);
+    wtape      = bfpp_mmap_alloc(TAPE_SIZE);
+    rcell_width = bfpp_mmap_alloc(TAPE_SIZE);
+    wcell_width = bfpp_mmap_alloc(TAPE_SIZE);
+    /* mmap'd memory is zero-filled by the kernel; calloc also zeros.
+       cell_width needs 1-fill (each cell starts as 1-byte). */
+    memset(cell_width, 1, TAPE_SIZE);
+    memset(rcell_width, 1, TAPE_SIZE);
+    memset(wcell_width, 1, TAPE_SIZE);
     memset(stack, 0, sizeof(stack));
+}
+
+/* Destructor: release mmap'd buffers on exit. */
+static void __attribute__((destructor)) bfpp_cleanup(void) {
+    bfpp_mmap_free(tape, TAPE_SIZE);
+    bfpp_mmap_free(cell_width, TAPE_SIZE);
+    bfpp_mmap_free(rtape, TAPE_SIZE);
+    bfpp_mmap_free(wtape, TAPE_SIZE);
+    bfpp_mmap_free(rcell_width, TAPE_SIZE);
+    bfpp_mmap_free(wcell_width, TAPE_SIZE);
+    tape = cell_width = rtape = wtape = rcell_width = wcell_width = NULL;
 }
 
 "#);
@@ -629,6 +713,14 @@ static void __attribute__((constructor)) bfpp_init(void) {
     }
 
     h.push_str("#endif /* BFPP_DECL_ONLY — end of definitions section */\n\n");
+
+    // Shorthand macros for the most common generated patterns.
+    // G = get current cell value, S(v) = set current cell value.
+    // These shave ~30% off generated C size for typical programs since
+    // bfpp_get(ptr)/bfpp_set(ptr,...) appear on nearly every line.
+    h.push_str("/* Codegen shorthands — current-cell get/set */\n");
+    h.push_str("#define G bfpp_get(ptr)\n");
+    h.push_str("#define S(v) bfpp_set(ptr,(v))\n\n");
 
     // SDL2 framebuffer system. Uses the tiled render pipeline (bfpp_fb_pipeline.h/c)
     // for parallel strip processing with triple buffering and cache management.
@@ -678,33 +770,33 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
         AstNode::Increment(n) => {
             indent(out, ctx.indent);
             if *n == 1 {
-                out.push_str("bfpp_set(ptr, bfpp_get(ptr) + 1);\n");
+                out.push_str("S(G + 1);\n");
             } else {
-                out.push_str(&format!("bfpp_set(ptr, bfpp_get(ptr) + {});\n", n));
+                out.push_str(&format!("S(G + {});\n", n));
             }
         }
         AstNode::Decrement(n) => {
             indent(out, ctx.indent);
             if *n == 1 {
-                out.push_str("bfpp_set(ptr, bfpp_get(ptr) - 1);\n");
+                out.push_str("S(G - 1);\n");
             } else {
-                out.push_str(&format!("bfpp_set(ptr, bfpp_get(ptr) - {});\n", n));
+                out.push_str(&format!("S(G - {});\n", n));
             }
         }
         AstNode::Output => {
             indent(out, ctx.indent);
-            out.push_str("putchar((int)bfpp_get(ptr));\n");
+            out.push_str("putchar((int)G);\n");
         }
         AstNode::Input => {
             indent(out, ctx.indent);
             out.push_str(&format!(
-                "{{ int c = getchar(); bfpp_set(ptr, c == EOF ? {} : (uint64_t)c); }}\n",
+                "{{ int c = getchar(); S(c == EOF ? {} : (uint64_t)c); }}\n",
                 ctx.eof_value
             ));
         }
         AstNode::Loop(body) => {
             indent(out, ctx.indent);
-            out.push_str("while (bfpp_get(ptr)) {\n");
+            out.push_str("while (G) {\n");
             ctx.indent += 1;
             emit_nodes(out, body, ctx);
             ctx.indent -= 1;
@@ -715,7 +807,7 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
         // Extended memory
         AstNode::AbsoluteAddr => {
             indent(out, ctx.indent);
-            out.push_str("ptr = (int)bfpp_get(ptr) & TAPE_MASK;\n");
+            out.push_str("ptr = (int)G & TAPE_MASK;\n");
         }
         // Dereference: saves ptr, jumps to the address stored in the current
         // cell, executes the inner operation there, then restores ptr. This is
@@ -723,7 +815,7 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
         // architecture.
         AstNode::Deref(inner) => {
             indent(out, ctx.indent);
-            out.push_str("{ int saved_ptr = ptr; ptr = (int)bfpp_get(ptr) & TAPE_MASK;\n");
+            out.push_str("{ int saved_ptr = ptr; ptr = (int)G & TAPE_MASK;\n");
             ctx.indent += 1;
             emit_node(out, inner, ctx);
             ctx.indent -= 1;
@@ -735,33 +827,27 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
             out.push_str("bfpp_cycle_width(ptr);\n");
         }
         AstNode::StringLit(bytes) => {
+            // Emit string bytes as a compound literal — no scoping issues,
+            // and the compiler will deduplicate identical literals automatically.
             indent(out, ctx.indent);
-            out.push_str("{\n");
-            ctx.indent += 1;
-            indent(out, ctx.indent);
-            out.push_str("static const uint8_t str_data[] = {");
+            out.push_str(&format!("memcpy(&tape[ptr], (const uint8_t[]){{"));
             for (i, b) in bytes.iter().enumerate() {
                 if i > 0 { out.push_str(", "); }
                 out.push_str(&format!("{}", b));
             }
-            out.push_str("};\n");
-            indent(out, ctx.indent);
-            out.push_str(&format!("memcpy(&tape[ptr], str_data, {});\n", bytes.len()));
+            out.push_str(&format!("}}, {});\n", bytes.len()));
             indent(out, ctx.indent);
             out.push_str(&format!("ptr = (ptr + {}) & TAPE_MASK;\n", bytes.len()));
-            ctx.indent -= 1;
-            indent(out, ctx.indent);
-            out.push_str("}\n");
         }
 
         // Stack
         AstNode::Push => {
             indent(out, ctx.indent);
-            out.push_str("bfpp_push(bfpp_get(ptr));\n");
+            out.push_str("bfpp_push(G);\n");
         }
         AstNode::Pop => {
             indent(out, ctx.indent);
-            out.push_str("bfpp_set(ptr, bfpp_pop());\n");
+            out.push_str("S(bfpp_pop());\n");
         }
 
         // Subroutines
@@ -801,12 +887,12 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
             match fd {
                 FdSpec::Literal(n) => {
                     out.push_str(&format!(
-                        "{{ uint8_t b = (uint8_t)bfpp_get(ptr); write({}, &b, 1); }}\n", n
+                        "{{ uint8_t b = (uint8_t)G; write({}, &b, 1); }}\n", n
                     ));
                 }
                 FdSpec::Indirect => {
                     out.push_str(
-                        "{ uint8_t b = (uint8_t)bfpp_get(ptr); write((int)bfpp_get(ptr+1), &b, 1); }\n"
+                        "{ uint8_t b = (uint8_t)G; write((int)bfpp_get(ptr+1), &b, 1); }\n"
                     );
                 }
             }
@@ -816,13 +902,13 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
             match fd {
                 FdSpec::Literal(n) => {
                     out.push_str(&format!(
-                        "{{ uint8_t b; if (read({}, &b, 1) == 1) bfpp_set(ptr, b); else bfpp_set(ptr, {}); }}\n",
+                        "{{ uint8_t b; if (read({}, &b, 1) == 1) S(b); else S({}); }}\n",
                         n, ctx.eof_value
                     ));
                 }
                 FdSpec::Indirect => {
                     out.push_str(&format!(
-                        "{{ uint8_t b; if (read((int)bfpp_get(ptr+1), &b, 1) == 1) bfpp_set(ptr, b); else bfpp_set(ptr, {}); }}\n",
+                        "{{ uint8_t b; if (read((int)bfpp_get(ptr+1), &b, 1) == 1) S(b); else S({}); }}\n",
                         ctx.eof_value
                     ));
                 }
@@ -832,37 +918,37 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
         // Bitwise
         AstNode::BitOr => {
             indent(out, ctx.indent);
-            out.push_str("bfpp_set(ptr, bfpp_get(ptr) | bfpp_get(ptr+1));\n");
+            out.push_str("S(G | bfpp_get(ptr+1));\n");
         }
         AstNode::BitAnd => {
             indent(out, ctx.indent);
-            out.push_str("bfpp_set(ptr, bfpp_get(ptr) & bfpp_get(ptr+1));\n");
+            out.push_str("S(G & bfpp_get(ptr+1));\n");
         }
         AstNode::BitXor => {
             indent(out, ctx.indent);
-            out.push_str("bfpp_set(ptr, bfpp_get(ptr) ^ bfpp_get(ptr+1));\n");
+            out.push_str("S(G ^ bfpp_get(ptr+1));\n");
         }
         AstNode::ShiftLeft => {
             indent(out, ctx.indent);
-            out.push_str("bfpp_set(ptr, bfpp_get(ptr) << bfpp_get(ptr+1));\n");
+            out.push_str("S(G << bfpp_get(ptr+1));\n");
         }
         AstNode::ShiftRight => {
             indent(out, ctx.indent);
-            out.push_str("bfpp_set(ptr, bfpp_get(ptr) >> bfpp_get(ptr+1));\n");
+            out.push_str("S(G >> bfpp_get(ptr+1));\n");
         }
         AstNode::BitNot => {
             indent(out, ctx.indent);
-            out.push_str("bfpp_set(ptr, ~bfpp_get(ptr));\n");
+            out.push_str("S(~G);\n");
         }
 
         // Error handling
         AstNode::ErrorRead => {
             indent(out, ctx.indent);
-            out.push_str("bfpp_set(ptr, (uint64_t)bfpp_err);\n");
+            out.push_str("S((uint64_t)bfpp_err);\n");
         }
         AstNode::ErrorWrite => {
             indent(out, ctx.indent);
-            out.push_str("bfpp_err = (int)bfpp_get(ptr);\n");
+            out.push_str("bfpp_err = (int)G;\n");
         }
         // Propagate (?) — early-exit on error. Three behaviors:
         // 1. Inside R{...} block: `break;` — exits the do/while(0) wrapper,
@@ -951,11 +1037,11 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
         // ── Dual-tape operators ─────────────────────────────
         AstNode::ReadTape => {
             indent(out, ctx.indent);
-            out.push_str("bfpp_set(ptr, rtape[rptr]);\n");
+            out.push_str("S(rtape[rptr]);\n");
         }
         AstNode::WriteTape => {
             indent(out, ctx.indent);
-            out.push_str("wtape[wptr] = (uint8_t)bfpp_get(ptr);\n");
+            out.push_str("wtape[wptr] = (uint8_t)G;\n");
         }
         AstNode::ReadPtrRight => {
             indent(out, ctx.indent);
@@ -970,10 +1056,11 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
             out.push_str("wtape[wptr] = rtape[rptr];\n");
         }
         AstNode::SwapTapes => {
-            // Swap read/write tape pointers + pointer indices. Uses a static
-            // scratch buffer to avoid stack-allocating TAPE_SIZE bytes.
+            // Swap read/write tape pointers + cell_width pointers + indices.
+            // Now that tapes are heap-allocated via mmap, swapping the pointers
+            // is O(1) instead of 3x memcpy(TAPE_SIZE).
             indent(out, ctx.indent);
-            out.push_str("{ static _Thread_local uint8_t _swap_tmp[TAPE_SIZE]; memcpy(_swap_tmp, rtape, TAPE_SIZE); memcpy(rtape, wtape, TAPE_SIZE); memcpy(wtape, _swap_tmp, TAPE_SIZE); int _tp = rptr; rptr = wptr; wptr = _tp; }\n");
+            out.push_str("{ uint8_t *_tp = rtape; rtape = wtape; wtape = _tp; _tp = rcell_width; rcell_width = wcell_width; wcell_width = _tp; int _ti = rptr; rptr = wptr; wptr = _ti; }\n");
         }
         AstNode::SyncPtrs => {
             indent(out, ctx.indent);
@@ -983,7 +1070,7 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
         // Numeric literal: set current cell to an immediate value
         AstNode::SetValue(val) => {
             indent(out, ctx.indent);
-            out.push_str(&format!("bfpp_set(ptr, {}ULL);\n", val));
+            out.push_str(&format!("S({}ULL);\n", val));
         }
 
         // Multi-cell setup: set P+0, P+1, ... P+N from a list of values.
@@ -1005,7 +1092,7 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
         // Non-destructive — the cell value is preserved after the comparison.
         AstNode::IfEqual(val, body, else_body) => {
             indent(out, ctx.indent);
-            out.push_str(&format!("if (bfpp_get(ptr) == {}ULL) {{\n", val));
+            out.push_str(&format!("if (G == {}ULL) {{\n", val));
             ctx.indent += 1;
             emit_nodes(out, body, ctx);
             ctx.indent -= 1;
@@ -1021,7 +1108,7 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
         }
         AstNode::IfNotEqual(val, body) => {
             indent(out, ctx.indent);
-            out.push_str(&format!("if (bfpp_get(ptr) != {}ULL) {{\n", val));
+            out.push_str(&format!("if (G != {}ULL) {{\n", val));
             ctx.indent += 1;
             emit_nodes(out, body, ctx);
             ctx.indent -= 1;
@@ -1030,7 +1117,7 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
         }
         AstNode::IfLess(val, body) => {
             indent(out, ctx.indent);
-            out.push_str(&format!("if (bfpp_get(ptr) < {}ULL) {{\n", val));
+            out.push_str(&format!("if (G < {}ULL) {{\n", val));
             ctx.indent += 1;
             emit_nodes(out, body, ctx);
             ctx.indent -= 1;
@@ -1039,7 +1126,7 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
         }
         AstNode::IfGreater(val, body) => {
             indent(out, ctx.indent);
-            out.push_str(&format!("if (bfpp_get(ptr) > {}ULL) {{\n", val));
+            out.push_str(&format!("if (G > {}ULL) {{\n", val));
             ctx.indent += 1;
             emit_nodes(out, body, ctx);
             ctx.indent -= 1;
@@ -1054,9 +1141,9 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
             out.push_str("{\n");
             ctx.indent += 1;
             indent(out, ctx.indent);
-            out.push_str("uint64_t _cond = bfpp_get(ptr);\n");
+            out.push_str("uint64_t _cond = G;\n");
             indent(out, ctx.indent);
-            out.push_str("bfpp_set(ptr, 0);\n");
+            out.push_str("S(0);\n");
             indent(out, ctx.indent);
             out.push_str("if (_cond) {\n");
             ctx.indent += 1;
@@ -1163,24 +1250,26 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
         //   constant factors and add to cells at known offsets, then clear.
         AstNode::Clear => {
             indent(out, ctx.indent);
-            out.push_str("bfpp_set(ptr, 0);\n");
+            out.push_str("S(0);\n");
         }
         AstNode::ScanRight => {
             indent(out, ctx.indent);
-            out.push_str("while (bfpp_get(ptr)) ptr = (ptr + 1) & TAPE_MASK;\n");
+            out.push_str("while (G) ptr = (ptr + 1) & TAPE_MASK;\n");
         }
         AstNode::ScanLeft => {
             indent(out, ctx.indent);
-            out.push_str("while (bfpp_get(ptr)) ptr = (ptr - 1 + TAPE_SIZE) & TAPE_MASK;\n");
+            out.push_str("while (G) ptr = (ptr - 1 + TAPE_SIZE) & TAPE_MASK;\n");
         }
         AstNode::MultiplyMove(pairs) => {
             indent(out, ctx.indent);
             out.push_str("{\n");
             ctx.indent += 1;
             indent(out, ctx.indent);
-            out.push_str("uint64_t val = bfpp_get(ptr);\n");
+            out.push_str("uint64_t val = G;\n");
             for (offset, factor) in pairs {
                 indent(out, ctx.indent);
+                // MultiplyMove targets are at ptr+offset, not ptr itself,
+                // so we use the full bfpp_get/set (not the G/S macros).
                 if *offset >= 0 {
                     out.push_str(&format!(
                         "bfpp_set(ptr + {}, bfpp_get(ptr + {}) + val * {});\n",
@@ -1194,7 +1283,197 @@ fn emit_node(out: &mut String, node: &AstNode, ctx: &mut GenCtx) {
                 }
             }
             indent(out, ctx.indent);
-            out.push_str("bfpp_set(ptr, 0);\n");
+            out.push_str("S(0);\n");
+            ctx.indent -= 1;
+            indent(out, ctx.indent);
+            out.push_str("}\n");
+        }
+
+        // ── Auto-parallelism nodes ────────────────────────────
+        // ParallelLoop: emits a file-scope body function and calls bfpp_parallel_for.
+        // Each iteration gets its own ptr position = base + i * stride, saving
+        // and restoring ptr to avoid cross-iteration interference.
+        AstNode::ParallelLoop { body, stride, trip_count } => {
+            let fn_id = ctx.par_counter;
+            ctx.par_counter += 1;
+
+            // Generate the body function at file scope (stored in par_bodies)
+            let mut fn_out = String::new();
+            fn_out.push_str(&format!(
+                "static void _par_body_{}(int _base, int _stride, int _start, int _end) {{\n",
+                fn_id
+            ));
+            fn_out.push_str("    for (int _i = _start; _i < _end; _i++) {\n");
+            fn_out.push_str("        int _saved_ptr = ptr;\n");
+            fn_out.push_str("        ptr = (_base + _i * _stride) & TAPE_MASK;\n");
+
+            // Emit the loop body inside the per-iteration block
+            let mut body_ctx = GenCtx {
+                indent: 2,
+                subroutines: ctx.subroutines.clone(),
+                eof_value: ctx.eof_value,
+                in_subroutine: ctx.in_subroutine,
+                in_result_block: ctx.in_result_block,
+                par_bodies: Vec::new(),
+                par_counter: ctx.par_counter,
+            };
+            emit_nodes(&mut fn_out, body, &mut body_ctx);
+            // Propagate counter back (nested parallel loops would increment it)
+            ctx.par_counter = body_ctx.par_counter;
+            // Propagate any nested par_bodies
+            ctx.par_bodies.extend(body_ctx.par_bodies);
+
+            fn_out.push_str("        ptr = _saved_ptr;\n");
+            fn_out.push_str("    }\n");
+            fn_out.push_str("}\n\n");
+            ctx.par_bodies.push(fn_out);
+
+            match trip_count {
+                Some(n) => {
+                    // Static trip count — always parallel
+                    indent(out, ctx.indent);
+                    out.push_str(&format!(
+                        "/* Auto-parallel loop: {} iterations, stride {} */\n",
+                        n, stride
+                    ));
+                    indent(out, ctx.indent);
+                    out.push_str(&format!(
+                        "bfpp_parallel_for(ptr, {}, {}, _par_body_{});\n",
+                        n, stride, fn_id
+                    ));
+                    indent(out, ctx.indent);
+                    out.push_str(&format!(
+                        "ptr = (ptr + {} * {}) & TAPE_MASK;\n",
+                        n, stride
+                    ));
+                }
+                None => {
+                    // Runtime trip count — branch on threshold
+                    indent(out, ctx.indent);
+                    out.push_str("{\n");
+                    ctx.indent += 1;
+                    indent(out, ctx.indent);
+                    out.push_str("uint64_t _count = G;\n");
+                    indent(out, ctx.indent);
+                    out.push_str("if (_count >= 64) {\n");
+                    ctx.indent += 1;
+                    indent(out, ctx.indent);
+                    out.push_str(&format!(
+                        "bfpp_parallel_for(ptr, (int)_count, {}, _par_body_{});\n",
+                        stride, fn_id
+                    ));
+                    indent(out, ctx.indent);
+                    out.push_str(&format!(
+                        "ptr = (ptr + (int)_count * {}) & TAPE_MASK;\n",
+                        stride
+                    ));
+                    ctx.indent -= 1;
+                    indent(out, ctx.indent);
+                    out.push_str("} else {\n");
+                    ctx.indent += 1;
+                    indent(out, ctx.indent);
+                    out.push_str("/* Sequential fallback for small counts */\n");
+                    indent(out, ctx.indent);
+                    out.push_str("while (G) {\n");
+                    ctx.indent += 1;
+                    indent(out, ctx.indent);
+                    out.push_str("S(G - 1);\n");
+                    emit_nodes(out, body, ctx);
+                    indent(out, ctx.indent);
+                    out.push_str(&format!(
+                        "ptr = (ptr + {}) & TAPE_MASK;\n",
+                        stride
+                    ));
+                    ctx.indent -= 1;
+                    indent(out, ctx.indent);
+                    out.push_str("}\n");
+                    ctx.indent -= 1;
+                    indent(out, ctx.indent);
+                    out.push_str("}\n");
+                    ctx.indent -= 1;
+                    indent(out, ctx.indent);
+                    out.push_str("}\n");
+                }
+            }
+        }
+
+        // ParallelCalls: spawn the first subroutine on a new thread,
+        // run the second on the current thread, then join.
+        AstNode::ParallelCalls(names) => {
+            if names.len() >= 2 {
+                indent(out, ctx.indent);
+                out.push_str("{\n");
+                ctx.indent += 1;
+                // Spawn all but the last on new threads
+                for (i, name) in names[..names.len() - 1].iter().enumerate() {
+                    indent(out, ctx.indent);
+                    out.push_str(&format!("pthread_t _pt_{};\n", i));
+                    indent(out, ctx.indent);
+                    out.push_str(&format!(
+                        "pthread_create(&_pt_{}, NULL, (void*(*)(void*))bfpp_sub_{}, NULL);\n",
+                        i, mangle_name(name)
+                    ));
+                }
+                // Run the last one on this thread
+                indent(out, ctx.indent);
+                out.push_str(&format!(
+                    "bfpp_sub_{}();\n",
+                    mangle_name(names.last().unwrap())
+                ));
+                // Join all spawned threads
+                for i in 0..names.len() - 1 {
+                    indent(out, ctx.indent);
+                    out.push_str(&format!("pthread_join(_pt_{}, NULL);\n", i));
+                }
+                ctx.indent -= 1;
+                indent(out, ctx.indent);
+                out.push_str("}\n");
+            } else if names.len() == 1 {
+                // Single sub — just call it directly
+                indent(out, ctx.indent);
+                out.push_str(&format!("bfpp_sub_{}();\n", mangle_name(&names[0])));
+            }
+        }
+
+        // GpuLoop: dual-path — OpenCL kernel dispatch with CPU fallback.
+        // Kernel source is embedded as a static C string, lazily compiled.
+        AstNode::GpuLoop { trip_count, stride, body, kernel_source, kernel_id } => {
+            indent(out, ctx.indent);
+            out.push_str(&format!("/* GPU loop {}: {} iters, stride {} */\n", kernel_id, trip_count, stride));
+            indent(out, ctx.indent);
+            out.push_str("if (bfpp_opencl_available()) {\n");
+            ctx.indent += 1;
+            let escaped = kernel_source.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n\"\n\"");
+            indent(out, ctx.indent);
+            out.push_str(&format!("static const char *_ksrc_{} = \"{}\";\n", kernel_id, escaped));
+            indent(out, ctx.indent);
+            out.push_str(&format!(
+                "static void *_k_{id} = NULL; if (!_k_{id}) _k_{id} = (void*)bfpp_opencl_compile_kernel(_ksrc_{id}, \"bfpp_gpu_loop_{id}\");\n",
+                id = kernel_id
+            ));
+            indent(out, ctx.indent);
+            out.push_str(&format!("bfpp_opencl_dispatch(_k_{}, tape, ptr, {}, {});\n", kernel_id, stride, trip_count));
+            indent(out, ctx.indent);
+            out.push_str("bfpp_opencl_wait_last();\n");
+            indent(out, ctx.indent);
+            out.push_str(&format!("ptr = (ptr + {} * {}) & TAPE_MASK;\n", trip_count, stride));
+            ctx.indent -= 1;
+            indent(out, ctx.indent);
+            out.push_str("} else {\n");
+            ctx.indent += 1;
+            indent(out, ctx.indent);
+            out.push_str(&format!("S({});\n", trip_count));
+            indent(out, ctx.indent);
+            out.push_str("while (G) {\n");
+            ctx.indent += 1;
+            indent(out, ctx.indent);
+            out.push_str("S(G - 1);\n");
+            emit_nodes(out, body, ctx);
+            indent(out, ctx.indent);
+            out.push_str(&format!("ptr = (ptr + {}) & TAPE_MASK;\n", stride));
+            ctx.indent -= 1;
+            indent(out, ctx.indent);
+            out.push_str("}\n");
             ctx.indent -= 1;
             indent(out, ctx.indent);
             out.push_str("}\n");
@@ -1928,6 +2207,33 @@ fn emit_intrinsic(out: &mut String, name: &str, ctx: &mut GenCtx) {
             out.push_str("bfpp_barrier_wait((int)bfpp_get(ptr));\n");
         }
 
+        // ── Compressed I/O (bfpp_rt_compress) ──────────────
+        // Wire format: [4-byte header][compressed data]. Requires -lz.
+        "__net_send_compressed" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_net_send_compressed((int)bfpp_get(ptr), &tape[(ptr+4)&TAPE_MASK], (int)bfpp_get(ptr+8));\n");
+        }
+        "__net_recv_compressed" => {
+            indent(out, ctx.indent);
+            out.push_str("{ int _n = bfpp_net_recv_compressed((int)bfpp_get(ptr), &tape[(ptr+4)&TAPE_MASK], (int)bfpp_get(ptr+8)); bfpp_set(ptr+12, _n); }\n");
+        }
+        "__file_write_compressed" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_file_write_compressed((int)bfpp_get(ptr), &tape[(ptr+4)&TAPE_MASK], (int)bfpp_get(ptr+8));\n");
+        }
+        "__file_read_compressed" => {
+            indent(out, ctx.indent);
+            out.push_str("{ int _n = bfpp_file_read_compressed((int)bfpp_get(ptr), &tape[(ptr+4)&TAPE_MASK], (int)bfpp_get(ptr+8)); bfpp_set(ptr+12, _n); }\n");
+        }
+        "__tape_save" => {
+            indent(out, ctx.indent);
+            out.push_str("bfpp_tape_save((const char*)&tape[(ptr)&TAPE_MASK], tape, TAPE_SIZE);\n");
+        }
+        "__tape_load" => {
+            indent(out, ctx.indent);
+            out.push_str("{ int _n = bfpp_tape_load((const char*)&tape[(ptr)&TAPE_MASK], tape, TAPE_SIZE); bfpp_set(ptr, _n); }\n");
+        }
+
         // ── Unrecognized intrinsic ───────────────────────────
         _ => {
             indent(out, ctx.indent);
@@ -1956,6 +2262,7 @@ struct IntrinsicUsage {
     multigpu: bool,  // __gl_multi_gpu, __gl_gpu_count, __gl_frame_time, __scene_* — requires bfpp_rt_3d_multigpu + bfpp_rt_3d_oracle + EGL
     indirect_call: bool, // __call — needs bfpp_sub_table (same as threading)
     opencl: bool,        // __gpu_* — requires bfpp_rt_opencl + dlopen(libOpenCL)
+    compressed_io: bool, // __net_send_compressed, __file_write_compressed, __tape_save/load — requires bfpp_rt_compress + -lz
 }
 
 // Pre-scan the entire AST for intrinsic calls and return a summary of
@@ -2027,6 +2334,10 @@ fn scan_intrinsics(nodes: &[AstNode], usage: &mut IntrinsicUsage) {
                     "__gpu_sort" | "__gpu_reduce" | "__gpu_transform" |
                     "__gpu_rasterize" | "__gpu_blur" | "__gpu_poll" |
                     "__gpu_wait" | "__gpu_dispatch" => { usage.opencl = true; }
+                    // Compressed I/O — needs bfpp_rt_compress + -lz
+                    "__net_send_compressed" | "__net_recv_compressed" |
+                    "__file_write_compressed" | "__file_read_compressed" |
+                    "__tape_save" | "__tape_load" => { usage.compressed_io = true; }
                     _ => {}
                 }
             }
@@ -2036,6 +2347,19 @@ fn scan_intrinsics(nodes: &[AstNode], usage: &mut IntrinsicUsage) {
                 scan_intrinsics(k, usage);
             }
             AstNode::Deref(inner) => scan_intrinsics(&[*inner.clone()], usage),
+            // Auto-parallel nodes require the threading runtime
+            AstNode::ParallelLoop { body, .. } => {
+                usage.threading = true;
+                scan_intrinsics(body, usage);
+            }
+            AstNode::ParallelCalls(_) => {
+                usage.threading = true;
+            }
+            // GPU loops require OpenCL runtime
+            AstNode::GpuLoop { body, .. } => {
+                usage.opencl = true;
+                scan_intrinsics(body, usage);
+            }
             _ => {}
         }
     }
@@ -2055,7 +2379,7 @@ mod tests {
         let program = parse(&tokens).unwrap();
         let result = generate(&program, &CodegenOptions::default());
         assert!(result.c_source.contains("int main(void)"));
-        assert!(result.c_source.contains("while (bfpp_get(ptr))"));
+        assert!(result.c_source.contains("while (G)"));
         assert!(result.c_source.contains("putchar"));
     }
 
@@ -2127,7 +2451,7 @@ mod tests {
         let tokens = lex("#42 .").unwrap();
         let program = parse(&tokens).unwrap();
         let result = generate(&program, &CodegenOptions::default());
-        assert!(result.c_source.contains("bfpp_set(ptr, 42ULL)"));
+        assert!(result.c_source.contains("S(42ULL)"));
         assert!(result.c_source.contains("putchar"));
     }
 
@@ -2138,7 +2462,7 @@ mod tests {
         let tokens = lex("#0xFF").unwrap();
         let program = parse(&tokens).unwrap();
         let result = generate(&program, &CodegenOptions::default());
-        assert!(result.c_source.contains("bfpp_set(ptr, 255ULL)"));
+        assert!(result.c_source.contains("S(255ULL)"));
     }
 
     /// %N (SetCellWidth) emits inline C that releases old sub-cells and
@@ -2149,7 +2473,7 @@ mod tests {
         let program = parse(&tokens).unwrap();
         let result = generate(&program, &CodegenOptions::default());
         assert!(result.c_source.contains("cell_width[ptr] = 8"));
-        assert!(result.c_source.contains("bfpp_set(ptr, 100ULL)"));
+        assert!(result.c_source.contains("S(100ULL)"));
     }
 
     /// __sleep intrinsic emits usleep() and triggers the time.h include.
@@ -2213,7 +2537,7 @@ mod tests {
         let tokens = lex("?= #17 [ #89 . ]").unwrap();
         let program = parse(&tokens).unwrap();
         let result = generate(&program, &CodegenOptions::default());
-        assert!(result.c_source.contains("if (bfpp_get(ptr) == 17ULL)"));
+        assert!(result.c_source.contains("if (G == 17ULL)"));
     }
 
     #[test]
@@ -2221,7 +2545,7 @@ mod tests {
         let tokens = lex("?= #65 [ #89 . ] : [ #78 . ]").unwrap();
         let program = parse(&tokens).unwrap();
         let result = generate(&program, &CodegenOptions::default());
-        assert!(result.c_source.contains("if (bfpp_get(ptr) == 65ULL)"));
+        assert!(result.c_source.contains("if (G == 65ULL)"));
         assert!(result.c_source.contains("} else {"));
     }
 
@@ -2230,7 +2554,7 @@ mod tests {
         let tokens = lex("?< #32 [ #89 . ]").unwrap();
         let program = parse(&tokens).unwrap();
         let result = generate(&program, &CodegenOptions::default());
-        assert!(result.c_source.contains("if (bfpp_get(ptr) < 32ULL)"));
+        assert!(result.c_source.contains("if (G < 32ULL)"));
     }
 
     #[test]

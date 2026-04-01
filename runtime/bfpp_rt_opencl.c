@@ -72,6 +72,8 @@ typedef cl_int (*fn_clReleaseEvent)(cl_event);
 typedef cl_int (*fn_clFlush)(cl_command_queue);
 typedef cl_int (*fn_clFinish)(cl_command_queue);
 typedef cl_int (*fn_clGetProgramBuildInfo)(cl_program, cl_device_id, cl_uint, size_t, void *, size_t *);
+typedef cl_program (*fn_clCreateProgramWithBinary)(cl_context, cl_uint, const cl_device_id *, const size_t *, const unsigned char **, cl_int *, cl_int *);
+typedef cl_int (*fn_clGetProgramInfo)(cl_program, cl_uint, size_t, void *, size_t *);
 
 /* ── Function pointer table ──────────────────────────────────── */
 
@@ -100,6 +102,8 @@ static struct {
     fn_clFlush                 Flush;
     fn_clFinish                Finish;
     fn_clGetProgramBuildInfo   GetProgramBuildInfo;
+    fn_clCreateProgramWithBinary CreateProgramWithBinary;
+    fn_clGetProgramInfo        GetProgramInfo;
 } cl;
 
 /* ── Per-device state ────────────────────────────────────────── */
@@ -155,6 +159,136 @@ static struct {
 
 extern int bfpp_err;
 #define BFPP_ERR_GENERIC 1
+
+/* ── Dirty-page GPU upload tracking (Item 4) ─────────────────── */
+
+#define OCL_PAGE_SIZE 4096
+#define OCL_MAX_PAGES (256 * 1024 * 1024 / OCL_PAGE_SIZE)  /* 256 MB max tape / page size */
+
+static uint8_t ocl_dirty_pages[OCL_MAX_PAGES];
+
+void bfpp_opencl_mark_dirty(int offset, int size)
+{
+    if (offset < 0 || size <= 0) return;
+    int start_page = offset / OCL_PAGE_SIZE;
+    int end_page   = (offset + size - 1) / OCL_PAGE_SIZE;
+    if (end_page >= OCL_MAX_PAGES) end_page = OCL_MAX_PAGES - 1;
+    for (int p = start_page; p <= end_page; p++)
+        ocl_dirty_pages[p] = 1;
+}
+
+/* Upload only dirty pages within the given tape region to the GPU buffer.
+ * Clears dirty flags for uploaded pages. */
+static void upload_dirty_region(int dev_idx, int base, int size, uint8_t *tape)
+{
+    bfpp_cl_device_t *dev = &ocl.devices[dev_idx];
+    if (!dev->tape_buf) return;
+    int start_page = base / OCL_PAGE_SIZE;
+    int end_page   = (base + size - 1) / OCL_PAGE_SIZE;
+    if (end_page >= OCL_MAX_PAGES) end_page = OCL_MAX_PAGES - 1;
+
+    for (int p = start_page; p <= end_page; p++) {
+        if (!ocl_dirty_pages[p]) continue;
+        int off = p * OCL_PAGE_SIZE;
+        int sz  = OCL_PAGE_SIZE;
+        /* Clamp to the requested region */
+        if (off < base) { sz -= (base - off); off = base; }
+        if (off + sz > base + size) sz = base + size - off;
+        if (sz <= 0) continue;
+        cl.EnqueueWriteBuffer(dev->queue, dev->tape_buf, CL_FALSE,
+                              (size_t)off, (size_t)sz, tape + off,
+                              0, NULL, NULL);
+        ocl_dirty_pages[p] = 0;
+    }
+}
+
+/* ── Program binary cache (Item 5) ───────────────────────────── */
+
+/* djb2 hash for cache key derivation */
+static uint32_t djb2_hash(const char *str)
+{
+    uint32_t hash = 5381;
+    int c;
+    while ((c = (unsigned char)*str++))
+        hash = ((hash << 5) + hash) + (uint32_t)c;
+    return hash;
+}
+
+/* Try loading a cached binary; if not found, compile from source and cache.
+ * Returns a built cl_program, or NULL on failure. */
+static cl_program load_or_compile_program(int dev_idx, const char *source)
+{
+    bfpp_cl_device_t *dev = &ocl.devices[dev_idx];
+    cl_int err;
+
+    uint32_t hash = djb2_hash(source);
+    char cache_path[256];
+    snprintf(cache_path, sizeof(cache_path),
+             "/tmp/bfpp_ocl_cache_%u_%d.bin", hash, dev_idx);
+
+    /* Try loading cached binary */
+    if (cl.CreateProgramWithBinary && cl.GetProgramInfo) {
+        FILE *f = fopen(cache_path, "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            size_t len = (size_t)ftell(f);
+            fseek(f, 0, SEEK_SET);
+            unsigned char *bin = (unsigned char *)malloc(len);
+            if (bin) {
+                fread(bin, 1, len, f);
+                fclose(f);
+                const unsigned char *bins[1] = { bin };
+                cl_int bin_status;
+                cl_program prog = cl.CreateProgramWithBinary(
+                    dev->context, 1, &dev->device, &len,
+                    bins, &bin_status, &err);
+                free(bin);
+                if (err == CL_SUCCESS && bin_status == CL_SUCCESS) {
+                    err = cl.BuildProgram(prog, 1, &dev->device,
+                                          "-cl-fast-relaxed-math",
+                                          NULL, NULL);
+                    if (err == CL_SUCCESS) return prog;
+                    cl.ReleaseProgram(prog);
+                }
+            } else {
+                fclose(f);
+            }
+        }
+    }
+
+    /* Compile from source */
+    size_t len = strlen(source);
+    cl_program prog = cl.CreateProgramWithSource(
+        dev->context, 1, &source, &len, &err);
+    if (err != CL_SUCCESS) return NULL;
+
+    err = cl.BuildProgram(prog, 1, &dev->device,
+                          "-cl-fast-relaxed-math", NULL, NULL);
+    if (err != CL_SUCCESS) {
+        cl.ReleaseProgram(prog);
+        return NULL;
+    }
+
+    /* Cache the binary for next run */
+    if (cl.GetProgramInfo) {
+        size_t bin_size = 0;
+        cl.GetProgramInfo(prog, 0x1165 /*CL_PROGRAM_BINARY_SIZES*/,
+                          sizeof(bin_size), &bin_size, NULL);
+        if (bin_size > 0) {
+            unsigned char *bin = (unsigned char *)malloc(bin_size);
+            if (bin) {
+                unsigned char *bins[1] = { bin };
+                cl.GetProgramInfo(prog, 0x1166 /*CL_PROGRAM_BINARIES*/,
+                                  sizeof(bins), bins, NULL);
+                FILE *f = fopen(cache_path, "wb");
+                if (f) { fwrite(bin, 1, bin_size, f); fclose(f); }
+                free(bin);
+            }
+        }
+    }
+
+    return prog;
+}
 
 /* ── Tape helpers ────────────────────────────────────────────── */
 
@@ -212,6 +346,10 @@ static int load_opencl(void) {
     LOAD(GetProgramBuildInfo)
     #undef LOAD
 
+    /* Optional functions — binary cache works only if both are present */
+    cl.CreateProgramWithBinary = (fn_clCreateProgramWithBinary)dlsym(cl.lib, "clCreateProgramWithBinary");
+    cl.GetProgramInfo = (fn_clGetProgramInfo)dlsym(cl.lib, "clGetProgramInfo");
+
     return 1;
 }
 
@@ -219,23 +357,17 @@ static int load_opencl(void) {
 
 static cl_kernel compile_kernel(int dev_idx, const char *source, const char *name) {
     cl_int err;
-    bfpp_cl_device_t *dev = &ocl.devices[dev_idx];
-    size_t len = strlen(source);
 
-    cl_program prog = cl.CreateProgramWithSource(dev->context, 1, &source, &len, &err);
-    if (err != CL_SUCCESS) return NULL;
-
-    err = cl.BuildProgram(prog, 1, &dev->device, "-cl-fast-relaxed-math", NULL, NULL);
-    if (err != CL_SUCCESS) {
-        char log[4096];
-        cl.GetProgramBuildInfo(prog, dev->device, 0x1183 /*CL_PROGRAM_BUILD_LOG*/,
-                               sizeof(log), log, NULL);
-        fprintf(stderr, "bfpp_opencl: build error for '%s': %s\n", name, log);
-        cl.ReleaseProgram(prog);
+    /* Try cached binary first, fall back to source compilation */
+    cl_program prog = load_or_compile_program(dev_idx, source);
+    if (!prog) {
+        fprintf(stderr, "bfpp_opencl: build error for '%s'\n", name);
         return NULL;
     }
 
     cl_kernel k = cl.CreateKernel(prog, name, &err);
+    /* Store program handle for later cleanup instead of releasing immediately,
+     * but since kernels hold a ref we can release safely */
     cl.ReleaseProgram(prog);
     return (err == CL_SUCCESS) ? k : NULL;
 }
@@ -317,6 +449,8 @@ int bfpp_opencl_init(void) {
 
     if (ocl.device_count > 0) {
         ocl.initialized = 1;
+        /* Mark all pages dirty so first upload transfers everything */
+        memset(ocl_dirty_pages, 1, sizeof(ocl_dirty_pages));
         fprintf(stderr, "bfpp_opencl: %d GPU compute device(s) initialized\n", ocl.device_count);
     }
 
@@ -370,6 +504,9 @@ int bfpp_opencl_memset(uint8_t *tape, int offset, uint8_t value, int size) {
     cl_mem buf = ensure_buf(di, offset + size);
     if (!buf) return -1;
 
+    /* Upload only dirty pages instead of full region (Item 4) */
+    upload_dirty_region(di, offset, size, tape);
+
     cl.SetKernelArg(ocl.k_memset[di], 0, sizeof(cl_mem), &buf);
     cl.SetKernelArg(ocl.k_memset[di], 1, sizeof(int), &offset);
     cl.SetKernelArg(ocl.k_memset[di], 2, sizeof(uint8_t), &value);
@@ -379,7 +516,7 @@ int bfpp_opencl_memset(uint8_t *tape, int offset, uint8_t value, int size) {
     cl_event evt;
     cl.EnqueueNDRangeKernel(dev->queue, ocl.k_memset[di], 1, NULL, &global, NULL, 0, NULL, &evt);
 
-    /* Read back */
+    /* Read back only the output region (Item 6) */
     cl_event read_evt;
     cl.EnqueueReadBuffer(dev->queue, buf, CL_FALSE, offset, size, tape + offset, 1, &evt, &read_evt);
     cl.ReleaseEvent(evt);
@@ -400,10 +537,11 @@ int bfpp_opencl_blur(uint8_t *tape, int fb_offset, int width, int height, int ra
     cl_mem buf = ensure_buf(di, fb_offset + fb_size);
     if (!buf) return -1;
 
-    /* Upload FB region */
-    cl_event upload_evt;
-    cl.EnqueueWriteBuffer(dev->queue, buf, CL_FALSE, fb_offset, fb_size,
-                          tape + fb_offset, 0, NULL, &upload_evt);
+    /* Upload only dirty pages of the FB region (Item 4).
+     * Pages marked dirty by CPU writes; clean pages already on GPU. */
+    upload_dirty_region(di, fb_offset, fb_size, tape);
+    /* Barrier to ensure all page uploads complete before kernel */
+    cl.Finish(dev->queue);
 
     cl.SetKernelArg(ocl.k_blur[di], 0, sizeof(cl_mem), &buf);
     cl.SetKernelArg(ocl.k_blur[di], 1, sizeof(int), &fb_offset);
@@ -414,8 +552,7 @@ int bfpp_opencl_blur(uint8_t *tape, int fb_offset, int width, int height, int ra
     size_t global[2] = { (size_t)width, (size_t)height };
     cl_event kern_evt;
     cl.EnqueueNDRangeKernel(dev->queue, ocl.k_blur[di], 2, NULL, global, NULL,
-                            1, &upload_evt, &kern_evt);
-    cl.ReleaseEvent(upload_evt);
+                            0, NULL, &kern_evt);
 
     /* Read back */
     cl_event read_evt;
@@ -461,9 +598,9 @@ int bfpp_opencl_memcpy(uint8_t *tape, int dst, int src, int size) {
     cl_mem buf = ensure_buf(di, max_addr);
     if (!buf) return -1;
 
-    /* Upload source region */
-    cl_event up_evt;
-    cl.EnqueueWriteBuffer(dev->queue, buf, CL_FALSE, src, size, tape + src, 0, NULL, &up_evt);
+    /* Upload only dirty pages of source region (Item 4) */
+    upload_dirty_region(di, src, size, tape);
+    cl.Finish(dev->queue);
 
     cl.SetKernelArg(ocl.k_memcpy[di], 0, sizeof(cl_mem), &buf);
     cl.SetKernelArg(ocl.k_memcpy[di], 1, sizeof(int), &dst);
@@ -472,9 +609,9 @@ int bfpp_opencl_memcpy(uint8_t *tape, int dst, int src, int size) {
 
     size_t global = (size_t)size;
     cl_event kern_evt;
-    cl.EnqueueNDRangeKernel(dev->queue, ocl.k_memcpy[di], 1, NULL, &global, NULL, 1, &up_evt, &kern_evt);
-    cl.ReleaseEvent(up_evt);
+    cl.EnqueueNDRangeKernel(dev->queue, ocl.k_memcpy[di], 1, NULL, &global, NULL, 0, NULL, &kern_evt);
 
+    /* Read back only the destination region (Item 6) */
     cl_event read_evt;
     cl.EnqueueReadBuffer(dev->queue, buf, CL_FALSE, dst, size, tape + dst, 1, &kern_evt, &read_evt);
     cl.ReleaseEvent(kern_evt);
@@ -495,7 +632,10 @@ int bfpp_opencl_reduce(uint8_t *tape, int offset, int count, int op) {
     cl_mem buf = ensure_buf(di, offset + data_size);
     if (!buf) return -1;
 
-    /* Upload data */
+    /* Upload data region — reduce needs all elements present.
+     * Dirty-page tracking clears flags for the uploaded region. */
+    upload_dirty_region(di, offset, data_size, tape);
+    cl.Finish(dev->queue);
     cl_event up_evt;
     cl.EnqueueWriteBuffer(dev->queue, buf, CL_FALSE, offset, data_size, tape + offset, 0, NULL, &up_evt);
 
@@ -557,9 +697,9 @@ int bfpp_opencl_transform(uint8_t *tape, int matrices_offset, int count) {
     cl_mem buf = ensure_buf(di, matrices_offset + data_size);
     if (!buf) return -1;
 
-    cl_event up_evt;
-    cl.EnqueueWriteBuffer(dev->queue, buf, CL_FALSE, matrices_offset, data_size,
-                          tape + matrices_offset, 0, NULL, &up_evt);
+    /* Upload only dirty pages of matrix region (Item 4) */
+    upload_dirty_region(di, matrices_offset, data_size, tape);
+    cl.Finish(dev->queue);
 
     cl.SetKernelArg(ocl.k_transform[di], 0, sizeof(cl_mem), &buf);
     cl.SetKernelArg(ocl.k_transform[di], 1, sizeof(int), &matrices_offset);
@@ -567,9 +707,9 @@ int bfpp_opencl_transform(uint8_t *tape, int matrices_offset, int count) {
 
     size_t global = (size_t)count;
     cl_event kern_evt;
-    cl.EnqueueNDRangeKernel(dev->queue, ocl.k_transform[di], 1, NULL, &global, NULL, 1, &up_evt, &kern_evt);
-    cl.ReleaseEvent(up_evt);
+    cl.EnqueueNDRangeKernel(dev->queue, ocl.k_transform[di], 1, NULL, &global, NULL, 0, NULL, &kern_evt);
 
+    /* Read back only the matrix output region (Item 6) */
     cl_event read_evt;
     cl.EnqueueReadBuffer(dev->queue, buf, CL_FALSE, matrices_offset, data_size,
                           tape + matrices_offset, 1, &kern_evt, &read_evt);

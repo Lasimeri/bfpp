@@ -56,6 +56,20 @@ void     bfpp_atomic_store(uint8_t *tape, int addr, uint64_t value, int cell_wid
 uint64_t bfpp_atomic_add(uint8_t *tape, int addr, uint64_t value, int cell_width);
 int      bfpp_atomic_cas(uint8_t *tape, int addr, uint64_t expected, uint64_t desired, int cell_width);
 
+/* ── Auto-parallel loop dispatch ───────────────────────────────── */
+
+/* Function pointer type for parallel loop body. Parameters:
+   base   — tape index of the first iteration's base cell
+   stride — cells per iteration (each iteration works on [base + i*stride, base + i*stride + stride))
+   start  — first iteration index (inclusive)
+   end    — last iteration index (exclusive) */
+typedef void (*bfpp_par_body_fn)(int base, int stride, int start, int end);
+
+/* Distributes `total` iterations of `body` across available CPU cores.
+   Each thread processes a contiguous chunk of iterations. Falls back to
+   sequential execution when total < 2*ncpu (dispatch overhead > benefit). */
+void bfpp_parallel_for(int base_ptr, int total, int stride, bfpp_par_body_fn body);
+
 /* ── Thread-local state extern declarations ────────────────────── */
 
 /* These are _Thread_local in the generated C. The parallel runtime

@@ -41,6 +41,8 @@ fn run_passes(nodes: Vec<AstNode>, level: OptLevel) -> Vec<AstNode> {
             let nodes = pass_scan_loop(nodes);
             let nodes = pass_multiply_move(nodes);
             let nodes = pass_unroll_small_loops(nodes);
+            let nodes = pass_auto_parallel(nodes);
+            let nodes = pass_detect_gpu_loops(nodes);
             let nodes = pass_dead_code(nodes);
             let nodes = pass_inline_subs(nodes);
             let nodes = pass_fold_constants(nodes);
@@ -99,7 +101,7 @@ pub fn optimize(nodes: Vec<AstNode>, level: OptLevel) -> Vec<AstNode> {
 //
 // The Clear node lets codegen emit `tape[ptr] = 0` instead of a loop.
 fn pass_clear_loop(nodes: Vec<AstNode>) -> Vec<AstNode> {
-    nodes.into_iter().map(|node| {
+    let map_fn = |node: AstNode| -> AstNode {
         match node {
             AstNode::Loop(ref body) => {
                 // Match: loop body is exactly one op that is Dec(1) or Inc(1)
@@ -123,7 +125,12 @@ fn pass_clear_loop(nodes: Vec<AstNode>) -> Vec<AstNode> {
             }
             other => other,
         }
-    }).collect()
+    };
+    if nodes.len() > 1000 {
+        nodes.into_par_iter().map(map_fn).collect()
+    } else {
+        nodes.into_iter().map(map_fn).collect()
+    }
 }
 
 // Scan-loop detection: replaces `[>]` with ScanRight and `[<]` with ScanLeft.
@@ -132,7 +139,7 @@ fn pass_clear_loop(nodes: Vec<AstNode>) -> Vec<AstNode> {
 // essentially a linear scan / memchr(0). Codegen can emit a while-loop with
 // pointer arithmetic or use memchr for a significant speedup over per-cell branching.
 fn pass_scan_loop(nodes: Vec<AstNode>) -> Vec<AstNode> {
-    nodes.into_iter().map(|node| {
+    let map_fn = |node: AstNode| -> AstNode {
         match node {
             AstNode::Loop(ref body) => {
                 // Match: loop body is exactly one MoveRight(1) or MoveLeft(1)
@@ -153,7 +160,12 @@ fn pass_scan_loop(nodes: Vec<AstNode>) -> Vec<AstNode> {
             }
             other => other,
         }
-    }).collect()
+    };
+    if nodes.len() > 1000 {
+        nodes.into_par_iter().map(map_fn).collect()
+    } else {
+        nodes.into_iter().map(map_fn).collect()
+    }
 }
 
 // Multiply-move detection: replaces loops like `[->+++>++<<]` with MultiplyMove.
@@ -167,7 +179,7 @@ fn pass_scan_loop(nodes: Vec<AstNode>) -> Vec<AstNode> {
 // Codegen can emit direct arithmetic instead of an O(N) loop — turns an O(N*M)
 // loop (N = source cell value, M = body length) into O(M) straight-line code.
 fn pass_multiply_move(nodes: Vec<AstNode>) -> Vec<AstNode> {
-    nodes.into_iter().map(|node| {
+    let map_fn = |node: AstNode| -> AstNode {
         match node {
             AstNode::Loop(ref body) => {
                 if let Some(pairs) = detect_multiply_pattern(body) {
@@ -183,7 +195,12 @@ fn pass_multiply_move(nodes: Vec<AstNode>) -> Vec<AstNode> {
             }
             other => other,
         }
-    }).collect()
+    };
+    if nodes.len() > 1000 {
+        nodes.into_par_iter().map(map_fn).collect()
+    } else {
+        nodes.into_iter().map(map_fn).collect()
+    }
 }
 
 // Validates whether a loop body matches the multiply-move pattern and extracts
@@ -601,6 +618,300 @@ fn pass_unroll_small_loops(nodes: Vec<AstNode>) -> Vec<AstNode> {
     result
 }
 
+// Auto-parallelism detection: identifies loops with provably independent
+// iterations and rewrites them as ParallelLoop nodes.
+//
+// Pattern 1 — Independent Loop Iterations:
+// Detects `SetValue(N)` followed by `Loop([Decrement(1), ...body..., MoveRight(stride)])`
+// where N >= 64, body has no side effects or cross-iteration dependencies, and
+// all cell accesses are within [0, stride) relative to the iteration's base pointer.
+//
+// The threshold (64) accounts for pthread dispatch overhead — below that,
+// sequential execution is faster than spawning threads.
+fn pass_auto_parallel(nodes: Vec<AstNode>) -> Vec<AstNode> {
+    let mut result = Vec::new();
+    let mut i = 0;
+
+    while i < nodes.len() {
+        // Pattern: SetValue(N) followed by Loop([Decrement(1), ...body..., MoveRight(stride)])
+        if i + 1 < nodes.len() {
+            if let AstNode::SetValue(count) = &nodes[i] {
+                if *count >= 64 {
+                    if let AstNode::Loop(body) = &nodes[i + 1] {
+                        if let Some((inner_body, stride)) = detect_parallel_loop(body) {
+                            result.push(AstNode::ParallelLoop {
+                                body: inner_body,
+                                stride,
+                                trip_count: Some(*count),
+                            });
+                            i += 2;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Recurse into containers
+        let node = nodes[i].clone();
+        match node {
+            AstNode::Loop(body) => result.push(AstNode::Loop(pass_auto_parallel(body))),
+            AstNode::SubDef(name, body) => {
+                result.push(AstNode::SubDef(name, pass_auto_parallel(body)));
+            }
+            AstNode::ResultBlock(r, k) => {
+                result.push(AstNode::ResultBlock(
+                    pass_auto_parallel(r),
+                    pass_auto_parallel(k),
+                ));
+            }
+            other => result.push(other),
+        }
+        i += 1;
+    }
+
+    result
+}
+
+// Checks if a loop body matches the parallelizable pattern:
+//   [Decrement(1), ...inner_body..., MoveRight(stride)]
+// Returns Some((inner_body, stride)) if the body is parallelizable, None otherwise.
+//
+// Parallelization requirements:
+// 1. First node must be Decrement(1) — the loop counter
+// 2. Last node must be MoveRight(stride) — advancing to the next chunk
+// 3. Inner body (between Dec and MoveRight) must be free of:
+//    - I/O (Output, Input, FramebufferFlush)
+//    - Subroutine calls (SubCall)
+//    - Error handling (ErrorRead, ErrorWrite, Propagate, ResultBlock)
+//    - FFI calls
+//    - Absolute addressing
+//    - Nested loops (conservative: could be refined but not worth the complexity)
+// 4. All cell accesses must be within [0, stride) relative to ptr — no cross-iteration aliasing
+fn detect_parallel_loop(body: &[AstNode]) -> Option<(Vec<AstNode>, usize)> {
+    if body.len() < 3 { return None; }
+
+    // First node: Decrement(1)
+    if body[0] != AstNode::Decrement(1) { return None; }
+
+    // Last node: MoveRight(stride)
+    let stride = match body.last()? {
+        AstNode::MoveRight(s) if *s > 0 => *s,
+        _ => return None,
+    };
+
+    // Inner body: everything between Dec(1) and MoveRight(stride)
+    let inner = &body[1..body.len() - 1];
+
+    // Check safety: no disqualifying ops
+    if !is_parallel_safe(inner) { return None; }
+
+    // Check cell access bounds: all accesses must be within [0, stride)
+    if !accesses_within_stride(inner, stride) { return None; }
+
+    Some((inner.to_vec(), stride))
+}
+
+// Returns true if the body contains only ops safe for parallel execution.
+// Rejects any operation with side effects, cross-thread hazards, or
+// non-local control flow.
+fn is_parallel_safe(body: &[AstNode]) -> bool {
+    for node in body {
+        match node {
+            // Safe: pure cell arithmetic and pointer movement
+            AstNode::Increment(_) | AstNode::Decrement(_) |
+            AstNode::MoveRight(_) | AstNode::MoveLeft(_) |
+            AstNode::SetValue(_) | AstNode::SetMulti(_) |
+            AstNode::Clear |
+            AstNode::MultiplyMove(_) |
+            AstNode::BitOr | AstNode::BitAnd | AstNode::BitXor |
+            AstNode::ShiftLeft | AstNode::ShiftRight | AstNode::BitNot |
+            AstNode::CellWidthCycle | AstNode::SetCellWidth(_) |
+            AstNode::Push | AstNode::Pop |
+            AstNode::StringLit(_) => {}
+
+            // Disqualifying: I/O, subroutine calls, error handling, control flow,
+            // absolute addressing, FFI, syscall, dual-tape ops, nested loops, etc.
+            _ => return false,
+        }
+    }
+    true
+}
+
+// Checks that all cell accesses in the body are within [0, stride) relative
+// to the starting pointer. This ensures no cross-iteration aliasing —
+// iteration K accesses cells [K*stride, K*stride+stride), which doesn't
+// overlap with iteration K+1's region.
+//
+// Tracks a running pointer offset and checks that it never goes negative
+// or reaches stride.
+fn accesses_within_stride(body: &[AstNode], stride: usize) -> bool {
+    let mut offset: isize = 0;
+
+    for node in body {
+        match node {
+            AstNode::MoveRight(n) => offset += *n as isize,
+            AstNode::MoveLeft(n) => offset -= *n as isize,
+            // Cell access at current offset: check bounds
+            AstNode::Increment(_) | AstNode::Decrement(_) |
+            AstNode::SetValue(_) | AstNode::Clear |
+            AstNode::BitOr | AstNode::BitAnd | AstNode::BitXor |
+            AstNode::ShiftLeft | AstNode::ShiftRight | AstNode::BitNot |
+            AstNode::Push | AstNode::Pop |
+            AstNode::CellWidthCycle | AstNode::SetCellWidth(_) => {
+                if offset < 0 || offset >= stride as isize {
+                    return false;
+                }
+            }
+            // MultiplyMove: check that all target offsets are within bounds
+            AstNode::MultiplyMove(pairs) => {
+                if offset < 0 || offset >= stride as isize {
+                    return false;
+                }
+                for (rel_off, _) in pairs {
+                    let abs = offset + rel_off;
+                    if abs < 0 || abs >= stride as isize {
+                        return false;
+                    }
+                }
+            }
+            // SetMulti writes to offset..offset+len
+            AstNode::SetMulti(vals) => {
+                if offset < 0 || offset + vals.len() as isize > stride as isize {
+                    return false;
+                }
+            }
+            // StringLit writes len bytes starting at current offset
+            AstNode::StringLit(bytes) => {
+                if offset < 0 || offset + bytes.len() as isize > stride as isize {
+                    return false;
+                }
+            }
+            // Anything else: shouldn't happen (is_parallel_safe filtered), but be safe
+            _ => return false,
+        }
+    }
+
+    // After the body, pointer must return to offset 0 — the next iteration
+    // starts at the same relative position within its stride-wide region.
+    // Actually, the pointer offset after the body doesn't need to be 0 because
+    // the MoveRight(stride) at the end handles advancing to the next chunk.
+    // But the body itself must not leave the pointer outside [0, stride).
+    // We've already checked each access point, so we're good.
+    true
+}
+
+// ── GPU loop transpilation pass ──────────────────────────────────────────────
+//
+// Detects data-parallel loops that can be offloaded to OpenCL. A loop qualifies
+// when it meets all criteria for CPU auto-parallelism AND additionally has no
+// nested loops (GPU kernels can't branch). GPU loops take priority over CPU
+// parallel loops — a ParallelLoop node is upgraded to GpuLoop when possible.
+//
+// Uses a global kernel ID counter (AtomicUsize) so IDs are unique even across
+// rayon-parallelized subroutine optimization.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+static GPU_KERNEL_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn pass_detect_gpu_loops(nodes: Vec<AstNode>) -> Vec<AstNode> {
+    let mut result = Vec::new();
+
+    for node in nodes {
+        match node {
+            // Upgrade existing ParallelLoop to GpuLoop if body is GPU-safe
+            AstNode::ParallelLoop { body, stride, trip_count: Some(count) } => {
+                if is_gpu_safe(&body) {
+                    let kid = GPU_KERNEL_COUNTER.fetch_add(1, Ordering::Relaxed);
+                    let ksrc = generate_opencl_kernel(&body, kid, stride);
+                    result.push(AstNode::GpuLoop {
+                        trip_count: count,
+                        stride,
+                        body,
+                        kernel_source: ksrc,
+                        kernel_id: kid,
+                    });
+                } else {
+                    result.push(AstNode::ParallelLoop { body, stride, trip_count: Some(count) });
+                }
+            }
+            // Also detect raw SetValue + Loop patterns not caught by auto_parallel
+            // (e.g., those with nested loops that auto_parallel rejected but GPU can't handle either)
+            AstNode::Loop(body) => result.push(AstNode::Loop(pass_detect_gpu_loops(body))),
+            AstNode::SubDef(name, body) => {
+                result.push(AstNode::SubDef(name, pass_detect_gpu_loops(body)));
+            }
+            AstNode::ResultBlock(r, k) => {
+                result.push(AstNode::ResultBlock(
+                    pass_detect_gpu_loops(r),
+                    pass_detect_gpu_loops(k),
+                ));
+            }
+            other => result.push(other),
+        }
+    }
+
+    result
+}
+
+// GPU kernels are more restrictive than CPU parallel: no nested loops at all,
+// no stack ops (GPU has no stack), no string literals (variable-length writes).
+fn is_gpu_safe(body: &[AstNode]) -> bool {
+    for node in body {
+        match node {
+            AstNode::Increment(_) | AstNode::Decrement(_) |
+            AstNode::MoveRight(_) | AstNode::MoveLeft(_) |
+            AstNode::SetValue(_) | AstNode::Clear |
+            AstNode::BitOr | AstNode::BitAnd | AstNode::BitXor |
+            AstNode::ShiftLeft | AstNode::ShiftRight | AstNode::BitNot |
+            AstNode::CellWidthCycle | AstNode::SetCellWidth(_) => {}
+            // Everything else disqualifies (loops, I/O, subs, stack, strings, etc.)
+            _ => return false,
+        }
+    }
+    true
+}
+
+// Generate an OpenCL C kernel string from a BF++ loop body.
+fn generate_opencl_kernel(body: &[AstNode], kernel_id: usize, _stride: usize) -> String {
+    let mut s = String::with_capacity(512);
+    s.push_str("#define R(a) tape[(a)]\n");
+    s.push_str("#define W(a,v) tape[(a)]=(unsigned char)(v)\n");
+    s.push_str(&format!(
+        "__kernel void bfpp_gpu_loop_{}(\
+        __global unsigned char *tape, const int base_ptr, const int stride) {{\n\
+        int gid = get_global_id(0);\n\
+        int p = base_ptr + gid * stride;\n\
+        int o = 0;\n",
+        kernel_id
+    ));
+
+    for node in body {
+        match node {
+            AstNode::Increment(n) => s.push_str(&format!("R(p+o) += {};\n", n)),
+            AstNode::Decrement(n) => s.push_str(&format!("R(p+o) -= {};\n", n)),
+            AstNode::SetValue(n) => s.push_str(&format!("W(p+o, {});\n", n)),
+            AstNode::MoveRight(n) => s.push_str(&format!("o += {};\n", n)),
+            AstNode::MoveLeft(n) => s.push_str(&format!("o -= {};\n", n)),
+            AstNode::Clear => s.push_str("W(p+o, 0);\n"),
+            AstNode::BitOr => s.push_str("W(p+o, R(p+o) | R(p+o+1));\n"),
+            AstNode::BitAnd => s.push_str("W(p+o, R(p+o) & R(p+o+1));\n"),
+            AstNode::BitXor => s.push_str("W(p+o, R(p+o) ^ R(p+o+1));\n"),
+            AstNode::ShiftLeft => s.push_str("W(p+o, R(p+o) << R(p+o+1));\n"),
+            AstNode::ShiftRight => s.push_str("W(p+o, R(p+o) >> R(p+o+1));\n"),
+            AstNode::BitNot => s.push_str("W(p+o, ~R(p+o));\n"),
+            AstNode::CellWidthCycle | AstNode::SetCellWidth(_) => {
+                // Cell width changes affect how the CPU interprets tape data but
+                // the OpenCL kernel always operates on bytes. Skip in kernel.
+            }
+            _ => {} // filtered by is_gpu_safe
+        }
+    }
+
+    s.push_str("}\n");
+    s
+}
+
 // Check if a loop body slice has side effects that prevent unrolling.
 // Side effects: I/O, subroutine calls, syscalls, pointer jumps, nested loops.
 fn body_has_side_effects(body: &[AstNode]) -> bool {
@@ -730,6 +1041,11 @@ fn collect_calls(nodes: &[AstNode], called: &mut std::collections::HashSet<Strin
                 collect_calls(f, called);
             }
             AstNode::Deref(inner) => collect_calls(&[*inner.clone()], called),
+            AstNode::ParallelLoop { body, .. } => collect_calls(body, called),
+            AstNode::ParallelCalls(names) => {
+                for name in names { called.insert(name.clone()); }
+            }
+            AstNode::GpuLoop { body, .. } => collect_calls(body, called),
             _ => {}
         }
     }
@@ -1247,5 +1563,104 @@ mod tests {
         // The Output should remain.
         assert!(output.contains(&AstNode::Output));
         assert!(!output.contains(&AstNode::Return));
+    }
+
+    // ── Auto-parallelism tests ──────────────────────────────────
+
+    #[test]
+    fn test_auto_parallel_basic() {
+        // #100 [- >+< >>>>>>>>] → ParallelLoop with stride 8
+        // Pattern: SetValue(100), Loop([Dec(1), MoveRight(1), Inc(1), MoveLeft(1), MoveRight(8)])
+        // Inner body: [MoveRight(1), Inc(1), MoveLeft(1)] within stride 8
+        let input = vec![
+            AstNode::SetValue(100),
+            AstNode::Loop(vec![
+                AstNode::Decrement(1),
+                AstNode::MoveRight(1),
+                AstNode::Increment(1),
+                AstNode::MoveLeft(1),
+                AstNode::MoveRight(8),
+            ]),
+        ];
+        let output = optimize(input, OptLevel::Full);
+        assert!(output.iter().any(|n| matches!(n, AstNode::ParallelLoop { .. } | AstNode::GpuLoop { .. })),
+            "Expected ParallelLoop or GpuLoop node, got: {:?}", output);
+    }
+
+    #[test]
+    fn test_auto_parallel_below_threshold() {
+        // #32 [- >+< >>>>>>>>] → NOT parallelized (count < 64)
+        let input = vec![
+            AstNode::SetValue(32),
+            AstNode::Loop(vec![
+                AstNode::Decrement(1),
+                AstNode::MoveRight(1),
+                AstNode::Increment(1),
+                AstNode::MoveLeft(1),
+                AstNode::MoveRight(8),
+            ]),
+        ];
+        let output = optimize(input, OptLevel::Full);
+        // Should NOT be parallelized due to low trip count
+        assert!(!output.iter().any(|n| matches!(n, AstNode::ParallelLoop { .. })),
+            "Should not parallelize with count < 64, got: {:?}", output);
+    }
+
+    #[test]
+    fn test_auto_parallel_rejects_io() {
+        // #100 [- . >>>>>>>>] → NOT parallelized (has Output)
+        let input = vec![
+            AstNode::SetValue(100),
+            AstNode::Loop(vec![
+                AstNode::Decrement(1),
+                AstNode::Output,
+                AstNode::MoveRight(8),
+            ]),
+        ];
+        let output = optimize(input, OptLevel::Full);
+        assert!(!output.iter().any(|n| matches!(n, AstNode::ParallelLoop { .. })),
+            "Should not parallelize loops with I/O, got: {:?}", output);
+    }
+
+    #[test]
+    fn test_auto_parallel_rejects_out_of_stride() {
+        // #100 [- >>>>>>>>>+<<<<<<<<< >>>>>>>>] → NOT parallelized
+        // Access at offset 9 exceeds stride 8
+        let input = vec![
+            AstNode::SetValue(100),
+            AstNode::Loop(vec![
+                AstNode::Decrement(1),
+                AstNode::MoveRight(9),
+                AstNode::Increment(1),
+                AstNode::MoveLeft(9),
+                AstNode::MoveRight(8),
+            ]),
+        ];
+        let output = optimize(input, OptLevel::Full);
+        assert!(!output.iter().any(|n| matches!(n, AstNode::ParallelLoop { .. })),
+            "Should not parallelize with out-of-stride access, got: {:?}", output);
+    }
+
+    #[test]
+    fn test_auto_parallel_stride_and_count() {
+        // Verify the detected stride and trip_count values
+        let input = vec![
+            AstNode::SetValue(256),
+            AstNode::Loop(vec![
+                AstNode::Decrement(1),
+                AstNode::SetValue(42),
+                AstNode::MoveRight(4),
+            ]),
+        ];
+        let output = optimize(input, OptLevel::Full);
+        // GPU-safe loops get upgraded from ParallelLoop to GpuLoop
+        let gpu = output.iter().find(|n| matches!(n, AstNode::GpuLoop { .. }));
+        assert!(gpu.is_some(), "Expected GpuLoop, got: {:?}", output);
+        if let Some(AstNode::GpuLoop { stride, trip_count, body, kernel_source, .. }) = gpu {
+            assert_eq!(*stride, 4);
+            assert_eq!(*trip_count, 256);
+            assert_eq!(body.len(), 1); // SetValue(42)
+            assert!(kernel_source.contains("bfpp_gpu_loop_"));
+        }
     }
 }

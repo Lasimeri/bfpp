@@ -33,7 +33,6 @@
 #include "bfpp_rt_3d.h"
 #include "bfpp_fb_pipeline.h"
 
-#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
@@ -300,9 +299,35 @@ void bfpp_oracle_publish(void)
     if (!atomic_load(&oracle.initialized)) return;
 
     bfpp_scene_snapshot_t *slot = tb_write_slot(&oracle.buffer);
+    bfpp_scene_snapshot_t *stg  = &oracle.staging;
 
-    /* Copy staging into write slot */
-    memcpy(slot, &oracle.staging, sizeof(bfpp_scene_snapshot_t));
+    /* Clear dirty mask */
+    memset(slot->dirty_mask, 0, sizeof(slot->dirty_mask));
+
+    /* Delta-compressed object copy: only copy objects whose state changed
+       vs the previous contents of this write slot. Each object comparison
+       covers the full struct (model_mat, velocity, angular_velocity, color,
+       vao_id, vertex_count, draw_mode, active, confidence). */
+    int obj_count = stg->object_count > slot->object_count
+                  ? stg->object_count : slot->object_count;
+    for (int i = 0; i < obj_count; i++) {
+        if (memcmp(&stg->objects[i], &slot->objects[i],
+                   sizeof(bfpp_scene_object_t)) != 0) {
+            memcpy(&slot->objects[i], &stg->objects[i],
+                   sizeof(bfpp_scene_object_t));
+            slot->dirty_mask[i / 64] |= (1ULL << (i % 64));
+        }
+    }
+
+    /* Always copy metadata (small, not worth diffing) */
+    slot->object_count = stg->object_count;
+    memcpy(slot->view_mat, stg->view_mat, sizeof(stg->view_mat));
+    memcpy(slot->proj_mat, stg->proj_mat, sizeof(stg->proj_mat));
+    memcpy(slot->view_pos, stg->view_pos, sizeof(stg->view_pos));
+    memcpy(slot->light_pos, stg->light_pos, sizeof(stg->light_pos));
+    memcpy(slot->light_color, stg->light_color, sizeof(stg->light_color));
+    memcpy(slot->light_intensity, stg->light_intensity, sizeof(stg->light_intensity));
+    slot->num_lights = stg->num_lights;
 
     /* Stamp */
     slot->timestamp_ns = now_ns();

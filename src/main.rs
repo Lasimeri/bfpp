@@ -234,8 +234,11 @@ fn compile(cli: &Cli, gpu_ctx: &Option<gpu::GpuCompiler>) -> Result<(), ()> {
     }
 
     // --- Stage 8: C compilation ---
+    // Use /dev/shm (tmpfs) for temp files when available — RAM-backed, avoids
+    // disk I/O for intermediate .c and .o files. Falls back to /tmp.
     let pid = std::process::id();
-    let tmp_dir = PathBuf::from(format!("/tmp/bfpp_{}", pid));
+    let tmp_base = if std::path::Path::new("/dev/shm").is_dir() { "/dev/shm" } else { "/tmp" };
+    let tmp_dir = PathBuf::from(format!("{}/bfpp_{}", tmp_base, pid));
     let parallel = codegen_result.split.is_some();
 
     // Build the cc command. In parallel mode: link .o files + runtime .c files.
@@ -249,9 +252,19 @@ fn compile(cli: &Cli, gpu_ctx: &Option<gpu::GpuCompiler>) -> Result<(), ()> {
         tmp_c = tmp_dir.join("_unused.c");
 
         // Write shared header
-        std::fs::write(tmp_dir.join("bfpp_gen.h"), &split.header).map_err(|e| {
+        let header_path = tmp_dir.join("bfpp_gen.h");
+        std::fs::write(&header_path, &split.header).map_err(|e| {
             eprintln!("error: cannot write header: {}", e);
         })?;
+
+        // Precompile shared header → .gch for faster parallel compilation.
+        // GCC/clang automatically use bfpp_gen.h.gch when #include "bfpp_gen.h"
+        // is encountered, avoiding redundant header parsing in each TU.
+        let _ = Command::new(&cli.cc)
+            .args(["-x", "c-header", header_path.to_str().unwrap(),
+                   "-o", tmp_dir.join("bfpp_gen.h.gch").to_str().unwrap(),
+                   "-O2", "-Wall"])
+            .status();
 
         // Write sub .c files + main .c file
         let mut c_files: Vec<PathBuf> = Vec::new();
@@ -294,7 +307,7 @@ fn compile(cli: &Cli, gpu_ctx: &Option<gpu::GpuCompiler>) -> Result<(), ()> {
                     .args([
                         c_file.to_str().unwrap(),
                         "-c", "-o", obj.to_str().unwrap(),
-                        "-O2", "-Wall",
+                        "-O2", "-Wall", "-pipe", "-flto",
                         "-Wno-unused-variable", "-Wno-unused-function",
                         &inc, &rt_inc, "-msse4.1",
                     ])
@@ -324,14 +337,14 @@ fn compile(cli: &Cli, gpu_ctx: &Option<gpu::GpuCompiler>) -> Result<(), ()> {
         for obj in &obj_files {
             cc_cmd.arg(obj.to_str().unwrap());
         }
-        cc_cmd.args(["-o", bin_path.to_str().unwrap()]);
+        cc_cmd.args(["-o", bin_path.to_str().unwrap(), "-flto", "-s"]);
 
         eprintln!("bfpp: parallel compile ({} TUs on {} threads)",
                   split.subs.len() + 1,
                   split.subs.len() + 1);
     } else {
         // ── Single-file mode (existing behavior) ──
-        tmp_c = PathBuf::from(format!("/tmp/bfpp_{}.c", pid));
+        tmp_c = PathBuf::from(format!("{}/bfpp_{}.c", tmp_base, pid));
         std::fs::write(&tmp_c, &c_source).map_err(|e| {
             eprintln!("error: cannot write temp file: {}", e);
         })?;
@@ -340,7 +353,7 @@ fn compile(cli: &Cli, gpu_ctx: &Option<gpu::GpuCompiler>) -> Result<(), ()> {
         cc_cmd.args([
             tmp_c.to_str().unwrap(),
             "-o", bin_path.to_str().unwrap(),
-            "-O2", "-Wall",
+            "-O2", "-Wall", "-pipe", "-s",
             "-Wno-unused-variable", "-Wno-unused-function",
         ]);
     }
@@ -464,6 +477,25 @@ fn compile(cli: &Cli, gpu_ctx: &Option<gpu::GpuCompiler>) -> Result<(), ()> {
             if rt_dir.join("bfpp_rt_opencl.c").exists() {
                 cc_cmd.arg(format!("-I{}", rt_dir.display()));
                 cc_cmd.arg(rt_dir.join("bfpp_rt_opencl.c").to_str().unwrap());
+                break;
+            }
+        }
+    }
+
+    // Compressed I/O runtime (requires zlib)
+    if codegen_result.uses_compressed_io {
+        cc_cmd.arg("-lz");
+        let runtime_paths = [
+            PathBuf::from("runtime"),
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("runtime")))
+                .unwrap_or_default(),
+        ];
+        for rt_dir in &runtime_paths {
+            if rt_dir.join("bfpp_rt_compress.c").exists() {
+                cc_cmd.arg(format!("-I{}", rt_dir.display()));
+                cc_cmd.arg(rt_dir.join("bfpp_rt_compress.c").to_str().unwrap());
                 break;
             }
         }

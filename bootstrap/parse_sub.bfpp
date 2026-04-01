@@ -22,7 +22,7 @@
 ;   NOTE: buffer must be below tape[192] to avoid POOL string overlap
 ;         (POOL=3000000 truncates to 192 due to 1-byte cell addressing)
 
-!define POOL 3000000
+; POOL is defined by bfpp_self.bfpp before including this file
 
 ; ── Mangle single char → stdout ──
 ; Input: P+0 = char. Emits mangled version to stdout.
@@ -82,16 +82,16 @@
 ; but exits when '}' is encountered at top nesting level.
 ; Nested !#name{...} are handled by recursive !#psu calls.
 ;
-; Uses cell 3 as body-active flag.
-; After: ptr = 0, cells 0-3 cleaned up.
+; Uses cell 8 as body-active flag (safe from !#pn which uses 0-6).
+; After: ptr = 0, cells cleaned up.
 !#pbody{
-    ; cell 3 = 1 (body active)
-    >>> #1 <<<
+    ; cell 10 = 1 (body active) — cell 10 is outside !#.+'s workspace (0-8)
+    >>>>>>>>>> #1 <<<<<<<<<<
 
     ,                       ; read first body char
     [
         ?= #125 [           ; '}' at top level → end of body
-            >>> [-] <<<      ; clear body flag
+            >>>>>>>>>> [-] <<<<<<<<<< ; clear body flag (cell 10)
             [-]              ; clear char
         ]
 
@@ -107,28 +107,47 @@
             ?= #35 [ [-] !#pn
                 ; Check if pn returned '}'
                 ?= #125 [
-                    >>> [-] <<<  ; clear body flag
+                    >>>>>>>>>> [-] <<<<<<<<<< ; clear body flag (cell 10)
                     [-]          ; clear char
                 ]
+            ]
+            ; Cell width: %
+            ?= #37 [
+                [-] ,
+                ?= #49 [ #POOL @ "{int _w=1,i;for(i=1;i<cell_width[ptr];i++)cell_width[ptr+i]=1;cell_width[ptr]=_w;for(i=1;i<_w;i++){if(cell_width[ptr+i]!=1){cell_width[ptr]=1;break;}cell_width[ptr+i]=0;}}\n\0" #0 @ !#pr [-] ]
+                ?= #50 [ #POOL @ "{int _w=2,i;for(i=1;i<cell_width[ptr];i++)cell_width[ptr+i]=1;cell_width[ptr]=_w;for(i=1;i<_w;i++){if(cell_width[ptr+i]!=1){cell_width[ptr]=1;break;}cell_width[ptr+i]=0;}}\n\0" #0 @ !#pr [-] ]
+                ?= #52 [ #POOL @ "{int _w=4,i;for(i=1;i<cell_width[ptr];i++)cell_width[ptr+i]=1;cell_width[ptr]=_w;for(i=1;i<_w;i++){if(cell_width[ptr+i]!=1){cell_width[ptr]=1;break;}cell_width[ptr+i]=0;}}\n\0" #0 @ !#pr [-] ]
+                ?= #56 [ #POOL @ "{int _w=8,i;for(i=1;i<cell_width[ptr];i++)cell_width[ptr+i]=1;cell_width[ptr]=_w;for(i=1;i<_w;i++){if(cell_width[ptr+i]!=1){cell_width[ptr]=1;break;}cell_width[ptr+i]=0;}}\n\0" #0 @ !#pr [-] ]
+                [ #POOL @ "{int _o=cell_width[ptr],_n,i;for(i=1;i<_o;i++)cell_width[ptr+i]=1;switch(_o){case 1:_n=2;break;case 2:_n=4;break;case 4:_n=8;break;default:_n=1;}cell_width[ptr]=_n;for(i=1;i<_n;i++){if(cell_width[ptr+i]!=1){cell_width[ptr]=1;break;}cell_width[ptr+i]=0;}}\n\0" #0 @ !#pr [-] ]
             ]
             ; Subroutine def/call: !
             ?= #33 [ [-] !#psu ]
             ; String literal
             ?= #34 [ [-] !#ps ]
+            ; Conditional: ?
+            ?= #63 [ [-] !#pcond ]
+            ; Dereference: *
+            ?= #42 [ [-] !#pderef ]
+            ; Coalesce +, -, >, <
+            ?= #43 [ [-] !#co+ ]
+            ?= #45 [ [-] !#co- ]
+            ?= #62 [ [-] !#co> ]
+            ?= #60 [ [-] !#co< ]
             ; All other chars: classify and emit
             [ !#cl !#em ]
             ; P+0 is now 0 from handlers above; inner block exits
         ]
 
         ; Read next char if body still active (outside inner block)
-        >>> ?= #1 [
-            <<< ,            ; read next char
-            >>>
-        ] <<<
+        >>>>>>>>>> ?= #1 [
+            <<<<<<<<<< ,     ; read next char
+            >>>>>>>>>>
+        ] <<<<<<<<<<
     ]
 
-    ; Clean up
-    [-] > [-] > [-] > [-] < < <
+    ; Clean up cells 0-10
+    [-] > [-] > [-] > [-] > [-] > [-] > [-] > [-] > [-] > [-] > [-]
+    < < < < < < < < < <
     ^
 }
 

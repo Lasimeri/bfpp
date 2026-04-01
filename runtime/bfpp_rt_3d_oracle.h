@@ -57,6 +57,12 @@ typedef struct {
     float    light_intensity[4];
     int      num_lights;
 
+    /* Per-object dirty tracking: 256 objects, 1 bit each (4 x uint64).
+       Set by publish when an object's state changed vs the previous slot
+       contents. Consumer can use this to skip unchanged objects in shaders
+       or upload paths. Cleared at the start of each publish. */
+    uint64_t dirty_mask[4];
+
     uint64_t timestamp_ns;
     uint64_t frame_seq;
 } bfpp_scene_snapshot_t;

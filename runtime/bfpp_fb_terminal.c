@@ -40,6 +40,10 @@
 #include <immintrin.h>
 #endif
 
+#ifdef BFPP_ZLIB_COMPRESS
+#include <zlib.h>
+#endif
+
 /* ── Terminal cell ──────────────────────────────────────────── */
 
 typedef struct {
@@ -73,10 +77,26 @@ static struct {
     uint64_t bytes_this_second;
     uint64_t second_start_ns;
 
+    /* Color mode: 0=no color, 1=256-color, 2=true-color */
+    int color_mode;
+
     /* Terminal state */
     struct termios orig_termios;
     int raw_mode;
     int initialized;
+
+    /* Initial draw tracking for 256-color initial / true-color delta strategy */
+    int initial_draw_done;
+
+    /* Status bar change tracking */
+    char prev_status[256];
+
+#ifdef BFPP_ZLIB_COMPRESS
+    /* Zlib stream compression for terminal output */
+    z_stream zstrm;
+    int zlib_active;
+    uint8_t zbuf[65536];
+#endif
 
     /* Input */
     atomic_int quit_requested;
@@ -118,12 +138,100 @@ static void out_fmt(const char *fmt, ...)
     if (n > 0) out_raw(tmp, n);
 }
 
+/* Forward declaration for zlib compressed write (used by out_flush) */
+#ifdef BFPP_ZLIB_COMPRESS
+static ssize_t terminal_write_compressed(const void *buf, size_t len);
+#endif
+
 static void out_flush(void)
 {
     if (tctx.out_len > 0) {
-        write(STDOUT_FILENO, tctx.out_buf, tctx.out_len);
+#ifdef BFPP_ZLIB_COMPRESS
+        if (tctx.zlib_active)
+            terminal_write_compressed(tctx.out_buf, tctx.out_len);
+        else
+#endif
+            write(STDOUT_FILENO, tctx.out_buf, tctx.out_len);
         tctx.bytes_this_second += tctx.out_len;
         tctx.out_len = 0;
+    }
+}
+
+/* ── Zlib stream compression ────────────────────────────────── */
+
+#ifdef BFPP_ZLIB_COMPRESS
+/*
+ * Initialize zlib compression for terminal output.
+ * Only activates when SSH_CONNECTION is set (remote session) but
+ * SSH's own compression isn't handling it, or when BFPP_FORCE_COMPRESS
+ * is set. Skips activation if no SSH_CONNECTION (local terminal doesn't
+ * benefit from ANSI stream compression).
+ */
+static void terminal_init_compression(void)
+{
+    /* Only compress if this looks like a remote session */
+    if (!getenv("SSH_CONNECTION") && !getenv("BFPP_FORCE_COMPRESS"))
+        return;
+
+    memset(&tctx.zstrm, 0, sizeof(tctx.zstrm));
+    if (deflateInit(&tctx.zstrm, Z_DEFAULT_COMPRESSION) == Z_OK) {
+        tctx.zlib_active = 1;
+    }
+}
+
+static void terminal_cleanup_compression(void)
+{
+    if (tctx.zlib_active) {
+        deflateEnd(&tctx.zstrm);
+        tctx.zlib_active = 0;
+    }
+}
+
+/*
+ * Write data through zlib compression. Outputs Z_SYNC_FLUSH'd chunks
+ * so the terminal receives data promptly (no buffering delay).
+ */
+static ssize_t terminal_write_compressed(const void *buf, size_t len)
+{
+    tctx.zstrm.next_in = (Bytef *)buf;
+    tctx.zstrm.avail_in = (uInt)len;
+    do {
+        tctx.zstrm.next_out = tctx.zbuf;
+        tctx.zstrm.avail_out = sizeof(tctx.zbuf);
+        deflate(&tctx.zstrm, Z_SYNC_FLUSH);
+        size_t have = sizeof(tctx.zbuf) - tctx.zstrm.avail_out;
+        if (have > 0)
+            write(STDOUT_FILENO, tctx.zbuf, have);
+    } while (tctx.zstrm.avail_out == 0);
+    return (ssize_t)len;
+}
+#endif /* BFPP_ZLIB_COMPRESS */
+
+/* ── Color mode detection ───────────────────────────────────── */
+
+/*
+ * Convert 24-bit RGB to nearest 256-color index.
+ * Uses the 6x6x6 color cube (indices 16-231): 16 + (r/51)*36 + (g/51)*6 + (b/51)
+ */
+static int rgb_to_256(uint8_t r, uint8_t g, uint8_t b)
+{
+    return 16 + (r / 51) * 36 + (g / 51) * 6 + (b / 51);
+}
+
+/*
+ * Adaptive color mode selection based on output bandwidth.
+ * Downgrade to 256-color when throughput is low (e.g., SSH),
+ * saving ~40% bytes per cell escape sequence.
+ * Called once per second from adapt_framerate().
+ */
+static void detect_color_bandwidth(uint64_t actual_bps)
+{
+    if (actual_bps < 131072) {
+        /* < 128KB/s: use 256-color */
+        tctx.color_mode = 1;
+    } else {
+        /* Adequate bandwidth: use true-color */
+        tctx.color_mode = 2;
     }
 }
 
@@ -287,7 +395,12 @@ static void render_delta(void)
 
             /* Color change — skip if same as last emitted */
             if (b->r != last_r || b->g != last_g || b->b != last_b) {
-                out_fmt("\033[38;2;%d;%d;%dm", b->r, b->g, b->b);
+                if (tctx.color_mode == 2) {
+                    out_fmt("\033[38;2;%d;%d;%dm", b->r, b->g, b->b);
+                } else {
+                    int idx256 = rgb_to_256(b->r, b->g, b->b);
+                    out_fmt("\033[38;5;%dm", idx256);
+                }
                 last_r = b->r;
                 last_g = b->g;
                 last_b = b->b;
@@ -331,16 +444,23 @@ static void render_delta(void)
 
 static void render_status(void)
 {
-    int row = tctx.term_rows + 1;
-    out_fmt("\033[%d;1H\033[0m\033[7m", row); /* inverse video */
-
-    char status[128];
+    /* Build status string first, skip redraw if unchanged */
+    char status[256];
     int n = snprintf(status, sizeof(status),
-        " BF++ %dx%d -> %dx%d | %d fps | %lu KB/s ",
+        " BF++ %dx%d -> %dx%d | %d fps | %lu KB/s | %s ",
         tctx.fb_width, tctx.fb_height,
         tctx.term_cols, tctx.term_rows,
         tctx.target_fps,
-        (unsigned long)(tctx.bytes_this_second / 1024));
+        (unsigned long)(tctx.bytes_this_second / 1024),
+        tctx.color_mode == 2 ? "24bit" : "256c");
+
+    if (strcmp(status, tctx.prev_status) == 0)
+        return;  /* unchanged — skip redraw */
+    strncpy(tctx.prev_status, status, sizeof(tctx.prev_status) - 1);
+    tctx.prev_status[sizeof(tctx.prev_status) - 1] = '\0';
+
+    int row = tctx.term_rows + 1;
+    out_fmt("\033[%d;1H\033[0m\033[7m", row); /* inverse video */
 
     out_raw(status, n);
     /* Pad to full width */
@@ -359,6 +479,9 @@ static void adapt_framerate(void)
     /* Reset bandwidth counter every second */
     if (elapsed >= 1000000000ULL) {
         uint64_t actual_bps = tctx.bytes_this_second * 1000000000ULL / elapsed;
+
+        /* Adapt color mode based on measured bandwidth */
+        detect_color_bandwidth(actual_bps);
 
         /* Adjust target fps based on bandwidth utilization */
         if (actual_bps > tctx.bandwidth_budget * 9 / 10) {
@@ -443,9 +566,16 @@ void bfpp_fb_terminal_init(int width, int height, uint8_t *tape, int fb_offset)
     const char *bw = getenv("BFPP_TERMINAL_BW");
     tctx.bandwidth_budget = bw ? (uint64_t)atoi(bw) * 1024 : 256 * 1024;
     tctx.target_fps = 15; /* start conservative, adapt up */
+    tctx.color_mode = 2;  /* start with true-color, adapt down if bandwidth is low */
+    tctx.initial_draw_done = 0;
+    tctx.prev_status[0] = '\0';
     tctx.second_start_ns = now_ns();
 
     enter_raw_mode();
+
+#ifdef BFPP_ZLIB_COMPRESS
+    terminal_init_compression();
+#endif
 
     /* Alt screen + hide cursor + clear */
     out_raw("\033[?1049h\033[?25l\033[2J\033[H", 23);
@@ -485,6 +615,8 @@ void bfpp_fb_terminal_present(void)
         tctx.back = realloc(tctx.back, tctx.buf_size * sizeof(term_cell_t));
         memset(tctx.front, 0xFF, tctx.buf_size * sizeof(term_cell_t));
         out_raw("\033[2J", 4); /* clear on resize */
+        tctx.initial_draw_done = 0; /* force 256-color full redraw on resize */
+        tctx.prev_status[0] = '\0'; /* force status bar redraw */
     }
 
     /* Check for quit key */
@@ -493,8 +625,17 @@ void bfpp_fb_terminal_present(void)
     /* Downsample framebuffer → terminal grid */
     downsample();
 
-    /* Delta-encoded render */
-    render_delta();
+    /* Initial draw uses 256-color (40% smaller payload), subsequent deltas
+     * use the adaptive color mode (typically true-color for accuracy). */
+    if (!tctx.initial_draw_done) {
+        int saved_mode = tctx.color_mode;
+        tctx.color_mode = 1;  /* force 256-color for initial full draw */
+        render_delta();
+        tctx.color_mode = saved_mode;
+        tctx.initial_draw_done = 1;
+    } else {
+        render_delta();  /* adaptive color mode (true-color deltas) */
+    }
 
     /* Status bar */
     render_status();
@@ -518,6 +659,10 @@ void bfpp_fb_terminal_cleanup(void)
     out_flush();
 
     exit_raw_mode();
+
+#ifdef BFPP_ZLIB_COMPRESS
+    terminal_cleanup_compression();
+#endif
 
     free(tctx.front);
     free(tctx.back);

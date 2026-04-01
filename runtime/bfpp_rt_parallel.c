@@ -23,9 +23,11 @@
  * Link with: -lpthread
  */
 
+#define _GNU_SOURCE
 #include "bfpp_rt_parallel.h"
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>  /* sysconf(_SC_NPROCESSORS_ONLN) */
 
 /* ── Thread-local state ────────────────────────────────────────── */
 
@@ -170,6 +172,65 @@ int bfpp_atomic_cas(uint8_t *tape, int addr, uint64_t expected, uint64_t desired
             return atomic_compare_exchange_strong((_Atomic uint64_t *)&tape[addr], &exp, desired);
         }
         default: return 0;
+    }
+}
+
+/* ── Auto-parallel loop dispatch ───────────────────────────────── */
+
+/* Worker thread argument for bfpp_parallel_for. Each spawned thread gets
+   its own copy (malloc'd by the dispatcher, free'd by the worker). */
+typedef struct {
+    bfpp_par_body_fn fn;
+    int base, stride, start, end;
+} bfpp_par_arg_t;
+
+static void *_bfpp_par_worker(void *arg)
+{
+    bfpp_par_arg_t *a = (bfpp_par_arg_t *)arg;
+    a->fn(a->base, a->stride, a->start, a->end);
+    free(a);
+    return NULL;
+}
+
+/* Distributes `total` iterations across available CPU cores.
+   Strategy: divide into ncpu chunks, run ncpu-1 on new threads,
+   execute the last chunk on the calling thread (avoids the overhead
+   of creating+joining one thread for work that runs immediately). */
+void bfpp_parallel_for(int base_ptr, int total, int stride, bfpp_par_body_fn body)
+{
+    int ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu > 8) ncpu = 8;  /* cap: diminishing returns + stack/TLS overhead */
+    if (ncpu < 1) ncpu = 1;
+
+    /* Fall back to sequential for small workloads — thread dispatch
+       overhead exceeds the parallelism benefit below this threshold. */
+    if (total < ncpu * 2) {
+        body(base_ptr, stride, 0, total);
+        return;
+    }
+
+    int chunk = (total + ncpu - 1) / ncpu;
+    pthread_t threads[8];
+    int n_threads = 0;
+
+    for (int i = 0; i < ncpu && i * chunk < total; i++) {
+        int s = i * chunk;
+        int e = s + chunk;
+        if (e > total) e = total;
+
+        if (i == ncpu - 1 || (i + 1) * chunk >= total) {
+            /* Last chunk: run on the calling thread to avoid an
+               unnecessary spawn+join for the final batch. */
+            body(base_ptr, stride, s, e);
+        } else {
+            bfpp_par_arg_t *a = malloc(sizeof(*a));
+            *a = (bfpp_par_arg_t){ body, base_ptr, stride, s, e };
+            pthread_create(&threads[n_threads++], NULL, _bfpp_par_worker, a);
+        }
+    }
+
+    for (int i = 0; i < n_threads; i++) {
+        pthread_join(threads[i], NULL);
     }
 }
 

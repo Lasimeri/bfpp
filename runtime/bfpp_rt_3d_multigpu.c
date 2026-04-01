@@ -48,6 +48,10 @@
 #define BFPP_HAS_NUMA 0
 #endif
 
+/* ── Forward declarations ────────────────────────────────────── */
+static void init_prev_strips(int gpu_count, int fb_size);
+static void cleanup_prev_strips(void);
+
 /* ── Per-GPU context ─────────────────────────────────────────── */
 
 typedef struct {
@@ -656,6 +660,9 @@ int bfpp_mgpu_init(bfpp_multi_mode_t mode, int width, int height,
             fprintf(stderr, "bfpp_mgpu: thread %d create failed\n", i);
     }
 
+    /* Allocate previous-strip buffers for strip change detection */
+    init_prev_strips(mgpu.gpu_count, mgpu.fb_size);
+
     mgpu.active = 1;
     fprintf(stderr, "bfpp_mgpu: %d GPUs, mode=%d\n",
             mgpu.gpu_count, (int)mode);
@@ -701,6 +708,8 @@ void bfpp_mgpu_cleanup(void)
         free(afr_queue[i].pixels);
         afr_queue[i].pixels = NULL;
     }
+
+    cleanup_prev_strips();
 
     pthread_mutex_destroy(&mgpu.frame_mutex);
     pthread_cond_destroy(&mgpu.frame_start_cv);
@@ -796,6 +805,31 @@ void bfpp_mgpu_cmd_depth_test(int enable)
     cmd_push(c);
 }
 
+/* ── Strip change detection (skip unchanged SFR strips) ──────── */
+
+/* Previous frame's strip data per GPU — used to skip compositor memcpy
+ * when a strip is identical to the previous frame. */
+static uint8_t *prev_strips[BFPP_MAX_GPUS];
+static int       prev_strip_sizes[BFPP_MAX_GPUS];
+
+static void init_prev_strips(int gpu_count, int fb_size)
+{
+    for (int i = 0; i < gpu_count; i++) {
+        if (prev_strips[i]) { free(prev_strips[i]); prev_strips[i] = NULL; }
+        prev_strips[i] = (uint8_t *)calloc(1, (size_t)fb_size);
+        prev_strip_sizes[i] = fb_size;
+    }
+}
+
+static void cleanup_prev_strips(void)
+{
+    for (int i = 0; i < BFPP_MAX_GPUS; i++) {
+        free(prev_strips[i]);
+        prev_strips[i] = NULL;
+        prev_strip_sizes[i] = 0;
+    }
+}
+
 /* ── SFR rebalancing ─────────────────────────────────────────── */
 
 /* Adjust weights inversely proportional to frame time. Smoothed 75/25. */
@@ -858,16 +892,33 @@ static void bfpp_mgpu_sfr_present(void)
     pthread_mutex_unlock(&mgpu.frame_mutex);
 
     uint8_t *fb = mgpu.tape + mgpu.fb_offset;
+    int any_changed = 0;
     for (int g = 0; g < mgpu.gpu_count; g++) {
         bfpp_gpu_ctx_t *gpu = &mgpu.gpus[g];
         if (!gpu->readback_ready) continue;
+
+        int strip_h = gpu->strip_y1 - gpu->strip_y0;
+        int strip_size = mgpu.stride * strip_h;
+
+        /* Skip compositor memcpy if strip is identical to previous frame */
+        if (prev_strips[g] && strip_size <= prev_strip_sizes[g] &&
+            memcmp(gpu->readback_buf, prev_strips[g], (size_t)strip_size) == 0) {
+            gpu->readback_ready = 0;
+            continue;
+        }
+
+        /* Strip changed — composite and update previous */
         composite_flip(fb, gpu->readback_buf, gpu->strip_y0,
-                       gpu->strip_y1 - gpu->strip_y0,
-                       mgpu.stride, mgpu.height);
+                       strip_h, mgpu.stride, mgpu.height);
+        if (prev_strips[g] && strip_size <= prev_strip_sizes[g])
+            memcpy(prev_strips[g], gpu->readback_buf, (size_t)strip_size);
         gpu->readback_ready = 0;
+        any_changed = 1;
     }
 
-    bfpp_fb_request_flush();
+    /* Only flush if at least one strip changed */
+    if (any_changed)
+        bfpp_fb_request_flush();
 
     if (++mgpu.rebalance_counter >= 30) {
         sfr_rebalance();

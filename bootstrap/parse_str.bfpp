@@ -1,16 +1,16 @@
 ; parse_str.bfpp — String literal parser for bootstrap compiler
 ;
 ; Called from main loop when double-quote (34) is detected.
-; Reads chars from stdin until closing double-quote, emits C code that
-; writes the string bytes to tape and advances ptr.
+; Reads chars from stdin until closing double-quote, emits C code.
 ;
 ; Emits:
-;   { static const uint8_t _s[] = {b0,b1,...,0};
-;     memcpy(&tape[ptr], _s, sizeof(_s)-1);
-;     ptr = (ptr + sizeof(_s)-1) & TAPE_MASK; }
+;   {static const uint8_t _s[]={b0,b1,...,0};
+;    memcpy(&tape[ptr],_s,sizeof(_s)-1);
+;    ptr=(ptr+sizeof(_s)-1)&TAPE_MASK;}
 ;
-; Escape handling: \n → 10, \0 → 0, \\ → 92, backslash-quote → 34
-; All other chars taken literally.
+; Escape handling: \n → 10, \0 → 0, \\ → 92, \" → 34
+;
+; Cell layout: 0=char, 9=count (safe from !#.+ which uses 0-8)
 
 !define POOL 3000000
 
@@ -18,58 +18,51 @@
     ; Emit opening
     #POOL @ "{static const uint8_t _s[]={" #0 @ !#pr
 
-    ; Track byte count at cell 2
-    > > [-] < < ; P+2 = 0 (count)
+    ; cell 9 = 0 (byte count)
+    >>>>>>>>> [-] <<<<<<<<<
 
-    ; Read chars until closing quote
-    ,                      ; read first string char
+    ; Read first string char
+    ,
     [
-        ?= #34 [ [-] ]    ; quote (34) → end of string, clear char
+        ?= #34 [ [-] ]    ; quote (34) → clear char → exit loop
 
         ; Check for backslash escape
-        ?= #92 [           ; '\' (92)
-            [-]            ; clear backslash
-            ,              ; read escape char
-            ?= #110 [ [-] #10 ]  ; 'n' → newline (10)
-            ?= #48  [ [-] #0  ]  ; '0' → null (0)
-            ?= #92  [ ]          ; '\' → keep as 92
-            ?= #34  [ ]          ; quote → keep as 34
-            ; P+0 = resolved byte value
+        ?= #92 [
+            [-] ,
+            ?= #110 [ [-] #10 ]
+            ?= #48  [ [-] ]
+            ?= #92  [ ]
+            ?= #34  [ ]
         ]
 
-        ; If P+0 still has a value, it's a string byte to emit
+        ; If P+0 still has a value, emit it
         [
-            ; Emit the byte value as decimal, followed by comma
-            ; Save the byte
-            $
-            ; Print comma separator if not first byte
-            >> [                   ; if count > 0
-                #POOL @ ",\0" #0 @ !#pr
-            ] <<
+            $              ; save byte
+            ; Comma separator if not first byte
+            >>>>>>>>> [    ; if count > 0 (cell 9)
+                <<<<<<<<< #POOL @ ",\0" #0 @ !#pr
+                >>>>>>>>>
+            ] <<<<<<<<<
             ; Print byte value
-            ~                      ; restore byte
-            ; Use io.bfpp's print_int
-            !#.+
+            ~              ; restore byte
+            !#.+           ; print as decimal (clobbers cells 0-8, NOT cell 9)
             [-]
-            ; Increment count
-            >> + <<
+            ; Increment count (cell 9 — safe from !#.+)
+            >>>>>>>>> + <<<<<<<<<
         ]
 
-        ; If char was closing quote (cleared to 0), the [..] above didn't execute.
-        ; Read next char only if we're still inside the string.
-        >> [                       ; if count was incremented (we printed a byte)
-            << ,                   ; read next char
-            >>
-        ] <<
-        ; If count wasn't incremented AND char is 0, we hit closing quote → exit
+        ; Read next char only if we emitted a byte (count > 0 means we're inside string)
+        >>>>>>>>> [        ; if count > 0
+            <<<<<<<<< ,    ; read next char
+            >>>>>>>>>
+        ] <<<<<<<<<
     ]
 
-    ; Emit closing: ,0}; memcpy(...); ptr advance;
-    ; But we need the count to emit sizeof.
-    ; SIMPLER: emit with sizeof(_s)-1 which C handles automatically.
+    ; Emit closing
     #POOL @ ",0};memcpy(&tape[ptr],_s,sizeof(_s)-1);ptr=(ptr+sizeof(_s)-1)&TAPE_MASK;}\n\0" #0 @ !#pr
 
     ; Clean up
-    [-] > [-] > [-] < <
+    [-] > [-] > [-] > [-] > [-] > [-] > [-] > [-] > [-] > [-]
+    < < < < < < < < <
     ^
 }

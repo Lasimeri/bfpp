@@ -17,6 +17,33 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+/// Read an include file, transparently decompressing `.zst` if the compressed
+/// variant exists on disk. When `path.zst` is found, it takes priority over
+/// the uncompressed `path`. Requires the `compressed-includes` feature (zstd).
+/// Without the feature, only plain-text files are read.
+fn read_include_file(path: &Path) -> Result<String, String> {
+    #[cfg(feature = "compressed-includes")]
+    {
+        let mut zst_path = path.as_os_str().to_os_string();
+        zst_path.push(".zst");
+        let zst_path = PathBuf::from(zst_path);
+        if zst_path.exists() {
+            use std::io::Read as _;
+            let file = std::fs::File::open(&zst_path)
+                .map_err(|e| format!("Cannot open {}: {}", zst_path.display(), e))?;
+            let mut decoder = zstd::Decoder::new(file)
+                .map_err(|e| format!("zstd decode error for {}: {}", zst_path.display(), e))?;
+            let mut content = String::new();
+            decoder.read_to_string(&mut content)
+                .map_err(|e| format!("zstd read error for {}: {}", zst_path.display(), e))?;
+            return Ok(content);
+        }
+    }
+    // Fall back to plain text
+    std::fs::read_to_string(path)
+        .map_err(|e| format!("Cannot read {}: {}", path.display(), e))
+}
+
 // Guard against runaway include chains (mutual recursion through many files)
 const MAX_INCLUDE_DEPTH: usize = 64;
 
@@ -134,9 +161,9 @@ fn expand(
                         continue;
                     }
 
-                    let included_source = std::fs::read_to_string(&resolved)
-                        .map_err(|e| PreprocessError {
-                            message: format!("Cannot read '{}': {}", resolved.display(), e),
+                    let included_source = read_include_file(&resolved)
+                        .map_err(|msg| PreprocessError {
+                            message: msg,
                             file: source_path.to_path_buf(),
                             line: line_num + 1,
                         })?;
@@ -210,22 +237,40 @@ fn expand_defines(line: &str, defines: &HashMap<String, String>) -> String {
     result
 }
 
+/// Check whether a candidate include path exists — either as a plain file
+/// or (when `compressed-includes` is enabled) as a `.zst` compressed file.
+fn include_candidate_exists(candidate: &Path) -> bool {
+    if candidate.exists() {
+        return true;
+    }
+    #[cfg(feature = "compressed-includes")]
+    {
+        let mut zst = candidate.as_os_str().to_os_string();
+        zst.push(".zst");
+        if PathBuf::from(zst).exists() {
+            return true;
+        }
+    }
+    false
+}
+
 // Resolve an include filename to an actual filesystem path.
-// Tries four locations in priority order, returning the first that exists.
+// Tries four locations in priority order, returning the first that exists
+// (plain or `.zst` compressed when the feature is enabled).
 // This order mirrors how C compilers resolve #include "..." — local first, then
 // search paths, then system-level locations.
 fn resolve_include(filename: &str, source_dir: &Path, include_paths: &[PathBuf]) -> Option<PathBuf> {
     // 1. Relative to the file that contains the !include directive.
     //    Highest priority — local includes should shadow stdlib versions.
     let candidate = source_dir.join(filename);
-    if candidate.exists() {
+    if include_candidate_exists(&candidate) {
         return Some(candidate);
     }
 
     // 2. User-specified --include paths, checked in the order provided.
     for path in include_paths {
         let candidate = path.join(filename);
-        if candidate.exists() {
+        if include_candidate_exists(&candidate) {
             return Some(candidate);
         }
     }
@@ -233,7 +278,7 @@ fn resolve_include(filename: &str, source_dir: &Path, include_paths: &[PathBuf])
     // 3. ./stdlib/ relative to CWD — supports running from the project root
     //    without needing explicit --include flags.
     let candidate = PathBuf::from("stdlib").join(filename);
-    if candidate.exists() {
+    if include_candidate_exists(&candidate) {
         return Some(candidate);
     }
 
@@ -242,7 +287,7 @@ fn resolve_include(filename: &str, source_dir: &Path, include_paths: &[PathBuf])
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe.parent() {
             let candidate = exe_dir.join("stdlib").join(filename);
-            if candidate.exists() {
+            if include_candidate_exists(&candidate) {
                 return Some(candidate);
             }
         }

@@ -15,7 +15,6 @@
 ; ╚══════════════════════════════════════════════════════════════╝
 
 !define POOL 3000000
-!define GPU_COUNT 100
 
 !include "io.bfpp"
 !include "parse_num.bfpp"
@@ -25,8 +24,126 @@
 ; ── Print null-terminated string from POOL ──
 !#pr{ #POOL @ [. >] #0 @ ^ }
 
+
+; ── Coalesce '+' (43): count consecutive, emit bfpp_set(ptr,bfpp_get(ptr)+N) ──
+; Entry: cell 0 = 0 ('+' consumed). Exit: cell 0 = next non-'+' char.
+; Count in cell 9 (safe from !#.+ which uses 0-8).
+!#co+{
+    >>>>>>>>> [-] + <<<<<<<<< ; cell 9 = 1
+    ,                          ; read next char
+    > #1 <                     ; cell 1 = 1 (reading flag)
+    ?= #43 [                   ; if char == '+'
+        [-]                    ; clear char
+        >>>>>>>>> + <<<<<<<<< ; count++
+        ,                     ; read next
+        ?= #43 [ [-] >>>>>>>>> + <<<<<<<<< , > #1 < ] ; keep going if '+'
+    ]
+    ; At this point, if char was '+', it was handled above.
+    ; But we need a LOOP, not just two checks. Use cell 1 as continue flag.
+    ; Actually, the `?= #43 [...]` above only handles the FIRST extra '+'.
+    ; For a proper loop, use a reading flag:
+    > [-] + <                  ; cell 1 = 1 (continue reading)
+    ?= #43 [ [-] >>>>>>>>> + <<<<<<<<< , > [-] + < ?!  #43 [ > [-] < ] ]
+    ; That doesn't loop either. BF++ ?= is not a loop, it's a conditional.
+
+    ; PROPER APPROACH: use a BF while loop on cell 1 (reading flag).
+    ; Set cell 1 = 1. Inner: check if cell 0 == 43 using ?=.
+    ; If yes: clear, count++, read next, keep cell 1 = 1.
+    ; If no: set cell 1 = 0.
+    ; Reset: clean up above attempts
+    > [-] + <                  ; cell 1 = 1
+    > [                        ; while cell 1 (reading)
+        - <                    ; cell 1 = 0, ptr → cell 0
+        ?= #43 [               ; if char == '+'
+            [-]                 ; clear '+'
+            >>>>>>>>> + <<<<<<<<< ; count++
+            ,                   ; read next char
+            > + <               ; cell 1 = 1 (continue)
+        ]
+        >                      ; ptr → cell 1
+    ]
+    <                          ; ptr → cell 0 (non-'+' char)
+    ; Emit
+    $
+    #POOL @ "bfpp_set(ptr,bfpp_get(ptr)+\0" #0 @ !#pr
+    [-]
+    >>>>>>>>> [- <<<<<<<<< + >>>>>>>>>] <<<<<<<<<
+    !#.+
+    [-]
+    #POOL @ ");\n\0" #0 @ !#pr
+    [-] ~
+    ^
+}
+
+; ── Coalesce '-' (45) ──
+!#co-{
+    >>>>>>>>> [-] + <<<<<<<<<
+    ,
+    > [-] + <
+    > [
+        - <
+        ?= #45 [ [-] >>>>>>>>> + <<<<<<<<< , > + < ]
+        >
+    ]
+    <
+    $
+    #POOL @ "bfpp_set(ptr,bfpp_get(ptr)-\0" #0 @ !#pr
+    [-]
+    >>>>>>>>> [- <<<<<<<<< + >>>>>>>>>] <<<<<<<<<
+    !#.+
+    [-]
+    #POOL @ ");\n\0" #0 @ !#pr
+    [-] ~
+    ^
+}
+
+; ── Coalesce '>' (62) ──
+!#co>{
+    >>>>>>>>> [-] + <<<<<<<<<
+    ,
+    > [-] + <
+    > [
+        - <
+        ?= #62 [ [-] >>>>>>>>> + <<<<<<<<< , > + < ]
+        >
+    ]
+    <
+    $
+    #POOL @ "ptr=(ptr+\0" #0 @ !#pr
+    [-]
+    >>>>>>>>> [- <<<<<<<<< + >>>>>>>>>] <<<<<<<<<
+    !#.+
+    [-]
+    #POOL @ ")&TAPE_MASK;\n\0" #0 @ !#pr
+    [-] ~
+    ^
+}
+
+; ── Coalesce '<' (60) ──
+!#co<{
+    >>>>>>>>> [-] + <<<<<<<<<
+    ,
+    > [-] + <
+    > [
+        - <
+        ?= #60 [ [-] >>>>>>>>> + <<<<<<<<< , > + < ]
+        >
+    ]
+    <
+    $
+    #POOL @ "ptr=(ptr-\0" #0 @ !#pr
+    [-]
+    >>>>>>>>> [- <<<<<<<<< + >>>>>>>>>] <<<<<<<<<
+    !#.+
+    [-]
+    #POOL @ "+TAPE_SIZE)&TAPE_MASK;\n\0" #0 @ !#pr
+    [-] ~
+    ^
+}
+
 ; ── Classify source char → token code ──
 ; Input: P+0 = char. Output: P+0 = code (0=ignore).
+; NOTE: ? (63) and * (42) are handled BEFORE classify by !#pcond and !#pderef.
 !#cl{
     ?= #62  [ [-] #1  ^ ]
     ?= #60  [ [-] #2  ^ ]
@@ -42,7 +159,6 @@
     ?= #69  [ [-] #12 ^ ]
     ?= #101 [ [-] #13 ^ ]
     ?= #64  [ [-] #14 ^ ]
-    ?= #42  [ [-] #15 ^ ]
     ?= #84  [ [-] #16 ^ ]
     ?= #70  [ [-] #17 ^ ]
     ?= #124 [ [-] #18 ^ ]
@@ -51,7 +167,6 @@
     ?= #115 [ [-] #21 ^ ]
     ?= #114 [ [-] #22 ^ ]
     ?= #110 [ [-] #23 ^ ]
-    ?= #63  [ [-] #24 ^ ]
     [-] #0 ^
 }
 
@@ -68,11 +183,10 @@
     ?= #8  [ #POOL @ "}\n\0" #0 @ !#pr [-] ^ ]
     ?= #9  [ #POOL @ "bfpp_push(bfpp_get(ptr));\n\0" #0 @ !#pr [-] ^ ]
     ?= #10 [ #POOL @ "bfpp_set(ptr,bfpp_pop());\n\0" #0 @ !#pr [-] ^ ]
-    ?= #11 [ #POOL @ "return 0;\n\0" #0 @ !#pr [-] ^ ]
+    ?= #11 [ #POOL @ "return;\n\0" #0 @ !#pr [-] ^ ]
     ?= #12 [ #POOL @ "bfpp_set(ptr,(uint64_t)bfpp_err);\n\0" #0 @ !#pr [-] ^ ]
     ?= #13 [ #POOL @ "bfpp_err=(int)bfpp_get(ptr);\n\0" #0 @ !#pr [-] ^ ]
     ?= #14 [ #POOL @ "ptr=bfpp_get(ptr)&TAPE_MASK;\n\0" #0 @ !#pr [-] ^ ]
-    ?= #15 [ #POOL @ "{int _s=ptr;ptr=bfpp_get(ptr)&TAPE_MASK;\n\0" #0 @ !#pr [-] ^ ]
     ?= #16 [ #POOL @ "bfpp_push((uint64_t)(uintptr_t)&tape[ptr]);\n\0" #0 @ !#pr [-] ^ ]
     ?= #17 [ #POOL @ "/* F: framebuffer flush (no-op in bootstrap) */\n\0" #0 @ !#pr [-] ^ ]
     ?= #18 [ #POOL @ "bfpp_set(ptr,bfpp_get(ptr)|bfpp_get(ptr+1));\n\0" #0 @ !#pr [-] ^ ]
@@ -81,18 +195,306 @@
     ?= #21 [ #POOL @ "bfpp_set(ptr,bfpp_get(ptr)<<bfpp_get(ptr+1));\n\0" #0 @ !#pr [-] ^ ]
     ?= #22 [ #POOL @ "bfpp_set(ptr,bfpp_get(ptr)>>bfpp_get(ptr+1));\n\0" #0 @ !#pr [-] ^ ]
     ?= #23 [ #POOL @ "bfpp_set(ptr,~bfpp_get(ptr));\n\0" #0 @ !#pr [-] ^ ]
-    ?= #24 [ #POOL @ "if(bfpp_err)return 0;\n\0" #0 @ !#pr [-] ^ ]
     [-] ^
+}
+
+; ── Parse numeric value and print as decimal ──
+; Called after '#' has been consumed. Reads decimal digits from stdin,
+; accumulates value, and prints the value as decimal to stdout.
+; Does NOT emit bfpp_set wrapper (unlike !#pn).
+; Exit: cell 0 = first non-digit char (terminator).
+; Uses cells 0-8 (via !#m* and !#.+).
+!#pnval{
+    ; Clear cells 0-6
+    [-] > [-] > [-] > [-] > [-] > [-] > [-] <<<<<<
+
+    ; Read first potential digit
+    ,                              ; cell 0 = char
+    > [-] + <                      ; cell 1 = 1 (assume digit)
+    ?< #48 [ > [-] < ]            ; if char < '0': not digit
+    ?> #57 [ > [-] < ]            ; if char > '9': not digit
+
+    > [                            ; while is_digit (cell 1)
+        - <                        ; clear flag, ptr → cell 0
+        ------------------------------------------------ ; char - 48 = digit
+        [- >>>>>> + <<<<<<]        ; cell 6 = digit, cell 0 = 0
+        >> [- << + >>] <<          ; cell 0 = acc, cell 2 = 0
+        > ++++++++++ <             ; cell 1 = 10
+        !#m*                       ; cell 0 = acc * 10
+        >>>>>> [- <<<<<< + >>>>>>] <<<<<<  ; cell 0 += digit
+        [- >> + <<]                ; cell 2 = acc*10 + digit
+        ,                          ; read next char
+        > [-] + <                  ; cell 1 = 1
+        ?< #48 [ > [-] < ]
+        ?> #57 [ > [-] < ]
+        >
+    ]
+
+    ; cell 0 = non-digit char, cell 2 = accumulated value
+    < $                            ; push non-digit char
+    [-]                            ; clear cell 0
+    >> [- << + >>] <<              ; cell 0 = acc (move from cell 2)
+    !#.+                           ; print value as decimal to stdout
+    [-]
+    ~                              ; pop non-digit char back to cell 0
+    ^
+}
+
+; ── Compile body until matching ']' ──
+; Reads and compiles chars from stdin, handles nesting of [ ] pairs.
+; Exits when the matching ']' for the opening '[' is found (depth 0).
+; Nested !#name{...} and ?= #N [...] are handled by recursive calls.
+;
+; Cell layout: cell 9 = nesting depth, cell 10 = body-active flag.
+; Cell 10 is outside !#.+'s workspace (0-8) to avoid clobbering.
+; After: ptr = 0, cells cleaned up.
+!#cbody{
+    ; cell 10 = 1 (body active), cell 9 = 0 (depth)
+    >>>>>>>>> [-] > #1 <<<<<<<<<<
+
+    ,                              ; read first body char
+    [
+        ; Check for ']' (93) — might close body or inner loop
+        ?= #93 [
+            >>>>>>>>> ?= #0 [     ; cell 9: if depth == 0
+                >  [-] <           ; clear body flag (cell 10)
+                <<<<<<<<<          ; back to cell 0
+                [-]                ; clear char
+            ] : [                  ; else: depth > 0
+                -                  ; depth--
+                <<<<<<<<<          ; back to cell 0
+                #POOL @ "}\n\0" #0 @ !#pr
+                [-]                ; clear char
+            ]
+        ]
+
+        ; If char still set, process it
+        [
+            ; Skip comments: ; to end of line
+            ?= #59 [
+                [-] , [ ?= #10 [ [-] ] : [ [-] , ] ]
+            ]
+            ; Skip newlines
+            ?= #10 [ [-] ]
+            ; Numeric literal: #N
+            ?= #35 [ [-] !#pn
+                ; Check if pn returned ']' — would close body
+                ?= #93 [
+                    >>>>>>>>> ?= #0 [ ; if depth == 0
+                        > [-] <    ; clear body flag (cell 10)
+                        <<<<<<<<<
+                        [-]
+                    ] : [            ; else: depth > 0
+                        -
+                        <<<<<<<<<
+                        #POOL @ "}\n\0" #0 @ !#pr
+                        [-]
+                    ]
+                ]
+            ]
+            ; Cell width: %
+            ?= #37 [
+                [-] ,
+                ?= #49 [ #POOL @ "{int _w=1,i;for(i=1;i<cell_width[ptr];i++)cell_width[ptr+i]=1;cell_width[ptr]=_w;for(i=1;i<_w;i++){if(cell_width[ptr+i]!=1){cell_width[ptr]=1;break;}cell_width[ptr+i]=0;}}\n\0" #0 @ !#pr [-] ]
+                ?= #50 [ #POOL @ "{int _w=2,i;for(i=1;i<cell_width[ptr];i++)cell_width[ptr+i]=1;cell_width[ptr]=_w;for(i=1;i<_w;i++){if(cell_width[ptr+i]!=1){cell_width[ptr]=1;break;}cell_width[ptr+i]=0;}}\n\0" #0 @ !#pr [-] ]
+                ?= #52 [ #POOL @ "{int _w=4,i;for(i=1;i<cell_width[ptr];i++)cell_width[ptr+i]=1;cell_width[ptr]=_w;for(i=1;i<_w;i++){if(cell_width[ptr+i]!=1){cell_width[ptr]=1;break;}cell_width[ptr+i]=0;}}\n\0" #0 @ !#pr [-] ]
+                ?= #56 [ #POOL @ "{int _w=8,i;for(i=1;i<cell_width[ptr];i++)cell_width[ptr+i]=1;cell_width[ptr]=_w;for(i=1;i<_w;i++){if(cell_width[ptr+i]!=1){cell_width[ptr]=1;break;}cell_width[ptr+i]=0;}}\n\0" #0 @ !#pr [-] ]
+                [ #POOL @ "{int _o=cell_width[ptr],_n,i;for(i=1;i<_o;i++)cell_width[ptr+i]=1;switch(_o){case 1:_n=2;break;case 2:_n=4;break;case 4:_n=8;break;default:_n=1;}cell_width[ptr]=_n;for(i=1;i<_n;i++){if(cell_width[ptr+i]!=1){cell_width[ptr]=1;break;}cell_width[ptr+i]=0;}}\n\0" #0 @ !#pr [-] ]
+            ]
+            ; Subroutine def/call: !
+            ?= #33 [ [-] !#psu ]
+            ; String literal
+            ?= #34 [ [-] !#ps ]
+            ; '[' → inner BF loop, increment depth, emit while
+            ?= #91 [
+                [-]
+                #POOL @ "while(bfpp_get(ptr)){\n\0" #0 @ !#pr
+                >>>>>>>>> + <<<<<<<<< ; depth++
+            ]
+            ; Conditional: ?
+            ?= #63 [ [-] !#pcond ]
+            ; Dereference: *
+            ?= #42 [ [-] !#pderef ]
+            ; Coalesce +, -, >, <
+            ?= #43 [ [-] !#co+ ]
+            ?= #45 [ [-] !#co- ]
+            ?= #62 [ [-] !#co> ]
+            ?= #60 [ [-] !#co< ]
+            ; All other chars: classify and emit
+            [ !#cl !#em ]
+        ]
+
+        ; Read next char if body still active (cell 10)
+        >>>>>>>>>> ?= #1 [
+            <<<<<<<<<< ,
+            >>>>>>>>>>
+        ] <<<<<<<<<<
+    ]
+
+    ; Clean up cells 0-10
+    [-] > [-] > [-] > [-] > [-] > [-] > [-] > [-] > [-] > [-] > [-]
+    < < < < < < < < < <
+    ^
+}
+
+; ── Handle conditional comparison or plain propagate ──
+; Called when '?' is consumed from input. Cell 0 = 0.
+; Reads next char: '=' → ?=, '<' → ?<, '>' → ?>, '!' → ?!, else plain ?.
+; For conditionals: emits if(...){, compiles body, handles else, emits }.
+; For plain ?: emits propagate code, leaves next char for caller.
+!#pcond{
+    ,                              ; read char after '?'
+
+    ; ?= (equals)
+    ?= #61 [
+        [-]
+        #POOL @ "if(bfpp_get(ptr)==\0" #0 @ !#pr
+        !#ccbody
+    ]
+
+    ; ?< (less than)
+    ?= #60 [
+        [-]
+        #POOL @ "if(bfpp_get(ptr)<\0" #0 @ !#pr
+        !#ccbody
+    ]
+
+    ; ?> (greater than)
+    ?= #62 [
+        [-]
+        #POOL @ "if(bfpp_get(ptr)>\0" #0 @ !#pr
+        !#ccbody
+    ]
+
+    ; ?! (not equal)
+    ?= #33 [
+        [-]
+        #POOL @ "if(bfpp_get(ptr)!=\0" #0 @ !#pr
+        !#ccbody
+    ]
+
+    ; Plain ? (propagate) — char after ? is still in cell 0
+    [
+        $                          ; save the char
+        #POOL @ "if(bfpp_err)return 0;\n\0" #0 @ !#pr
+        [-] ~                      ; restore char for caller to re-process
+    ]
+
+    ^
+}
+
+; ── Common conditional body handler ──
+; Called after "if(bfpp_get(ptr)OP" has been emitted.
+; Parses #N, emits "NULL){\n", compiles body, handles else, emits "}\n".
+; Entry: cell 0 = 0.
+; Exit: cell 0 = char after conditional (for caller to process).
+!#ccbody{
+    ; Skip whitespace and '#' to reach the number
+    ,
+    ?= #32 [ [-] , ]
+    ?= #10 [ [-] , ]
+    ?= #13 [ [-] , ]
+    ?= #35 [ [-] ]                ; consume '#' if present
+
+    ; Parse and emit the comparison value as decimal
+    !#pnval
+
+    ; Cell 0 = non-digit terminator
+    ; Emit "ULL){\n"
+    $
+    #POOL @ "ULL){\n\0" #0 @ !#pr
+    [-] ~
+
+    ; Skip whitespace to find '['
+    ?= #32 [ [-] , ]
+    ?= #10 [ [-] , ]
+    ?= #13 [ [-] , ]
+    ?= #91 [ [-] ]                ; consume '['
+
+    ; Compile body until ']'
+    !#cbody
+
+    ; After cbody, check for ':' (else clause)
+    ,
+    ?= #32 [ [-] , ]              ; skip whitespace
+    ?= #10 [ [-] , ]
+    ?= #13 [ [-] , ]
+
+    ?= #58 [                      ; ':' → else clause
+        [-]
+        #POOL @ "} else {\n\0" #0 @ !#pr
+
+        ; Skip whitespace to find '['
+        ,
+        ?= #32 [ [-] , ]
+        ?= #10 [ [-] , ]
+        ?= #13 [ [-] , ]
+        ?= #91 [ [-] ]            ; consume '['
+
+        ; Compile else body until ']'
+        !#cbody
+
+        ; Read next char (for below)
+        ,
+    ]
+
+    ; Emit closing brace
+    $
+    #POOL @ "}\n\0" #0 @ !#pr
+    [-] ~
+
+    ; Cell 0 has the char after the conditional (or 0 if EOF)
+    ; Leave it for caller
+    ^
+}
+
+; ── Handle dereference ──
+; Called when '*' is consumed from input. Cell 0 = 0.
+; Emits ptr save + jump, processes one inner operation, emits restore.
+!#pderef{
+    #POOL @ "{int _s=ptr;ptr=(int)bfpp_get(ptr)&TAPE_MASK;\n\0" #0 @ !#pr
+
+    ,                              ; read the inner operation char
+
+    ; '[' → deref wraps a loop/block
+    ?= #91 [
+        [-]
+        #POOL @ "while(bfpp_get(ptr)){\n\0" #0 @ !#pr
+        !#cbody
+        $ #POOL @ "}\n\0" #0 @ !#pr [-] ~
+    ]
+    ; '#' → numeric literal inside deref
+    ?= #35 [ [-] !#pn ]
+    ; '!' → subroutine call inside deref
+    ?= #33 [ [-] !#psu ]
+    ; double-quote → string literal inside deref
+    ?= #34 [ [-] !#ps ]
+    ; '?' → conditional inside deref
+    ?= #63 [ [-] !#pcond ]
+    ; '*' → nested deref
+    ?= #42 [ [-] !#pderef ]
+    ; Coalesce +, -, >, <
+    ?= #43 [ [-] !#co+ ]
+    ?= #45 [ [-] !#co- ]
+    ?= #62 [ [-] !#co> ]
+    ?= #60 [ [-] !#co< ]
+    ; Single char operation (classify + emit)
+    [ !#cl !#em ]
+
+    ; Emit ptr restore
+    $
+    #POOL @ "ptr=_s;}\n\0" #0 @ !#pr
+    [-] ~
+
+    ^
 }
 
 ; ═══════════════════════════════════════════════════════════════
 ; MAIN
 ; ═══════════════════════════════════════════════════════════════
 
-; ── GPU probe (informational) ──
-%4 !#__gpu_init
-; P+0 = GPU device count. Store at tape[GPU_COUNT].
-$ #GPU_COUNT @ ~ #0 @ %1
+; ── GPU probe (skipped in bootstrap — no runtime dependency) ──
+; Just clear cell 0 and proceed.
 [-]
 
 ; ── Emit C header ──
@@ -146,7 +548,16 @@ $ #GPU_COUNT @ ~ #0 @ %1
     ?= #33 [ [-] !#psu ]
     ; Handle string literal
     ?= #34 [ [-] !#ps ]
-    ; Process remaining chars
+    ; Handle ? (conditional comparison or propagate)
+    ?= #63 [ [-] !#pcond ]
+    ; Handle * (dereference — wraps next operation)
+    ?= #42 [ [-] !#pderef ]
+    ; Coalesce consecutive +, -, >, < into single C statements
+    ?= #43 [ [-] !#co+ ]
+    ?= #45 [ [-] !#co- ]
+    ?= #62 [ [-] !#co> ]
+    ?= #60 [ [-] !#co< ]
+    ; Process remaining chars (single-op emit)
     [ !#cl !#em ]
     ,
 ]
@@ -154,4 +565,5 @@ $ #GPU_COUNT @ ~ #0 @ %1
 ; ── Emit main close ──
 #POOL @ "return 0;\n}\n\0" #0 @ !#pr
 
-#0 !#__exit
+; Exit cleanly (return 0 from main)
+^

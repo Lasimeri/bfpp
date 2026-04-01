@@ -12,7 +12,9 @@ categories = ["compilers", "command-line-utilities"]
 clap = { version = "4", features = ["derive"] }
 rayon = "1"
 opencl3 = { version = "0.9", optional = true }
+zstd = { version = "0.13", optional = true }
 
 [features]
 default = []
 gpu = ["opencl3"]
+compressed-includes = ["zstd"]

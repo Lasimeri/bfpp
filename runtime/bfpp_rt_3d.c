@@ -164,7 +164,9 @@ static void init_pbo(int w, int h);
 static void cleanup_pbo(void);
 
 static void init_pbo(int w, int h) {
-    int size = w * h * 3;  /* RGB24 */
+    /* Use RGBA (4 bytes/pixel) for PBO readback — GPU-native alignment is
+     * faster than RGB on most drivers.  We strip alpha during tape copy. */
+    int size = w * h * 4;  /* RGBA32 */
     glGenBuffers(2, g3d.pbo);
     for (int i = 0; i < 2; i++) {
         glBindBuffer(GL_PIXEL_PACK_BUFFER, g3d.pbo[i]);
@@ -1085,22 +1087,26 @@ void bfpp_gl_present(uint8_t *tape, int ptr)
     int w = g3d.width;
     int h = g3d.height;
     int stride = w * 3;
-    int fb_size = w * h * 3;
 
     if (!g3d.pbo_initialized) {
         /* Fallback: synchronous readback */
         glBindFramebuffer(GL_READ_FRAMEBUFFER, g3d.fbo);
         glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, fb);
     } else {
-        /* Async PBO double-buffered readback:
+        /* Async PBO double-buffered readback (RGBA path):
+         * GPU reads RGBA (native alignment, faster on most drivers).
+         * We strip alpha during the copy to tape, saving 25% on tape write.
+         *
          * Frame N: initiate async read into pbo[current]
-         * Frame N: map pbo[previous] (already complete), copy to tape
+         * Frame N: map pbo[previous] (already complete), RGBA→RGB to tape
          * Net effect: 1 frame of readback latency, but no GPU sync stall */
 
-        /* Step 1: Initiate async readback of current frame into pbo[current] */
+        int pbo_size = w * h * 4;  /* RGBA */
+
+        /* Step 1: Initiate async RGBA readback of current frame into pbo[current] */
         glBindBuffer(GL_PIXEL_PACK_BUFFER, g3d.pbo[g3d.pbo_index]);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, g3d.fbo);
-        glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, 0);
+        glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, 0);
 
         /* Fence the current PBO readback so we know when it's safe to map */
         g3d.pbo_fence[g3d.pbo_index] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
@@ -1115,9 +1121,47 @@ void bfpp_gl_present(uint8_t *tape, int ptr)
                 g3d.pbo_fence[g3d.pbo_index ^ 1] = NULL;
             }
             glBindBuffer(GL_PIXEL_PACK_BUFFER, g3d.pbo[g3d.pbo_index ^ 1]);
-            void *data = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, fb_size, GL_MAP_READ_BIT);
+            void *data = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0,
+                                          pbo_size, GL_MAP_READ_BIT);
             if (data) {
-                memcpy(fb, data, (size_t)fb_size);
+                /* Strip alpha: RGBA PBO → RGB24 tape.
+                 * 4 bytes in, 3 bytes out per pixel. */
+                const uint8_t *src = (const uint8_t *)data;
+                uint8_t *dst = fb;
+#ifdef __AVX2__
+                /* Process 8 RGBA pixels (32 bytes) → 8 RGB pixels (24 bytes)
+                 * per iteration using shuffle + store. */
+                int total_pixels = w * h;
+                int px = 0;
+                /* AVX2 shuffle mask: extract R,G,B from consecutive RGBA quads.
+                 * Each 128-bit lane shuffles 4 RGBA pixels → 12 RGB bytes. */
+                for (; px + 8 <= total_pixels; px += 8) {
+                    /* Scalar — AVX2 RGBA→RGB shuffle is non-trivial across
+                     * lane boundaries. Use simple unrolled scalar for now. */
+                    dst[0]  = src[0];  dst[1]  = src[1];  dst[2]  = src[2];
+                    dst[3]  = src[4];  dst[4]  = src[5];  dst[5]  = src[6];
+                    dst[6]  = src[8];  dst[7]  = src[9];  dst[8]  = src[10];
+                    dst[9]  = src[12]; dst[10] = src[13]; dst[11] = src[14];
+                    dst[12] = src[16]; dst[13] = src[17]; dst[14] = src[18];
+                    dst[15] = src[20]; dst[16] = src[21]; dst[17] = src[22];
+                    dst[18] = src[24]; dst[19] = src[25]; dst[20] = src[26];
+                    dst[21] = src[28]; dst[22] = src[29]; dst[23] = src[30];
+                    src += 32; dst += 24;
+                }
+                for (; px < total_pixels; px++) {
+                    dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2];
+                    src += 4; dst += 3;
+                }
+#else
+                for (int y = 0; y < h; y++) {
+                    for (int x = 0; x < w; x++) {
+                        dst[0] = src[0];
+                        dst[1] = src[1];
+                        dst[2] = src[2];
+                        src += 4; dst += 3;
+                    }
+                }
+#endif
                 glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
             }
         } else {
@@ -1221,11 +1265,12 @@ static void setup_shadow_fbo(int index)
 
     int size = g3d.shadow_map_size;
 
-    /* Depth texture */
+    /* Depth texture — 16-bit depth is sufficient for shadow maps at 1024x1024
+     * and halves VRAM usage + bandwidth for each shadow pass. */
     glGenTextures(1, &g3d.shadow_depth[index]);
     glBindTexture(GL_TEXTURE_2D, g3d.shadow_depth[index]);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24,
-                 size, size, 0, GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT16,
+                 size, size, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, NULL);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
