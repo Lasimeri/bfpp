@@ -1235,19 +1235,20 @@ fn emit_intrinsic(out: &mut String, name: &str, ctx: &mut GenCtx) {
         // These operate on raw integers in tape cells, NOT fixed-point.
         // Essential for offset calculations, index math, and self-hosting.
         "__mul" => {
-            // Input: tape[ptr]=a, tape[ptr+1]=b. Output: tape[ptr]=a*b
+            // Input: tape[ptr]=a, tape[ptr+4]=b. Output: tape[ptr]=a*b
+            // Uses ptr+4 stride (compatible with %4 / 32-bit cell mode)
             indent(out, ctx.indent);
-            out.push_str("bfpp_set(ptr, bfpp_get(ptr) * bfpp_get(ptr+1));\n");
+            out.push_str("bfpp_set(ptr, bfpp_get(ptr) * bfpp_get(ptr+4));\n");
         }
         "__div" => {
-            // Input: tape[ptr]=a, tape[ptr+1]=b. Output: tape[ptr]=a/b, tape[ptr+1]=a%b
+            // Input: tape[ptr]=a, tape[ptr+4]=b. Output: tape[ptr]=a/b, tape[ptr+4]=a%b
             indent(out, ctx.indent);
-            out.push_str("{ uint64_t _a = bfpp_get(ptr), _b = bfpp_get(ptr+1); if (_b) { bfpp_set(ptr, _a / _b); bfpp_set(ptr+1, _a % _b); } else { bfpp_err = BFPP_ERR_INVALID_ARG; } }\n");
+            out.push_str("{ uint64_t _a = bfpp_get(ptr), _b = bfpp_get(ptr+4); if (_b) { bfpp_set(ptr, _a / _b); bfpp_set(ptr+4, _a % _b); } else { bfpp_err = BFPP_ERR_INVALID_ARG; } }\n");
         }
         "__mod" => {
-            // Input: tape[ptr]=a, tape[ptr+1]=b. Output: tape[ptr]=a%b
+            // Input: tape[ptr]=a, tape[ptr+4]=b. Output: tape[ptr]=a%b
             indent(out, ctx.indent);
-            out.push_str("{ uint64_t _b = bfpp_get(ptr+1); if (_b) { bfpp_set(ptr, bfpp_get(ptr) % _b); } else { bfpp_err = BFPP_ERR_INVALID_ARG; } }\n");
+            out.push_str("{ uint64_t _b = bfpp_get(ptr+4); if (_b) { bfpp_set(ptr, bfpp_get(ptr) % _b); } else { bfpp_err = BFPP_ERR_INVALID_ARG; } }\n");
         }
 
         // ── String operations ────────────────────────────────────
