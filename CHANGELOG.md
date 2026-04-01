@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.5.0] - 2026-04-01
+
+### Added
+- **OpenCL GPU compute offloading**: 12 `__gpu_*` intrinsics (`__gpu_init`, `__gpu_count`, `__gpu_memset`, `__gpu_memcpy`, `__gpu_sort`, `__gpu_reduce`, `__gpu_transform`, `__gpu_rasterize`, `__gpu_blur`, `__gpu_poll`, `__gpu_wait`, `__gpu_dispatch`) via `runtime/bfpp_rt_opencl.{c,h}`. Programs can offload parallel computation to GPU without touching OpenCL directly
+- **GPU compiler acceleration** (`src/gpu.rs`): optional `--features gpu` enables OpenCL-accelerated lexing (parallel character classification) and optimizer pattern detection. Falls back to CPU for sources under 10KB or when OpenCL is unavailable. Requires `opencl3` crate (optional dependency)
+- **Parallel CC compilation**: translation unit splitting generates per-subroutine `.c` files, compiled in parallel via threaded `cc -c` invocations. Significant speedup for programs with many subroutines
+- **Parallel codegen emission**: subroutine bodies emitted concurrently using `rayon` `par_iter`
+- **Parallel analyzer**: passes 2 and 4 run concurrently via `rayon::join`
+- **Strip-parallel software rasterizer**: 8-thread horizontal strip decomposition with per-thread brace depth tracking for the software rendering fallback
+- **Per-triangle atomic rasterizer**: CAS-based z-buffer with threshold-based mode selection (switches between strip-parallel and per-triangle based on triangle count)
+- **AVX2 SIMD acceleration**: dirty region detection, row flip, 8-pixel edge functions, and terminal downsampling all use AVX2 intrinsics on x86_64
+- **Terminal framebuffer backend** (`runtime/bfpp_fb_terminal.{c,h}`): true-color ANSI rendering with delta encoding, adaptive frame rate targeting 256KB/s SSH connections. Auto-detected when no display server is available. Override with `BFPP_TERMINAL_FB=1` or set bandwidth via `BFPP_TERMINAL_BW=N` (KB/s)
+- **Self-hosting bootstrap compiler** (`bootstrap/bfpp_self.bfpp` + `parse_num.bfpp` + `parse_str.bfpp` + `parse_sub.bfpp`): a BF++ compiler written in BF++ itself, demonstrating the language's self-hosting capability. Parses a subset of BF++ and emits C output
+- **`-mavx2 -mfma`** CC flags automatically added on x86_64 targets
+
+### Changed
+- `rayon` added as a dependency (parallel codegen, optimizer, analyzer)
+- `opencl3` added as an optional dependency (`[features] gpu = ["opencl3"]`)
+- Cargo.toml version bumped to 0.5.0
+
+### Tests
+- 114 unit tests + 23 integration tests, all passing
+- Zero clippy warnings
+
 ## [0.4.0] - 2026-03-31
 
 ### Added

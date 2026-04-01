@@ -1,0 +1,85 @@
+; ╔══════════════════════════════════════════════╗
+; ║  BF++ Test: Indirect Call + Cell Width      ║
+; ║  __call, %4, #N numeric literals            ║
+; ╚══════════════════════════════════════════════╝
+;
+; __call dispatches to subroutine by index (0-based into sub_table).
+; Subroutines must be defined with !#name{} before __call is used.
+; Tests indirect dispatch, sequential calls, and %4 cell width mode.
+
+; ── Define subroutines ──
+!#print_A{ #65 . ^ }    ; prints 'A'
+!#print_B{ #66 . ^ }    ; prints 'B'
+!#print_C{ #67 . ^ }    ; prints 'C'
+!#print_D{ #68 . ^ }    ; prints 'D'
+!#print_E{ #69 . ^ }    ; prints 'E'
+
+; ── Test 1: Sequential dispatch (forward order) ──
+; sub_table order: print_A=0, print_B=1, print_C=2, print_D=3, print_E=4
+%4
+#0 !#__call [-]
+#1 !#__call [-]
+#2 !#__call [-]
+#3 !#__call [-]
+#4 !#__call [-]
+%1 #10 . [-]           ; newline → "ABCDE"
+
+; ── Test 2: Reverse order dispatch ──
+%4
+#4 !#__call [-]
+#3 !#__call [-]
+#2 !#__call [-]
+#1 !#__call [-]
+#0 !#__call [-]
+%1 #10 . [-]           ; newline → "EDCBA"
+
+; ── Test 3: Repeated dispatch (same subroutine) ──
+%4
+#0 !#__call [-]
+#0 !#__call [-]
+#0 !#__call [-]
+%1 #10 . [-]           ; newline → "AAA"
+
+; ── Test 4: Arbitrary pattern ──
+%4
+#2 !#__call [-]        ; C
+#0 !#__call [-]        ; A
+#1 !#__call [-]        ; B
+%1 #10 . [-]           ; newline → "CAB"
+
+; ── Test 5: Cell width %4 with #N numeric literals ──
+; Verify %4 cells store 32-bit values correctly
+%4
+#300                    ; store 300 (> 255, proves 32-bit)
+; Read it back: divide by 100 to check
+>>>> #100 <<<<
+!#__div
+; P+0 = 3, + 48 = '3'
+++++++++++++++++++++++++++++++++++++++++++++++++  ; +48
+.
+[-] >>>> [-] <<<<
+%1 #10 . [-]           ; newline → "3"
+
+; ── Test 6: %4 arithmetic with large values ──
+; 256 * 2 = 512. Divide by 512 to get 1. Proves >255 values work.
+%4
+#256 >>>> #2 <<<<
+!#__mul
+; P+0 = 512. Now div by 512 to verify.
+>>>> #512 <<<<
+!#__div
+; P+0 = 1, + 48 = '1'
+++++++++++++++++++++++++++++++++++++++++++++++++  ; +48
+.
+[-] >>>> [-] <<<<
+
+; ── Summary ──
+; Expected output:
+; ABCDE
+; EDCBA
+; AAA
+; CAB
+; 3
+; 1
+
+%1 #0 !#__exit

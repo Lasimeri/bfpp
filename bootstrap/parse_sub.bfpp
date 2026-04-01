@@ -18,7 +18,9 @@
 ;   cell 2     = is_def flag (in !#psu)
 ;   cell 3     = body-active flag (in !#pbody)
 ;   cell 10-13 = buffer address pointer (4-byte, for name storage/reading)
-;   tape[500..563] = name buffer (max 64 chars, null-terminated)
+;   tape[16..79]  = name buffer (max 64 chars, null-terminated)
+;   NOTE: buffer must be below tape[192] to avoid POOL string overlap
+;         (POOL=3000000 truncates to 192 due to 1-byte cell addressing)
 
 !define POOL 3000000
 
@@ -51,7 +53,7 @@
 !#emn{
     ; Set up address pointer at cell 10 = 500 (4-byte)
     >>>>>>>>>>              ; ptr = 10
-    %4 #500                 ; cell_width[10] = 4, tape[10..13] = 500
+    %4 #16                  ; cell_width[10] = 4, tape[10..13] = 16
     *$                      ; push tape[500] (first name char)
     <<<<<<<<<<              ; ptr = 0
     %1 ~                    ; pop char to cell 0 (1-byte)
@@ -117,7 +119,7 @@
             [ !#cl !#em ]
 
             ; Read next char if body still active
-            >>> [
+            >>> ?= #1 [
                 <<< ,        ; read next char
                 >>>
             ] <<<
@@ -203,8 +205,11 @@
         <<<<<<<<<<                  ; ptr = 0
 
         ; Emit C code based on def flag (cell 2)
+        ; All subroutine calls below expect ptr = 0, so navigate
+        ; to cell 2, check flag, navigate back before calling.
         >> ?= #1 [                  ; if cell 2 == 1 (definition)
             [-]                     ; clear def flag
+            <<                      ; ptr = 0
 
             ; Emit: void bfpp_sub_
             #POOL @ "void bfpp_sub_\0" #0 @ !#pr
@@ -219,7 +224,9 @@
             ; Emit: }\n
             #POOL @ "}\n\0" #0 @ !#pr
 
+            >>                      ; back to cell 2 for ] alignment
         ] : [                       ; else: cell 2 == 0 (call)
+            <<                      ; ptr = 0
 
             ; Emit: bfpp_sub_
             #POOL @ "bfpp_sub_\0" #0 @ !#pr
@@ -227,6 +234,8 @@
             !#emn
             ; Emit: ();\n
             #POOL @ "();\n\0" #0 @ !#pr
+
+            >>                      ; back to cell 2 for ] alignment
         ]
         <<                          ; ptr = 0
 

@@ -1,6 +1,6 @@
 # BF++
 
-A Brainfuck superset transpiler that compiles to C, adding syscalls, subroutines, error handling, bitwise ops, stack operations, FFI, numeric literals, preprocessor macros (`!define`/`!undef`), if/else syntax (`?{...}:{...}`), compiler intrinsics (terminal, TUI, process, I/O, SDL input, textures), self-hosting intrinsics (arithmetic, strings, hash maps, indirect calls), optional SDL2 framebuffer graphics, 3D rendering (OpenGL 3.3 + software rasterizer fallback), and multi-GPU support (EGL multi-context SFR/AFR/AUTO). Written in Rust. Produces self-contained, single-file C programs with an embedded runtime. Includes external C runtime libraries for double-buffered TUI rendering, 3D rendering, and multi-GPU coordination.
+A Brainfuck superset transpiler that compiles to C, adding syscalls, subroutines, error handling, bitwise ops, stack operations, FFI, numeric literals, preprocessor macros (`!define`/`!undef`), if/else syntax (`?{...}:{...}`), compiler intrinsics (terminal, TUI, process, I/O, SDL input, textures), self-hosting intrinsics (arithmetic, strings, hash maps, indirect calls), OpenCL GPU compute offloading (12 `__gpu_*` intrinsics), optional GPU-accelerated compilation (`--features gpu`), optional SDL2 framebuffer graphics, 3D rendering (OpenGL 3.3 + software rasterizer fallback), multi-GPU support (EGL multi-context SFR/AFR/AUTO), AVX2 SIMD acceleration, terminal framebuffer backend (headless/SSH rendering), and a self-hosting bootstrap compiler. Written in Rust with parallel compilation (rayon). Produces self-contained, single-file C programs with an embedded runtime. Includes external C runtime libraries for double-buffered TUI rendering, 3D rendering, multi-GPU coordination, OpenCL compute, and terminal framebuffer rendering.
 
 ---
 
@@ -162,11 +162,14 @@ source.bfpp
 
 ```sh
 cargo build --release
+
+# With GPU-accelerated compilation (optional, requires OpenCL runtime):
+cargo build --release --features gpu
 ```
 
-Binary at `target/release/bfpp`. Only dependency: `clap 4` (derive feature).
+Binary at `target/release/bfpp`. Dependencies: `clap 4` (derive), `rayon 1` (parallel codegen/analysis). Optional: `opencl3 0.9` (GPU-accelerated lexing, enabled via `--features gpu`).
 
-Runtime requirements for generated programs: a C compiler (gcc/clang), POSIX libc. Optional: SDL2 (framebuffer mode), libdl (FFI mode), libGL + libGLEW (3D intrinsics), libEGL (multi-GPU intrinsics), libm (3D math). Programs using `__tui_*` intrinsics require `runtime/bfpp_rt.{h,c}` (compiled and linked automatically by the `bfpp` driver). Programs using 3D intrinsics require `runtime/bfpp_rt_3d*.{h,c}` (6 files, auto-linked).
+Runtime requirements for generated programs: a C compiler (gcc/clang), POSIX libc. Optional: SDL2 (framebuffer mode), libdl (FFI mode), libGL + libGLEW (3D intrinsics), libEGL (multi-GPU intrinsics), libm (3D math), libOpenCL (GPU compute intrinsics). Programs using `__tui_*` intrinsics require `runtime/bfpp_rt.{h,c}` (compiled and linked automatically by the `bfpp` driver). Programs using 3D intrinsics require `runtime/bfpp_rt_3d*.{h,c}` (6 files, auto-linked). Programs using `__gpu_*` intrinsics require `runtime/bfpp_rt_opencl.{c,h}` (auto-linked). The terminal framebuffer backend (`runtime/bfpp_fb_terminal.{c,h}`) is auto-linked when `--framebuffer` is active and no display server is detected (or `BFPP_TERMINAL_FB=1`). On x86_64, `-mavx2 -mfma` flags are passed to the C compiler automatically.
 
 ---
 
@@ -414,7 +417,7 @@ Key runtime properties:
 - **Cell width**: parallel `cell_width[]` array. `bfpp_get`/`bfpp_set` use `memcpy` for safe unaligned multi-byte access. Width 0 = continuation byte (accessing it sets `ERR_INVALID_ARG`)
 - **Call depth**: each subroutine entry increments `bfpp_call_depth`, checks against `CALL_DEPTH`, and decrements on exit/return. Overflow aborts
 - **Subroutine names**: mangled for C compatibility (`>` -> `gt`, `*` -> `star`, `.` -> `dot`, etc.)
-- **CC flags**: `-O2 -Wall -Wno-unused-variable -Wno-unused-function`. Plus `-lSDL2` if framebuffer, `-ldl` if FFI, `-lGL -lGLEW -lm` if 3D intrinsics, `-lEGL` if multi-GPU intrinsics
+- **CC flags**: `-O2 -Wall -Wno-unused-variable -Wno-unused-function`. Plus `-mavx2 -mfma` on x86_64, `-lSDL2` if framebuffer, `-ldl` if FFI, `-lGL -lGLEW -lm` if 3D intrinsics, `-lEGL` if multi-GPU intrinsics, `-lOpenCL` if GPU compute intrinsics. Parallel compilation: per-subroutine `.c` files compiled concurrently via threaded `cc -c`
 
 ---
 
@@ -611,7 +614,7 @@ Primitives for writing a BF++ compiler in BF++. These provide efficient operatio
 
 ## Testing
 
-114 unit tests, all passing. Zero clippy warnings.
+114 unit tests + 23 integration tests, all passing. Zero clippy warnings.
 
 ### Unit Tests
 

@@ -1,0 +1,129 @@
+; ╔══════════════════════════════════════════════╗
+; ║  BF++ Test: String Intrinsics               ║
+; ║  __strlen, __strcmp                          ║
+; ╚══════════════════════════════════════════════╝
+;
+; String intrinsics operate on null-terminated strings stored on tape.
+; __strlen: P+0 = addr → P+0 = length
+; __strcmp: P+0 = addr_a, P+4 = addr_b → P+0 = 0 (eq), <0 (a<b), >0 (a>b)
+
+; ── Setup: Write strings into high tape addresses ──
+; "Hello" at 200
+#200 @ "Hello\0"
+; "Hello" at 210 (duplicate for equality test)
+#210 @ "Hello\0"
+; "World" at 220
+#220 @ "World\0"
+; "" (empty) at 230
+#230 @ "\0"
+; "Hell" at 240 (prefix of Hello)
+#240 @ "Hell\0"
+; "Hellp" at 250 (one char different, 'p' > 'o')
+#250 @ "Hellp\0"
+
+#0 @
+
+; ── Test 1: __strlen("Hello") = 5 ──
+#200
+!#__strlen
+; P+0 = 5, + 48 = 53 = '5'
+++++++++++++++++++++++++++++++++++++++++++++++++  ; +48
+.
+[-]
+#10 . [-]
+
+; ── Test 2: __strlen("") = 0 ──
+#230
+!#__strlen
+?{
+    #70 .             ; 'F' — fail, should be 0
+}:{
+    #48 .             ; '0' — zero length confirmed
+}
+[-]
+#10 . [-]
+
+; ── Test 3: __strlen("Hell") = 4 ──
+#240
+!#__strlen
+; P+0 = 4, + 48 = 52 = '4'
+++++++++++++++++++++++++++++++++++++++++++++++++  ; +48
+.
+[-]
+#10 . [-]
+
+; ── Test 4: __strcmp equal ("Hello" vs "Hello") ──
+%4
+#200 >>>> #210 <<<<
+!#__strcmp
+?{
+    #78 .             ; 'N' — not equal (fail)
+}:{
+    #69 . #81 .       ; 'EQ'
+}
+[-] >>>> [-] <<<<
+%1 #10 . [-]
+
+; ── Test 5: __strcmp less ("Hello" vs "World") ──
+; 'H' < 'W', so result < 0 (which is nonzero)
+%4
+#200 >>>> #220 <<<<
+!#__strcmp
+?{
+    #76 . #84 .       ; 'LT' — nonzero, and we know H < W
+}:{
+    #70 .             ; 'F' — fail, should be nonzero
+}
+[-] >>>> [-] <<<<
+%1 #10 . [-]
+
+; ── Test 6: __strcmp greater ("World" vs "Hello") ──
+; 'W' > 'H', so result > 0 (nonzero)
+%4
+#220 >>>> #200 <<<<
+!#__strcmp
+?{
+    #71 . #84 .       ; 'GT' — nonzero, and we know W > H
+}:{
+    #70 .             ; 'F' — fail
+}
+[-] >>>> [-] <<<<
+%1 #10 . [-]
+
+; ── Test 7: __strcmp prefix ("Hello" vs "Hell") ──
+; "Hello" > "Hell" because 'o' > '\0'
+%4
+#200 >>>> #240 <<<<
+!#__strcmp
+?{
+    #80 .             ; 'P' — nonzero (prefix differs)
+}:{
+    #70 .             ; 'F' — fail
+}
+[-] >>>> [-] <<<<
+%1 #10 . [-]
+
+; ── Test 8: __strcmp one char diff ("Hello" vs "Hellp") ──
+; 'o' (111) < 'p' (112), so result < 0 (nonzero)
+%4
+#200 >>>> #250 <<<<
+!#__strcmp
+?{
+    #68 .             ; 'D' — different (nonzero)
+}:{
+    #70 .             ; 'F' — fail
+}
+[-] >>>> [-] <<<<
+
+; ── Summary ──
+; Expected output:
+; 5
+; 0
+; 4
+; EQ
+; LT
+; GT
+; P
+; D
+
+%1 #0 !#__exit
