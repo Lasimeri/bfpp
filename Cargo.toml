@@ -11,3 +11,8 @@ categories = ["compilers", "command-line-utilities"]
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 rayon = "1"
+opencl3 = { version = "0.9", optional = true }
+
+[features]
+default = []
+gpu = ["opencl3"]

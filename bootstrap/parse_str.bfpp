@@ -1,7 +1,7 @@
 ; parse_str.bfpp — String literal parser for bootstrap compiler
 ;
-; Called from main loop when '"' (34) is detected.
-; Reads chars from stdin until closing '"', emits C code that
+; Called from main loop when double-quote (34) is detected.
+; Reads chars from stdin until closing double-quote, emits C code that
 ; writes the string bytes to tape and advances ptr.
 ;
 ; Emits:
@@ -9,7 +9,7 @@
 ;     memcpy(&tape[ptr], _s, sizeof(_s)-1);
 ;     ptr = (ptr + sizeof(_s)-1) & TAPE_MASK; }
 ;
-; Escape handling: \n → 10, \0 → 0, \\ → 92, \" → 34
+; Escape handling: \n → 10, \0 → 0, \\ → 92, backslash-quote → 34
 ; All other chars taken literally.
 
 !define POOL 3000000
@@ -21,10 +21,10 @@
     ; Track byte count at cell 2
     > > [-] < < ; P+2 = 0 (count)
 
-    ; Read chars until closing "
+    ; Read chars until closing quote
     ,                      ; read first string char
     [
-        ?= #34 [ [-] ]    ; '"' → end of string, clear char
+        ?= #34 [ [-] ]    ; quote (34) → end of string, clear char
 
         ; Check for backslash escape
         ?= #92 [           ; '\' (92)
@@ -33,7 +33,7 @@
             ?= #110 [ [-] #10 ]  ; 'n' → newline (10)
             ?= #48  [ [-] #0  ]  ; '0' → null (0)
             ?= #92  [ ]          ; '\' → keep as 92
-            ?= #34  [ ]          ; '"' → keep as 34
+            ?= #34  [ ]          ; quote → keep as 34
             ; P+0 = resolved byte value
         ]
 

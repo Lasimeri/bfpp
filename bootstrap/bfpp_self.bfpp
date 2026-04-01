@@ -3,6 +3,7 @@
 ; ║                                                              ║
 ; ║  Compiles core BF from stdin → C on stdout.                  ║
 ; ║  Supports: > < + - . , [ ] $ ~ ^ E e @ * T F | & x s r n ?  ║
+; ║  Extended: # (numeric) % (width) ! (subs) string-lit        ║
 ; ║                                                              ║
 ; ║  GPU: uses __gpu_init to detect compute devices at startup.  ║
 ; ║  Multithread: compiled with parallel CC (>3 subroutines).    ║
@@ -18,6 +19,8 @@
 
 !include "io.bfpp"
 !include "parse_num.bfpp"
+!include "parse_str.bfpp"
+!include "parse_sub.bfpp"
 
 ; ── Print null-terminated string from POOL ──
 !#pr{ #POOL @ [. >] #0 @ ^ }
@@ -139,6 +142,10 @@ $ #GPU_COUNT @ ~ #0 @ %1
             #POOL @ "{int _o=cell_width[ptr],_n,i;for(i=1;i<_o;i++)cell_width[ptr+i]=1;switch(_o){case 1:_n=2;break;case 2:_n=4;break;case 4:_n=8;break;default:_n=1;}cell_width[ptr]=_n;for(i=1;i<_n;i++){if(cell_width[ptr+i]!=1){cell_width[ptr]=1;break;}cell_width[ptr+i]=0;}}\n\0" #0 @ !#pr [-]
         ]
     ]
+    ; Handle ! (subroutine def/call): !#name{ or !#name
+    ?= #33 [ [-] !#psu ]
+    ; Handle string literal
+    ?= #34 [ [-] !#ps ]
     ; Process remaining chars
     [ !#cl !#em ]
     ,

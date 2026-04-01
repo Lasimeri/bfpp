@@ -111,7 +111,7 @@
             ]
             ; Subroutine def/call: !
             ?= #33 [ [-] !#psu ]
-            ; String literal: "
+            ; String literal
             ?= #34 [ [-] !#ps ]
             ; All other chars: classify and emit
             [ !#cl !#em ]
@@ -163,6 +163,7 @@
             ]
 
             ; Check for call terminators
+            ?= #0  [ > [-] < ]       ; EOF → call (P+0 already 0)
             ?= #10 [ > [-] < [-] ]   ; newline → call
             ?= #32 [ > [-] < [-] ]   ; space → call
             ?= #13 [ > [-] < [-] ]   ; CR → call
@@ -174,11 +175,16 @@
                 *~                  ; deref: jump to tape[10..13], pop char, write; restore ptr=10
                 +                   ; tape[10..13]++ (advance write position)
                 <<<<<<<<<<          ; ptr = 0
-                [-]                 ; clear cell 0
-                ,                   ; read next name char
+                [-]                 ; clear cell 0 (prevents inner loop re-entry)
             ]
 
-            >                       ; ptr = 1 (check reading flag)
+            ; Read next char if still reading name
+            > ?= #1 [              ; if cell 1 (reading flag) still set
+                < ,                 ; read next name char
+                >
+            ] <
+
+            >                       ; ptr = 1 (check outer reading flag)
         ]
         <                           ; ptr = 0
 
@@ -197,7 +203,7 @@
         <<<<<<<<<<                  ; ptr = 0
 
         ; Emit C code based on def flag (cell 2)
-        >> [                        ; if def (cell 2 = 1)
+        >> ?= #1 [                  ; if cell 2 == 1 (definition)
             [-]                     ; clear def flag
 
             ; Emit: void bfpp_sub_
@@ -213,7 +219,7 @@
             ; Emit: }\n
             #POOL @ "}\n\0" #0 @ !#pr
 
-        ] : [                       ; else: it's a call
+        ] : [                       ; else: cell 2 == 0 (call)
 
             ; Emit: bfpp_sub_
             #POOL @ "bfpp_sub_\0" #0 @ !#pr

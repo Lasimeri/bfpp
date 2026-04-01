@@ -170,6 +170,15 @@ static inline void tape_set_u32(uint8_t *tape, int addr, uint32_t val) {
     tape[addr+3] = (val >> 24) & 0xFF;
 }
 
+/* ── Comparator for qsort (uint32 LE) ────────────────────────── */
+
+static int cmp_u32_le(const void *a, const void *b) {
+    const uint8_t *pa = (const uint8_t *)a, *pb = (const uint8_t *)b;
+    uint32_t va = pa[0] | ((uint32_t)pa[1]<<8) | ((uint32_t)pa[2]<<16) | ((uint32_t)pa[3]<<24);
+    uint32_t vb = pb[0] | ((uint32_t)pb[1]<<8) | ((uint32_t)pb[2]<<16) | ((uint32_t)pb[3]<<24);
+    return (va > vb) - (va < vb);
+}
+
 /* ── dlopen loader ───────────────────────────────────────────── */
 
 static int load_opencl(void) {
@@ -440,35 +449,167 @@ void bfpp_opencl_wait(int handle) {
     ocl.ops[handle].active = 0;
 }
 
-/* ── Stub implementations for other operations ───────────────── */
+/* ── Async memcpy (non-overlapping) ───────────────────────────── */
 
 int bfpp_opencl_memcpy(uint8_t *tape, int dst, int src, int size) {
-    (void)tape; (void)dst; (void)src; (void)size;
-    return -1; /* TODO: implement */
+    if (!ocl.initialized || size < 65536) return -1;
+    int di = pick_device();
+    if (di < 0) return -1;
+    bfpp_cl_device_t *dev = &ocl.devices[di];
+
+    int max_addr = (dst + size > src + size) ? dst + size : src + size;
+    cl_mem buf = ensure_buf(di, max_addr);
+    if (!buf) return -1;
+
+    /* Upload source region */
+    cl_event up_evt;
+    cl.EnqueueWriteBuffer(dev->queue, buf, CL_FALSE, src, size, tape + src, 0, NULL, &up_evt);
+
+    cl.SetKernelArg(ocl.k_memcpy[di], 0, sizeof(cl_mem), &buf);
+    cl.SetKernelArg(ocl.k_memcpy[di], 1, sizeof(int), &dst);
+    cl.SetKernelArg(ocl.k_memcpy[di], 2, sizeof(int), &src);
+    cl.SetKernelArg(ocl.k_memcpy[di], 3, sizeof(int), &size);
+
+    size_t global = (size_t)size;
+    cl_event kern_evt;
+    cl.EnqueueNDRangeKernel(dev->queue, ocl.k_memcpy[di], 1, NULL, &global, NULL, 1, &up_evt, &kern_evt);
+    cl.ReleaseEvent(up_evt);
+
+    cl_event read_evt;
+    cl.EnqueueReadBuffer(dev->queue, buf, CL_FALSE, dst, size, tape + dst, 1, &kern_evt, &read_evt);
+    cl.ReleaseEvent(kern_evt);
+    cl.Flush(dev->queue);
+
+    return alloc_op(di, read_evt, dst, size);
 }
 
-int bfpp_opencl_sort(uint8_t *tape, int offset, int count, int elem_size) {
-    (void)tape; (void)offset; (void)count; (void)elem_size;
-    return -1; /* TODO: implement */
-}
+/* ── Async reduce (sum/min/max on 32-bit elements) ───────────── */
 
 int bfpp_opencl_reduce(uint8_t *tape, int offset, int count, int op) {
-    (void)tape; (void)offset; (void)count; (void)op;
-    return -1; /* TODO: implement */
+    if (!ocl.initialized || count < 256) return -1;
+    int di = pick_device();
+    if (di < 0) return -1;
+    bfpp_cl_device_t *dev = &ocl.devices[di];
+
+    int data_size = count * 4;
+    cl_mem buf = ensure_buf(di, offset + data_size);
+    if (!buf) return -1;
+
+    /* Upload data */
+    cl_event up_evt;
+    cl.EnqueueWriteBuffer(dev->queue, buf, CL_FALSE, offset, data_size, tape + offset, 0, NULL, &up_evt);
+
+    /* Partial results buffer (one per work-group) */
+    size_t local_size = 256;
+    size_t global = ((count + local_size - 1) / local_size) * local_size;
+    int num_groups = (int)(global / local_size);
+
+    cl_int err;
+    cl_mem partial = cl.CreateBuffer(dev->context, CL_MEM_READ_WRITE, num_groups * 4, NULL, &err);
+    if (err != CL_SUCCESS) { cl.ReleaseEvent(up_evt); return -1; }
+
+    cl.SetKernelArg(ocl.k_reduce[di], 0, sizeof(cl_mem), &buf);
+    cl.SetKernelArg(ocl.k_reduce[di], 1, sizeof(int), &offset);
+    cl.SetKernelArg(ocl.k_reduce[di], 2, sizeof(int), &count);
+    cl.SetKernelArg(ocl.k_reduce[di], 3, sizeof(int), &op);
+    cl.SetKernelArg(ocl.k_reduce[di], 4, sizeof(cl_mem), &partial);
+    cl.SetKernelArg(ocl.k_reduce[di], 5, local_size * 4, NULL); /* local scratch */
+
+    cl_event kern_evt;
+    cl.EnqueueNDRangeKernel(dev->queue, ocl.k_reduce[di], 1, NULL, &global, &local_size, 1, &up_evt, &kern_evt);
+    cl.ReleaseEvent(up_evt);
+
+    /* Read partial results back to CPU for final reduction */
+    int32_t *partials = (int32_t *)malloc(num_groups * 4);
+    cl_event read_evt;
+    cl.EnqueueReadBuffer(dev->queue, partial, CL_TRUE, 0, num_groups * 4, partials, 1, &kern_evt, &read_evt);
+    cl.ReleaseEvent(kern_evt);
+
+    /* CPU final reduction across work-groups */
+    int32_t result = partials[0];
+    for (int i = 1; i < num_groups; i++) {
+        if (op == 0) result += partials[i];
+        else if (op == 1) result = result < partials[i] ? result : partials[i];
+        else result = result > partials[i] ? result : partials[i];
+    }
+    free(partials);
+    cl.ReleaseMemObject(partial);
+
+    /* Write result to tape[offset] */
+    tape[offset]   =  result        & 0xFF;
+    tape[offset+1] = (result >> 8)  & 0xFF;
+    tape[offset+2] = (result >> 16) & 0xFF;
+    tape[offset+3] = (result >> 24) & 0xFF;
+
+    cl.ReleaseEvent(read_evt);
+    return 0; /* synchronous — result already in tape */
 }
 
+/* ── Async batch matrix transform ────────────────────────────── */
+
 int bfpp_opencl_transform(uint8_t *tape, int matrices_offset, int count) {
-    (void)tape; (void)matrices_offset; (void)count;
-    return -1; /* TODO: implement */
+    if (!ocl.initialized || count < 16) return -1;
+    int di = pick_device();
+    if (di < 0) return -1;
+    bfpp_cl_device_t *dev = &ocl.devices[di];
+
+    int data_size = count * 64; /* 16 x int32 per matrix = 64 bytes */
+    cl_mem buf = ensure_buf(di, matrices_offset + data_size);
+    if (!buf) return -1;
+
+    cl_event up_evt;
+    cl.EnqueueWriteBuffer(dev->queue, buf, CL_FALSE, matrices_offset, data_size,
+                          tape + matrices_offset, 0, NULL, &up_evt);
+
+    cl.SetKernelArg(ocl.k_transform[di], 0, sizeof(cl_mem), &buf);
+    cl.SetKernelArg(ocl.k_transform[di], 1, sizeof(int), &matrices_offset);
+    cl.SetKernelArg(ocl.k_transform[di], 2, sizeof(int), &count);
+
+    size_t global = (size_t)count;
+    cl_event kern_evt;
+    cl.EnqueueNDRangeKernel(dev->queue, ocl.k_transform[di], 1, NULL, &global, NULL, 1, &up_evt, &kern_evt);
+    cl.ReleaseEvent(up_evt);
+
+    cl_event read_evt;
+    cl.EnqueueReadBuffer(dev->queue, buf, CL_FALSE, matrices_offset, data_size,
+                          tape + matrices_offset, 1, &kern_evt, &read_evt);
+    cl.ReleaseEvent(kern_evt);
+    cl.Flush(dev->queue);
+
+    return alloc_op(di, read_evt, matrices_offset, data_size);
 }
+
+/* ── Async sort (not yet fully implemented — requires multi-pass radix) ── */
+
+int bfpp_opencl_sort(uint8_t *tape, int offset, int count, int elem_size) {
+    /* GPU radix sort requires multiple kernel dispatches (histogram + scatter per bit).
+     * For now, fall back to CPU qsort for correctness. GPU path is a future optimization. */
+    (void)elem_size;
+    if (!ocl.initialized) return -1;
+
+    /* CPU fallback: sort in-place using qsort */
+    /* Elements are `elem_size` bytes each at tape[offset] */
+    /* For 4-byte elements (the common case): */
+    if (elem_size == 4) {
+        qsort(tape + offset, count, 4, cmp_u32_le);
+        return 0;
+    }
+    return -1; /* signal CPU fallback to caller */
+}
+
+/* ── Async rasterization (GPU edge-function per-pixel) ───────── */
 
 int bfpp_opencl_rasterize(uint8_t *tape, int vert_offset, int vert_count,
                           int idx_offset, int idx_count,
                           int fb_offset, int width, int height) {
+    /* GPU rasterization requires uploading transformed triangle data + z-buffer.
+     * The rasterize kernel (BFPP_CL_RASTERIZE) is defined in the kernels header
+     * but requires scene-specific setup (light positions, camera, etc.).
+     * For now, fall back to CPU software rasterizer. */
     (void)tape; (void)vert_offset; (void)vert_count;
     (void)idx_offset; (void)idx_count;
     (void)fb_offset; (void)width; (void)height;
-    return -1; /* TODO: implement */
+    return -1; /* CPU fallback — full GPU rasterize path is a future task */
 }
 
 /* ── Intrinsic wrappers (called from generated C) ────────────── */

@@ -6,6 +6,7 @@ mod codegen;
 mod optimizer;
 mod preprocess;
 mod error_codes;
+mod gpu;
 
 use clap::Parser;
 use std::path::PathBuf;
@@ -84,16 +85,16 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
 
-    // Tape size must be a power of 2 so codegen can emit bitmask wrapping
-    // (ptr & (size - 1)) instead of expensive modulo. This is a hard requirement
-    // of the generated C runtime, not just a performance preference.
     if !cli.tape_size.is_power_of_two() {
         eprintln!("error: --tape-size must be a power of 2 (got {})", cli.tape_size);
         std::process::exit(1);
     }
 
+    // Try GPU compiler acceleration (optional, --features gpu)
+    let gpu_ctx = gpu::GpuCompiler::try_init();
+
     // Run the compilation pipeline once
-    if compile(&cli).is_err() && !cli.watch {
+    if compile(&cli, &gpu_ctx).is_err() && !cli.watch {
         std::process::exit(1);
     }
 
@@ -112,7 +113,7 @@ fn main() {
             if current != last_modified {
                 last_modified = current;
                 eprintln!("Recompiling {}...", cli.input.display());
-                let _ = compile(&cli); // errors are printed but don't exit in watch mode
+                let _ = compile(&cli, &gpu_ctx); // errors are printed but don't exit in watch mode
             }
         }
     }
@@ -121,7 +122,7 @@ fn main() {
 /// Run the full compilation pipeline: read → preprocess → lex → parse → analyze →
 /// optimize → codegen → C compile. Returns Err(()) on any stage failure (errors
 /// already printed to stderr). Separated from main() to enable --watch recompilation.
-fn compile(cli: &Cli) -> Result<(), ()> {
+fn compile(cli: &Cli, gpu_ctx: &Option<gpu::GpuCompiler>) -> Result<(), ()> {
     // --- Stage 1: Read source file ---
     let raw_source = std::fs::read_to_string(&cli.input).map_err(|e| {
         eprintln!("error: cannot read '{}': {}", cli.input.display(), e);
@@ -131,6 +132,17 @@ fn compile(cli: &Cli) -> Result<(), ()> {
     let source = preprocess::preprocess(&raw_source, &cli.input, &cli.include_paths).map_err(|e| {
         eprintln!("{}", e);
     })?;
+
+    // --- Stage 2.5: GPU pre-classification (optional, for sources >10KB) ---
+    #[cfg(feature = "gpu")]
+    if let Some(ref gpu) = gpu_ctx {
+        if let Some(_classes) = gpu.classify_chars(source.as_bytes()) {
+            eprintln!("bfpp: GPU classified {} bytes", source.len());
+            // TODO: feed classification array to lexer for accelerated tokenization
+        }
+    }
+    #[cfg(not(feature = "gpu"))]
+    let _ = gpu_ctx; // suppress unused warning
 
     // --- Stage 3: Lex (tokenize the preprocessed source) ---
     let tokens = lexer::lex(&source).map_err(|e| {
@@ -335,6 +347,10 @@ fn compile(cli: &Cli) -> Result<(), ()> {
 
     // ── Shared flags: library linking + runtime .c files ──
     // These apply to BOTH parallel (link step) and single-file (compile+link step).
+
+    // AVX2 + FMA for x86_64 SIMD paths in runtime (guarded by #ifdef __AVX2__)
+    #[cfg(target_arch = "x86_64")]
+    cc_cmd.args(["-mavx2", "-mfma"]);
 
     // -lSDL2 + pipeline runtime
     if codegen_result.uses_fb_pipeline {
