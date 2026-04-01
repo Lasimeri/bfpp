@@ -31,6 +31,7 @@
  */
 
 #include "bfpp_fb_pipeline.h"
+#include "bfpp_fb_terminal.h"
 #include <SDL2/SDL.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -89,6 +90,7 @@ static struct {
     atomic_int      strips_remaining;
     atomic_int      running;
     uint64_t        frame_seq;
+    int             headless;   /* 1 = terminal backend, no SDL */
 } fb;
 
 /* Global quit flag — set by presenter thread on SDL_QUIT */
@@ -290,6 +292,36 @@ static void *presenter_thread_func(void *arg)
 {
     (void)arg;
 
+    /* ── Headless: terminal backend ─────────────────────────── */
+    if (fb.headless) {
+        bfpp_fb_terminal_init(fb.width, fb.height, fb.tape, fb.fb_offset);
+
+        while (atomic_load(&fb.running)) {
+            if (bfpp_fb_terminal_should_quit()) {
+                atomic_store(&bfpp_fb_quit, 1);
+                atomic_store(&fb.running, 0);
+                break;
+            }
+
+            if (!atomic_load(&fb.flush_requested)) {
+                { struct timespec _ts = {0, 1000000}; nanosleep(&_ts, NULL); } /* 1ms poll */
+                continue;
+            }
+            atomic_store(&fb.flush_requested, 0);
+
+            bfpp_fb_terminal_present();
+
+            /* Signal sync waiters */
+            pthread_mutex_lock(&fb.mutex);
+            fb.frame_seq++;
+            pthread_cond_broadcast(&fb.sync_cv);
+            pthread_mutex_unlock(&fb.mutex);
+        }
+
+        bfpp_fb_terminal_cleanup();
+        return NULL;
+    }
+
     /* ── Initialize SDL (video subsystem only) ──────────────── */
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         fprintf(stderr, "bfpp_fb_pipeline: SDL_Init failed: %s\n", SDL_GetError());
@@ -477,6 +509,7 @@ void bfpp_fb_pipeline_init(int w, int h, uint8_t *tape, int fb_offset)
     fb.stride    = w * 3;
     fb.fb_size   = w * h * 3;
     fb.tape      = tape;
+    fb.headless  = bfpp_fb_terminal_detect();
     fb.fb_offset = fb_offset;
 
     /* Allocate triple-buffer surfaces (staging, present, prev_frame) */

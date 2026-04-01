@@ -251,6 +251,11 @@ fn compile(cli: &Cli) -> Result<(), ()> {
             if rt_dir.join("bfpp_fb_pipeline.c").exists() {
                 cc_cmd.arg(format!("-I{}", rt_dir.display()));
                 cc_cmd.arg(rt_dir.join("bfpp_fb_pipeline.c").to_str().unwrap());
+                // Terminal fallback for headless/SSH rendering
+                let term_path = rt_dir.join("bfpp_fb_terminal.c");
+                if term_path.exists() {
+                    cc_cmd.arg(term_path.to_str().unwrap());
+                }
                 break;
             }
         }
@@ -297,6 +302,14 @@ fn compile(cli: &Cli) -> Result<(), ()> {
     // Multi-GPU + Scene Oracle runtime
     if codegen_result.uses_multigpu {
         cc_cmd.arg("-lEGL");
+        // Link libnuma if available (for NUMA-aware staging buffers on EPYC)
+        // Check existence before linking to avoid hard dependency
+        if std::path::Path::new("/usr/lib/libnuma.so").exists()
+            || std::path::Path::new("/usr/lib64/libnuma.so").exists()
+            || std::path::Path::new("/usr/lib/x86_64-linux-gnu/libnuma.so").exists()
+        {
+            cc_cmd.arg("-lnuma");
+        }
         let runtime_paths = [
             PathBuf::from("runtime"),
             std::env::current_exe()
